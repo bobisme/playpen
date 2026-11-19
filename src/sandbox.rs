@@ -771,8 +771,6 @@ fn read_counters(nft: &Path) -> Result<DropSummary, String> {
 // ---------------------------------------------------------------- S ----
 
 fn stage_s(plan: &Plan, files: &SandboxFiles, up_w: &OwnedFd) -> Result<(), String> {
-    let me = getpid();
-    let _ = me;
     prctl::set_pdeathsig(Signal::SIGKILL).map_err(|e| format!("PR_SET_PDEATHSIG: {e}"))?;
     unshare(CloneFlags::CLONE_NEWPID).map_err(|e| format!("cannot create a PID namespace: {e}"))?;
     match fork_checked()? {

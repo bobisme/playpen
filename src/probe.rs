@@ -152,6 +152,7 @@ pub fn privs(nft: &str) -> Value {
         "raw_socket_v6": errno_outcome(try_socket(AddressFamily::Inet6, Some(SockProtocol::IcmpV6))),
         "packet_socket": errno_outcome(try_socket(AddressFamily::Packet, None)),
         "setns_net_of_pid1": outcome(setns_pid1()),
+        "read_pid1_memory": outcome(std::fs::File::open("/proc/1/mem").map(drop).map_err(|e| e.to_string())),
         "cap_eff": field("CapEff:"),
         "cap_prm": field("CapPrm:"),
         "no_new_privs": field("NoNewPrivs:"),

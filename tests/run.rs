@@ -289,6 +289,7 @@ fn assert_all_denied(v: &serde_json::Value) {
         "raw_socket_v6",
         "packet_socket",
         "setns_net_of_pid1",
+        "read_pid1_memory",
     ] {
         let val = v[key].as_str().unwrap_or("missing");
         assert!(val.starts_with("denied"), "{key}: {val}");
