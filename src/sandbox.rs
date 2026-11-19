@@ -777,9 +777,11 @@ fn parent(
                     Signal::SIGTSTP => suspend(&down_w),
                     Signal::SIGCONT => send_byte(&down_w, THAW),
                     // The terminal sent it to its foreground process group,
-                    // which holds the command too, unless the command runs
-                    // in its own session.
-                    _ if info.ssi_code == SI_KERNEL && !plan.new_session => {}
+                    // which holds the command, or, in a new session, I
+                    // (which passes it on). Forwarding it as well would
+                    // race: standard signals merge while pending, and I
+                    // could see only the kernel's copy.
+                    _ if info.ssi_code == SI_KERNEL => {}
                     _ => pending.push(sig),
                 }
             }
@@ -1072,15 +1074,17 @@ fn stage_i(
     } else {
         child
     };
-    init_loop(child, target, &sigfd, up_w, down_r)
+    init_loop(child, target, plan.new_session, &sigfd, up_w, down_r)
 }
 
 /// I's work while the command runs: pass signals on to `target`, freeze
 /// and thaw on P's request, reap orphans, and report how the command
-/// ended.
+/// ended. With `from_terminal`, signals the kernel sent (the terminal
+/// signals I's process group, no longer the command's) are passed on too.
 fn init_loop(
     child: Pid,
     target: Pid,
+    from_terminal: bool,
     sigfd: &SignalFd,
     up_w: &OwnedFd,
     down_r: &OwnedFd,
@@ -1124,7 +1128,7 @@ fn init_loop(
         };
         if sig != Signal::SIGCHLD {
             // Job-control signals are P's business (freeze and thaw).
-            if FORWARDED.contains(&sig) && info.ssi_code != SI_KERNEL {
+            if FORWARDED.contains(&sig) && (from_terminal || info.ssi_code != SI_KERNEL) {
                 let _ = kill(target, sig);
             }
             continue;

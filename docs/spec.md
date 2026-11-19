@@ -537,8 +537,9 @@ While the command runs, P forwards SIGINT, SIGTERM, SIGHUP, SIGQUIT,
 SIGUSR1, SIGUSR2 and SIGWINCH it receives from another process to I, which
 passes them to the command (to its process group in a new session).
 Signals the kernel generated (for example Ctrl-C from the terminal) already
-reach the command directly and are not sent twice, except in a new
-session, where P passes them on too. On SIGTSTP, P asks I to stop every
+reach the command directly and are not sent twice; in a new session they
+reach I instead (it is in playpen's process group), which passes them on.
+On SIGTSTP, P asks I to stop every
 process in the sandbox that is not stopped already, then stops itself; on
 SIGCONT it asks I to continue them. I reaps orphaned processes.
 

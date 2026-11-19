@@ -205,9 +205,13 @@ command could queue a shell command for the operator's shell to read after
 playpen exits. There playpen runs the command in a new session (`setsid`
 in X), with no controlling terminal: `TIOCSTI` needs the terminal to be the
 caller's controlling one. `--new-session` forces this mode. The price: the
-terminal no longer signals the command, so P passes kernel-generated
-SIGINT, SIGQUIT and SIGWINCH on, and I sends everything it passes on to the
-command's whole process group, as the terminal would; Ctrl-Z works through
+terminal no longer signals the command. It still signals I, which is in
+playpen's process group, so I passes the terminal's SIGINT, SIGQUIT and
+SIGWINCH on, and sends everything it passes on to the command's whole
+process group, as the terminal would. (A first version had P forward the
+terminal's signals to I. That lost signals under load: I also gets the
+terminal's own copy, a pending standard signal absorbs a second one, and
+I then saw only the kernel's copy, which it ignored.) Ctrl-Z works through
 the freeze; but `/dev/tty` cannot be opened (password prompts of `ssh` or
 `sudo` fail) and a shell inside has no job control. Reading from the
 terminal on stdin works.
