@@ -4,6 +4,37 @@ This document describes what playpen does at this commit. Anything not built
 yet is marked **planned**. The reasons behind the design and the leak
 analysis are in [DESIGN.md](DESIGN.md).
 
+## Changes since v0.1
+
+If you used v0.1, these will be different:
+
+- **Host Unix sockets are unreachable by default, wherever they are.**
+  v0.1 hid a fixed list (D-Bus, systemd, resolvers, container engines,
+  dirmngr, PulseAudio). Now every pathname socket created outside the
+  sandbox is refused (Landlock), so the session and system bus,
+  `systemctl --user`, `ssh-agent`, `gpg-agent`, PulseAudio/PipeWire,
+  syslog and the journal (log messages are lost), and user or group names
+  served by sssd, systemd-userdb or nscd no longer work inside. Bring one
+  back with `--expose PATH` (for example `--expose "$SSH_AUTH_SOCK"`);
+  graphical programs need `--display`.
+- **The runtime directory is private and empty.** `/run/user/UID` (and
+  `XDG_RUNTIME_DIR`) is a fresh writable directory, mode 0700. Files and
+  sockets the command makes there vanish with the run. The same holds for
+  `/tmp/.X11-unix`, `/tmp/.ICE-unix`, `/tmp/.XIM-unix`, `/tmp/.font-unix`,
+  `/tmp/tmux-UID`, `/dev/shm` and `/dev/mqueue`. `/tmp` itself is still
+  the host's.
+- **A new kernel requirement**: Landlock ABI 9. On older kernels `run`
+  does not start; `--without-landlock` runs with the weaker mount-only
+  hiding (section 4.1).
+- **Standard streams that are network sockets are refused** (UDP,
+  unconnected or listening TCP).
+- **Ctrl-Z stops the whole sandbox**, and `fg` resumes it. On kernels that
+  still allow `TIOCSTI`, the command runs in its own session without a
+  controlling terminal (section 4.1, `--new-session`).
+- **The start line** has new clauses about host sockets, exposed paths and
+  the session; **the report** has the new fields `socket_guard`,
+  `exposed`, `display` and `new_session`.
+
 ## 1. Purpose and non-goals
 
 playpen runs one command so that the command, and every process it starts,
@@ -47,10 +78,17 @@ The namespace code does not know where the rules came from.
   interface managed by pasta;
 - a PID namespace, so the command sees only its own processes and they all
   end when it ends;
-- a private mount namespace, with a fresh `/proc` and generated resolver
-  files;
+- a private mount namespace, with a fresh `/proc`, generated resolver
+  files, and private directories where host sockets live (section 7);
+- an IPC namespace of its own;
 - a *nested* user namespace in which the command runs as the caller's own
-  uid and gid with no capabilities.
+  uid and gid with no capabilities;
+- a Landlock domain that refuses connections to Unix sockets created
+  outside the sandbox, except exposed ones (unless `--without-landlock`).
+
+**Exposed path.** A host socket, or a directory of sockets, the command
+may reach after all: `--expose PATH` and the display sockets of
+`--display`.
 
 **Ruleset.** The nftables table `inet playpen` loaded inside the network
 namespace (section 6). `playpen rules` prints it.
@@ -68,8 +106,11 @@ written as JSON to `--report FILE` (section 4.5).
 - Linux with user namespaces: `user.max_user_namespaces` greater than 0,
   and, where those settings exist, `kernel.unprivileged_userns_clone = 1`
   and `kernel.apparmor_restrict_unprivileged_userns = 0`.
-- Kernel support for network, PID and mount namespaces, nftables with the
-  `inet` family, dynamic sets with counters, and `reject`.
+- Kernel support for network, PID, mount and IPC namespaces, nftables
+  with the `inet` family, dynamic sets with counters, and `reject`.
+- Landlock ABI 9 or later (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`), with
+  `landlock` in the kernel's active security modules. Without it `run`
+  does not start unless `--without-landlock` is given.
 - `nft` (nftables). Found from the `PLAYPEN_NFT` environment variable, else
   `PATH`, else `/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`.
 - `pasta` (passt package), unless `--no-network`. Found the same way, with
@@ -87,16 +128,27 @@ missing `COMMAND`) prints clap's message and exits 2.
 
 ```text
 playpen run --pass FILE [--only LABEL]... [--host NAME=ADDR]...
-            [--until RFC3339] [--hide PATH]... [--format text|json]
+            [--until RFC3339] [SOCKETS] [--format text|json]
             [--report FILE] -- COMMAND [ARGS...]
 playpen run [--allow SPEC]... [--host NAME=ADDR]... [--until RFC3339]
-            [--no-network] [--hide PATH]... [--format text|json]
+            [--no-network] [SOCKETS] [--format text|json]
             [--report FILE] -- COMMAND [ARGS...]
+
+SOCKETS = [--expose PATH]... [--display] [--hide PATH]...
+          [--without-landlock] [--new-session]
 ```
 
 Runs `COMMAND` (looked up on `PATH`) in the sandbox with the caller's
 environment, working directory, stdin, stdout and stderr. Every other file
-descriptor the caller passed is closed at `exec`.
+descriptor the caller passed is closed at `exec`. The environment is not
+changed: variables such as `DBUS_SESSION_BUS_ADDRESS` or `SSH_AUTH_SOCK`
+still name sockets the command cannot reach.
+
+Standard input, output or error that is a socket is checked first.
+Allowed: Unix sockets, and connected TCP sockets (they reach only their
+peer, which the caller chose). Refused (exit 2, `standard output is ...;
+nothing was run`): UDP and raw IP sockets (they can send to any address),
+unconnected or listening TCP sockets, and sockets of any other family.
 
 **`--pass FILE`**. Take the approval from a hallpass pass:
 
@@ -223,10 +275,63 @@ the command, and after a grace of 3 seconds kills the whole PID namespace
 with SIGKILL. The deadline is fixed against the monotonic clock when the
 sandbox starts.
 
+**Host Unix sockets.** By default the command cannot connect to, or send
+by address to, any pathname Unix socket created outside the sandbox
+(Landlock; the connection fails with "Permission denied"), and the places
+where host sockets usually are look empty (section 7). Sockets the command
+creates itself work, anywhere it may create them. Abstract sockets of the
+host do not exist inside (the network namespace has its own).
+
+**`--expose PATH`** (repeatable). Let the command reach this host socket,
+or every socket below this directory. `PATH` must exist and is resolved to
+its canonical form (symbolic links followed); `/` is refused. If the mount
+layer hid it (for example a socket in the runtime directory), it is bound
+back into place at the same path. An `--expose` path inside a `--hide`
+path is refused.
+
+**`--display`**. Expose the display: the Wayland socket named by
+`WAYLAND_DISPLAY` (an absolute path, or a name in `XDG_RUNTIME_DIR`), the
+X11 socket `/tmp/.X11-unix/XN` for a local `DISPLAY` (`:N`, `:N.S`,
+`unix:N`; a display over the network is never exposed), and the file named
+by `XAUTHORITY` if it exists. Those that exist are exposed; if none does,
+playpen refuses (exit 2) and says what it looked for. Off by default,
+because an X11 server lets any client type into other windows.
+
+**`--without-landlock`**. For kernels without Landlock ABI 9: run without
+the Landlock rule. The mount layer still applies, and in addition every
+socket found under `/run`, `/tmp` and `/var/tmp` at start (not following
+symbolic links; more than 2,000,000 entries stops the run with `nothing
+was run`) gets `/dev/null` bound over it, except exposed ones. Sockets
+anywhere else (for example in the home directory), and ones created after
+the start, stay reachable. Without this option and without Landlock ABI 9,
+`run` stops with a message that says so (exit 1, `nothing was run`).
+
+**`--new-session`**. Run the command in a new session with no controlling
+terminal, so it cannot push input into the caller's terminal with
+`TIOCSTI`. This is automatic when the kernel allows `TIOCSTI` for
+unprivileged processes (`/proc/sys/dev/tty/legacy_tiocsti` is missing or
+not `0`). In this mode playpen passes Ctrl-C (SIGINT), Ctrl-\ (SIGQUIT) and
+resizes (SIGWINCH) from the terminal on to the command's process group,
+Ctrl-Z works as below, reading the terminal on stdin works, but `/dev/tty`
+cannot be opened (password prompts that use it fail) and a shell inside has
+no job control.
+
 **`--hide PATH`** (repeatable). Hide one more host path from the command:
 a directory gets an empty read-only tmpfs over it; anything else gets
-`/dev/null` bound over it. A path that does not exist is ignored. These are
-added to the default list (section 7).
+`/dev/null` bound over it. A path that does not exist is ignored. Applied
+after the mount layer and `--expose`.
+
+**Terminal and job control.** Without a new session the command stays in
+the terminal's foreground process group: Ctrl-C, Ctrl-\, resizes and
+reading from the terminal reach it as they would without playpen, and a
+shell inside (`-- bash -i`) has job control for its own jobs. Ctrl-Z (or
+SIGTSTP sent to playpen) stops every process in the sandbox, including
+those in other process groups or sessions, and then playpen itself, so the
+shell shows the job as stopped; `fg` or `bg` continues playpen, which
+continues exactly the processes it stopped. playpen does not stop for
+terminal input or output. SIGSTOP sent to playpen directly stops only
+playpen: the end time and the pass re-read are then enforced when it
+continues.
 
 **`--report FILE`**. Write the JSON report to `FILE`, for every outcome,
 refusals by policy included. The file is created (truncated) before
@@ -242,8 +347,14 @@ Messages on stderr, all prefixed `playpen:`:
   `with no time limit` when there is no `--until`; with `--no-network`:
   `no network, loopback only, ...`. With `--pass` the line starts `under
   pass ID ("NAME", owner "OWNER", sha256:DIGEST, window ends TIME,
-  destinations LABEL, ...): allowing only ...` and may end with the
-  `hostname` hint above. It says nothing about ceilings;
+  destinations LABEL, ...): allowing only ...` and may continue with the
+  `hostname` hint above. It says nothing about ceilings. Then, always,
+  `; host Unix sockets: none reachable` (with `--without-landlock`: `;
+  host Unix sockets: hidden under /run, /tmp, /var/tmp and the runtime
+  directory only (--without-landlock); sockets elsewhere stay reachable`),
+  then `; exposed: PATH, ...` when `--expose` was given, `; display
+  exposed: PATH, ...` with `--display`, and `; the command runs in its own
+  session, without a controlling terminal` in a new session;
 - when the end time is reached: what happened and that SIGKILL follows;
 - with `--pass`, when a re-read finds a harmless edit: `the pass was edited
   (now sha256:...); nothing this run uses changed, so the command continues
@@ -298,18 +409,26 @@ playpen doctor [--format text|json]
 
 Checks, without changing any host setting:
 
-1. user namespace settings (section 3);
+1. user namespace settings (section 3), including the AppArmor
+   restriction where the setting exists;
 2. `nft --version` and `pasta --version` run;
-3. a self-test of the real mechanism, run only if 1 and 2 pass: playpen
+3. Landlock ABI 9 or later (`FAIL` otherwise, with the same message `run`
+   gives);
+4. whether the kernel allows `TIOCSTI` (always `ok`; says whether the
+   command will run in its own session);
+5. a self-test of the real mechanism, run only if 1 to 4 pass: playpen
    runs itself in a sandbox with pasta, with documentation addresses
    (`192.0.2.1`, `192.0.2.2`, `2001:db8::1`, `2001:db8::2`) added to the
    sandbox's own `lo`, approves some ports on the first of each, and checks
    that approved TCP, UDP and IPv6 destinations are reached and the others
    are not;
-4. a second sandbox in which the command tries `nft flush ruleset`, `nft
+6. a second sandbox in which the command tries `nft flush ruleset`, `nft
    add table`, netlink address, link and link-state changes, raw IPv4, raw
    IPv6 and packet sockets, joining the user namespace of PID 1, and
-   reading PID 1's memory, and must have no capabilities.
+   reading PID 1's memory, and must have no capabilities;
+7. a third sandbox (`--no-network`) that must not be able to connect to a
+   Unix socket and an abstract Unix socket doctor creates on the host for
+   the purpose.
 
 Each line says `ok` or `FAIL` and what is missing. Exit status 0 when all
 pass, 1 otherwise. JSON: `{"ok": bool, "checks": [{"name", "ok",
@@ -338,6 +457,10 @@ Written by `run --report FILE`. Field names are stable.
 | `playpen_exit_status` | integer | the status playpen exits with |
 | `dropped` | object or null | `{"packets": N, "destinations": [{"address", "protocol", "port", "packets"}], "destinations_truncated": bool}`; `port` is null for protocols other than TCP and UDP; destinations are sorted by packet count, largest first |
 | `dropped_error` | string or null | why the counters could not be read |
+| `socket_guard` | `"landlock"` or `"mounts_only"` | how host Unix sockets were kept from the command; `"mounts_only"` with `--without-landlock` |
+| `exposed` | array of strings | every exposed path (`--expose` and `--display`), canonical once checked; the `--expose` values as typed when refused |
+| `display` | bool | `--display` was given |
+| `new_session` | bool | the command ran (or would have run) in its own session without a controlling terminal |
 
 ### 4.6 Hidden test aids
 
@@ -346,8 +469,10 @@ Not part of the stable interface, hidden from `--help`:
 - `run --lo-addr ADDR` adds `ADDR` to the sandbox's `lo` before the
   ruleset is loaded. Used by tests and `doctor` to have destinations that
   exist only inside the sandbox.
-- `playpen probe reach|privs|resolve` are the checks run inside the
-  sandbox by `doctor` and the tests.
+- `playpen probe reach|privs|resolve|unix|unix-send|fds|tty|listen` are the checks
+  run inside the sandbox by `doctor` and the tests (`unix` connects to Unix
+  sockets and closes at once, writing nothing; `listen` reports
+  connections to a TCP listener).
 - `run --pass-recheck-ms MS` re-reads the pass every `MS` milliseconds
   instead of every 2 seconds. Clamped to 50 ms .. 2 s, so it can only make
   the re-read more frequent. Used by the tests.
@@ -358,12 +483,15 @@ Each step either succeeds or stops the run with a message that ends
 `nothing was run`; the command is never started after a failed step.
 
 1. **Check the request** (CLI): load and check the pass (with `--pass`),
-   parse every spec, `--host` and `--until`; apply the refusals in 4.1.
-   Policy failures exit 2.
+   parse every spec, `--host` and `--until`, check every `--expose` path
+   and find the display sockets for `--display`, check standard input,
+   output and error; apply the refusals in 4.1. Policy failures exit 2.
 2. **Find the tools**: `nft`, and `pasta` unless `--no-network`.
 3. **Check the process**: exactly one thread (required for creating a user
-   namespace) and not root. Mark every descriptor above 2 close-on-exec.
-   Block the forwarded signals and SIGCHLD, to be read from a signalfd.
+   namespace) and not root; Landlock ABI 9 unless `--without-landlock`.
+   Mark every descriptor above 2 close-on-exec. Block the forwarded
+   signals, SIGCHLD and the job-control signals (SIGTSTP, SIGCONT,
+   SIGTTIN, SIGTTOU), to be read from a signalfd.
 4. **C: create the user and network namespaces.** Fork a child C. C sets
    "die with parent", unshares a user and a network namespace, and maps
    root inside to the caller (`setgroups` denied, single-id uid and gid
@@ -382,27 +510,43 @@ Each step either succeeds or stops the run with a message that ends
    once, prints the start line, and tells C to go. (Steps 4 to 6 must
    finish within 30 seconds.)
 8. **C makes itself non-dumpable**, then forks S, which unshares a PID
-   namespace and forks I, its PID 1. I unshares a mount namespace, makes
-   all mounts private, mounts a fresh `/proc`, hides the paths in section 7
-   and binds the generated `/etc/hosts`, `/etc/resolv.conf` and
-   `/etc/nsswitch.conf` read-only over the host's (each failure stops the
-   run).
+   namespace and forks I, its PID 1. I unshares a mount and an IPC
+   namespace, makes all mounts private, and mounts a fresh `/proc`. Then,
+   in this order (each failure stops the run): it opens every exposed path
+   and, with `--without-landlock`, finds the sockets to cover, both in the
+   host's view of the tree; binds the generated `/etc/hosts`,
+   `/etc/resolv.conf` and `/etc/nsswitch.conf` read-only over the host's;
+   replaces the directories of section 7 with private ones and mounts a
+   fresh `/dev/mqueue`; covers the sockets found; binds every exposed path
+   that is now hidden back into place; and applies `--hide`.
 9. **X: drop privileges.** I forks X. X unshares a nested user namespace,
    maps the caller's uid and gid to the outer root, sets uid and gid,
    clears all capability sets, sets `no_new_privs`, and verifies: all of
    CapInh, CapPrm, CapEff and CapAmb are zero, NoNewPrivs is 1, the uid and
    gid are the caller's, raw IPv4, raw IPv6 and packet sockets cannot be
    opened, and a netlink link change is refused with `EPERM`. Any failure
-   stops the run.
+   stops the run. Unless `--without-landlock`, X then restricts itself
+   with Landlock: no connection to Unix sockets created outside, except
+   below exposed paths; abstract sockets scoped. In a new session X calls
+   `setsid`.
 10. **X: exec the command.** If `exec` fails (for example the command does
     not exist), the run stops with `cannot run ...; nothing was run`
     (exit 1). Otherwise I reports "started".
 
 While the command runs, P forwards SIGINT, SIGTERM, SIGHUP, SIGQUIT,
 SIGUSR1, SIGUSR2 and SIGWINCH it receives from another process to I, which
-passes them to the command. Signals the kernel generated (for example
-Ctrl-C from the terminal) already reach the command directly and are not
-sent twice. I reaps orphaned processes.
+passes them to the command (to its process group in a new session).
+Signals the kernel generated (for example Ctrl-C from the terminal) already
+reach the command directly and are not sent twice, except in a new
+session, where P passes them on too. On SIGTSTP, P asks I to stop every
+process in the sandbox that is not stopped already, then stops itself; on
+SIGCONT it asks I to continue them. I reaps orphaned processes.
+
+If any step before the command starts fails and
+`kernel.apparmor_restrict_unprivileged_userns` is 1, the message adds that
+AppArmor's restriction is the likely cause and what an administrator can do
+(a profile granting `userns,` to playpen, shown in DESIGN.md, or the
+sysctl set to 0).
 
 **Teardown.** When the command exits, I reports its status and exits; the
 kernel kills every process left in the PID namespace. C then lists the
@@ -470,15 +614,21 @@ and `PID` is C.
 - `/etc/nsswitch.conf`: the host's file with its `hosts:` line replaced by
   `hosts: files`. (Not bound if the host has none.)
 - `/proc`: the sandbox's own PID namespace.
-- Hidden by default, if present (sockets get `/dev/null`, directories an
-  empty read-only tmpfs; symlinks are followed): 
-  `/run/systemd/resolve/io.systemd.Resolve`,
-  `/run/systemd/resolve/io.systemd.Resolve.Monitor`, `/run/nscd/socket`,
-  `/run/avahi-daemon/socket`, `/run/dbus/system_bus_socket`,
-  `/run/systemd/private`, `/run/podman`, `/run/docker.sock`, and under
-  `/run/user/UID`: `bus`, `systemd`, `podman`, `docker.sock`,
-  `gnupg/S.dirmngr`, `pulse/native`; plus the path in
-  `DBUS_SESSION_BUS_ADDRESS` if it is `unix:path=...`.
+- Replaced by fresh, empty, writable private directories (tmpfs) with the
+  host directory's mode, if present; what the command writes there is gone
+  after the run:
+  - `/run/user`, containing only `/run/user/UID` (mode 0700, owned by the
+    caller), and `XDG_RUNTIME_DIR` if it is set and elsewhere;
+  - `/tmp/.X11-unix`, `/tmp/.ICE-unix`, `/tmp/.XIM-unix`,
+    `/tmp/.font-unix`, `/tmp/tmux-UID`;
+  - `/dev/shm`.
+- `/dev/mqueue`: the sandbox's own message queues (fresh mqueue mount).
+- `/tmp`, `/var/tmp`, the home directory and everything else: the host's.
+  Host sockets in them are visible but refused (Landlock).
+- With `--without-landlock`: also every socket under `/run`, `/tmp` and
+  `/var/tmp` found at start has `/dev/null` bound over it.
+- Exposed paths: bound back at their own path.
+- `--hide` paths: `/dev/null` or an empty read-only tmpfs.
 
 Inside, the command's uid and gid are the caller's; other users and groups
 show as `nobody`.
@@ -486,16 +636,23 @@ show as `nobody`.
 ## 8. Threat model and known limits
 
 Guarded against: accidental or misconfigured traffic, redirects and name
-resolution to unapproved places, the command's children and daemons, and
-the command trying to change the firewall, interfaces or addresses, open
-raw sockets, or join another network namespace.
+resolution to unapproved places, the command's children and daemons, the
+command trying to change the firewall, interfaces or addresses, open raw
+sockets, or join another network namespace, and the command reaching the
+host's network through a host daemon's Unix socket, an inherited
+descriptor, a socket on standard input or output, host IPC, the display
+server (unless `--display`) or the terminal's input queue.
 
 Not guarded against, or known limits:
 
-- kernel exploits; bugs in nftables or pasta;
+- kernel exploits; bugs in nftables, pasta or Landlock;
 - processes started outside playpen;
-- host daemons reachable through filesystem sockets other than the hidden
-  ones, which may act on the host's network for the command;
+- what the daemon behind an exposed socket (`--expose`, `--display`) does
+  for the command, including handing it descriptors;
+- with `--without-landlock`: host sockets outside `/run`, `/tmp`,
+  `/var/tmp` and the runtime directory, or created after the start;
+- host processes that act on files the command writes (sync clients,
+  spoolers, named pipes), and network file systems;
 - an approved destination that forwards traffic further;
 - volume, content and covert channels within approved flows;
 - the report file can be overwritten by the command while it runs (same
@@ -504,7 +661,9 @@ Not guarded against, or known limits:
 - per-destination drop lists hold 1024 destinations per address family;
   the total count stays exact and `destinations_truncated` says when the
   list is incomplete;
-- interactive job control (Ctrl-Z, `fg`) inside playpen is untested;
+- SIGSTOP sent to playpen itself (not Ctrl-Z) stops playpen but not the
+  command; the end time and the pass re-read wait until playpen continues;
+- the command can open the caller's other terminals (`/dev/pts/N`);
 - with `--pass`: a revocation or edit takes effect at the next re-read (up
   to 2 seconds) plus the grace; traffic in that time is still allowed. Who
   can write the pass file can also restore it between two re-reads.
@@ -515,4 +674,3 @@ DESIGN.md has the full list with the reasons.
 ## 9. Not yet built (planned)
 
 - **planned:** approving ICMP echo to specific addresses.
-- **planned:** an option to keep a hidden default socket visible.

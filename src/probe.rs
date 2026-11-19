@@ -232,6 +232,31 @@ pub fn unix(listen: &[String], tries: &[String]) -> Result<Vec<Value>, String> {
     Ok(lines)
 }
 
+/// `probe unix-send PATH`: sends one datagram, `playpen-probe`, by address
+/// from an unconnected datagram socket. Only for sockets the caller made
+/// for the test.
+#[must_use]
+pub fn unix_send(path: &str) -> Value {
+    let sent = unix_addr(path)
+        .and_then(|addr| {
+            let fd = socket(
+                AddressFamily::Unix,
+                SockType::Datagram,
+                SockFlag::SOCK_CLOEXEC,
+                None,
+            )?;
+            nix::sys::socket::sendto(
+                fd.as_raw_fd(),
+                b"playpen-probe",
+                &addr,
+                nix::sys::socket::MsgFlags::empty(),
+            )
+        })
+        .map(drop)
+        .map_err(|e| e.to_string());
+    json!({"path": path, "sent": outcome(sent)})
+}
+
 /// `probe listen`: listens on a TCP address for `ms` milliseconds.
 ///
 /// Prints `{"listening": ADDR}` once the socket is bound, `{"accepted":

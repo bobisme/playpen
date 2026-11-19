@@ -30,8 +30,11 @@ ok   user namespaces: user.max_user_namespaces = 512098
 ok   unprivileged user namespaces: kernel.unprivileged_userns_clone = 1
 ok   nft: /usr/bin/nft (nftables v1.1.7 (Commodore Bullmoose #8))
 ok   pasta: /usr/bin/pasta (pasta 2026_09_25.df90211)
+ok   Landlock (host Unix sockets): ABI 10: connections to host Unix sockets can be refused
+ok   terminal input injection (TIOCSTI): refused by the kernel (dev.tty.legacy_tiocsti = 0): the command keeps the terminal and job control
 ok   allowed reached, others blocked: TCP, UDP and IPv6 to in-sandbox addresses: approved reached, others dropped
 ok   command cannot change the network: nft, netlink address/link changes, raw and packet sockets all denied; no capabilities
+ok   host Unix sockets unreachable: a host socket and a host abstract socket were not reachable from inside
 playpen can run here.
 
 $ cat engagement.pass.toml          # written with hallpass init, mode 0600
@@ -57,7 +60,7 @@ hostname = "app.example.test"     # informational: grants nothing
 $ playpen run --pass engagement.pass.toml \
               --host app.example.test=192.0.2.10 \
               -- curl -sS https://app.example.test/
-playpen: under pass example-2026-11 ("Example web app", owner "Pat Owner, Example Corp", sha256:3f1c..., window ends 2026-11-19T17:00:00Z, destinations app): allowing only 192.0.2.10:443/tcp until 2026-11-19T17:00:00Z (no DNS, names app.example.test=192.0.2.10); everything else is dropped
+playpen: under pass example-2026-11 ("Example web app", owner "Pat Owner, Example Corp", sha256:3f1c..., window ends 2026-11-19T17:00:00Z, destinations app): allowing only 192.0.2.10:443/tcp until 2026-11-19T17:00:00Z (no DNS, names app.example.test=192.0.2.10); everything else is dropped; host Unix sockets: none reachable
 ...curl output...
 playpen: command exited with status 0
 playpen: no packets to unapproved destinations were dropped
@@ -85,11 +88,29 @@ $ playpen run --allow 192.0.2.10:443/tcp \
               --host app.example.test=192.0.2.10 \
               --until 2026-11-19T18:00:00+01:00 \
               -- curl -sS https://app.example.test/
-playpen: allowing only 192.0.2.10:443/tcp until 2026-11-19T17:00:00Z (no DNS, names app.example.test=192.0.2.10); everything else is dropped
+playpen: allowing only 192.0.2.10:443/tcp until 2026-11-19T17:00:00Z (no DNS, names app.example.test=192.0.2.10); everything else is dropped; host Unix sockets: none reachable
 ```
 
 `--pass` and `--allow` cannot be combined: an `--allow` beside a pass would
 add a destination the owner did not approve.
+
+The command also cannot reach daemons on the host through their Unix
+sockets: a host daemon has the host's network (a session bus, a container
+engine, an SSH or browser automation agent). The command's runtime
+directory (`$XDG_RUNTIME_DIR`) is a fresh, empty, private one; `/tmp` is
+the host's. Bring a socket back deliberately with `--expose`; graphical
+programs need `--display`. Both are listed on the start line and in the
+report:
+
+```console
+$ playpen run --pass engagement.pass.toml --expose "$SSH_AUTH_SOCK" \
+              -- ssh admin@192.0.2.10
+playpen: under pass ...; everything else is dropped; host Unix sockets: none reachable; exposed: /home/sam/.ssh/agent.sock
+```
+
+Upgrading from v0.1? The spec lists the [changes](docs/spec.md#changes-since-v01):
+the runtime directory is empty, and the session bus, `ssh-agent`, syslog
+and others are not reachable without `--expose`.
 
 If the tool tries to go somewhere else, the connection fails at once
 ("No route to host" for TCP, "Operation not permitted" for UDP), and
@@ -119,7 +140,11 @@ refusing to start it (`"refused"`).
 ## Requirements
 
 - Linux with unprivileged user namespaces enabled (the default on most
-  distributions; `playpen doctor` checks).
+  distributions; `playpen doctor` checks). On distributions that restrict
+  them with AppArmor (Ubuntu 24.04 and later, for example), an
+  administrator must allow playpen; DESIGN.md shows a profile.
+- Landlock ABI 9 or later, to refuse host Unix sockets. On older kernels
+  `--without-landlock` runs with weaker, mount-only hiding.
 - `nft` (nftables) and `pasta` (from the passt package). `--no-network`
   needs only `nft`.
 - No root, no setuid helper, no subuid/subgid ranges, no change to host
@@ -141,16 +166,25 @@ playpen guards against:
   sandbox and are killed when the command exits;
 - the command trying to undo the guard: it cannot change the firewall,
   add addresses or interfaces, open raw sockets, or join another network
-  namespace (each is tested).
+  namespace (each is tested);
+- side doors to the host's network: host daemons reached through Unix
+  sockets anywhere in the file system (refused unless you `--expose`
+  them), host abstract sockets, descriptors inherited from the caller, a
+  UDP or unconnected socket as standard input or output, host IPC and
+  shared memory, the display server (unless `--display`), and pushing
+  input into your terminal for your shell to run later. Each is tested;
+  DESIGN.md has the list, with what stays open.
 
 playpen does not guard against:
 
-- a kernel exploit, or a bug in nftables or pasta;
-- processes started outside playpen, or a host daemon that the command
-  reaches through a filesystem socket and that acts on the host's network
-  for it. playpen hides the ones it knows (D-Bus buses, systemd, resolvers,
-  container engines, dirmngr, PulseAudio; see the spec) and `--hide PATH`
-  hides more, but it cannot know every such socket on your machine;
+- a kernel exploit, or a bug in nftables, pasta or Landlock;
+- processes started outside playpen;
+- whatever the daemon behind a socket you exposed does for the command;
+- host processes acting on files the command writes (a sync client
+  watching your home directory, a print spooler), and network file
+  systems: playpen does not confine files;
+- on kernels without Landlock ABI 9 (`--without-landlock`), host sockets
+  outside `/run`, `/tmp`, `/var/tmp` and the runtime directory;
 - the approved destination itself forwarding traffic elsewhere (an approved
   proxy is a way out to wherever that proxy goes);
 - what is sent: playpen limits where packets go, not how many or what they

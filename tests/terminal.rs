@@ -451,13 +451,19 @@ fn the_command_cannot_type_into_the_terminal() {
 }
 
 #[test]
-fn in_a_new_session_ctrl_c_ctrl_z_and_input_still_work() {
+fn in_a_new_session_ctrl_c_ctrl_z_resize_and_input_still_work() {
     require_pty!(t);
-    t.send("$P run --no-network --new-session -- sh -c 'read x; echo \"got-$x\"; echo t\"\"ick; sleep 30'\n");
+    t.send(
+        "$P run --no-network --new-session -- sh -c 'trap \"stty size\" WINCH; read x; echo \"got-$x\"; echo t\"\"ick; while :; do sleep 0.1; done'\n",
+    );
     t.expect("own session");
     t.send("hello\n");
     t.expect("got-hello");
     t.expect("tick");
+    // The terminal signals playpen's process group, not the command's
+    // session: playpen passes the resize on.
+    t.set_size(30, 90);
+    t.expect("30 90");
     t.send("\x1a");
     t.expect("Stopped");
     t.send("fg\n");

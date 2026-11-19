@@ -341,6 +341,41 @@ fn expose_lets_exactly_the_named_socket_or_directory_through() {
 }
 
 #[test]
+fn a_datagram_sent_by_address_to_a_host_socket_is_refused() {
+    require_sandbox!();
+    if !landlock_ok() {
+        eprintln!("SKIPPED: this kernel lacks Landlock ABI 9");
+        return;
+    }
+    let dir = tmpdir("dgram");
+    let path = dir.join("log.sock");
+    let _ = std::fs::remove_file(&path);
+    let sock = std::os::unix::net::UnixDatagram::bind(&path).unwrap_or_else(|e| panic!("{e}"));
+    sock.set_nonblocking(true).unwrap_or_else(|e| panic!("{e}"));
+    let p = path.display().to_string();
+    // From the host it arrives: the probe works.
+    let direct = Command::new(BIN)
+        .args(["probe", "unix-send", &p])
+        .output()
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        text(&direct.stdout).contains("ALLOWED"),
+        "{}",
+        text(&direct.stdout)
+    );
+    let mut buf = [0u8; 64];
+    assert!(sock.recv(&mut buf).is_ok());
+    let out = sandbox(&[], &[BIN, "probe", "unix-send", &p]);
+    assert!(
+        text(&out.stdout).contains("denied: EACCES"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(sock.recv(&mut buf).is_err(), "the datagram arrived");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn expose_refuses_missing_paths_and_root() {
     for (args, expect) in [
         (

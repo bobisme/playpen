@@ -36,19 +36,209 @@ netlink sockets. nix has safe wrappers for all of them; rustix has no
 supported `fork`. `libc` (already a dependency of nix) is used for the one
 call nix lacks, `capset`.
 
-**`unsafe`** appears in three places, each with a comment saying why it is
+**`unsafe`** appears in a few places, each with a comment saying why it is
 sound: `fork` (the process is checked to be single-threaded first, and
-playpen starts no threads), `capset` (fixed `repr(C)` structs matching the
-kernel ABI), and borrowing raw descriptors listed in `/proc/self/fd` to set
-close-on-exec.
+playpen starts no threads), `capset` and the three Landlock system calls
+(fixed `repr(C)` structs matching the kernel ABI), borrowing raw
+descriptors listed in `/proc/self/fd` to set close-on-exec, and the
+`TIOCSTI` ioctl in the hidden `probe tty`.
 
 **Single-id mappings.** The outer namespace maps only `0 -> caller`, the
 nested one only `caller -> 0`. No subuid/subgid ranges and no setuid
 helper (newuidmap) are needed. The price: inside, every other uid and gid
 shows as `nobody`, and supplementary groups cannot be dropped (writing
 `setgroups` is denied in an unprivileged user namespace), so they still
-count for file access. That is why the docker socket is hidden: a member of
-the `docker` group could otherwise start a container on the host network.
+count for file access. That is one more reason host sockets are refused: a
+member of the `docker` group could otherwise start a container on the host
+network through `/run/docker.sock`.
+
+## Host Unix sockets
+
+A daemon on the host has the host's network. If the command can talk to
+one that opens connections, fetches things, starts processes or forwards
+messages for its clients (a session bus, a container engine, a user
+service manager, a resolver, an SSH agent with a control master, a browser
+automation server, a sync client, a syslog daemon that forwards), the
+filter does not see that traffic. v0.1 hid a fixed list of such sockets; a
+list cannot be complete (on the development machine there were sockets of
+this kind in the home directory, which no list of system paths covers).
+Since this version host sockets are refused by default and brought back
+one by one with `--expose`.
+
+### Which kinds of socket can cross out of the sandbox
+
+| Kind | Crosses out? | Status | Test |
+|---|---|---|---|
+| Abstract Unix sockets (`@name`) | no: the abstract namespace belongs to the network namespace, and the sandbox has its own | closed by the network namespace; Landlock's abstract-socket scope is a second layer | `abstract_sockets_of_the_host_are_not_reachable` (a host abstract listener, with and without Landlock; the command's own abstract socket works) |
+| Pathname Unix sockets (stream, datagram, seqpacket) | yes, wherever the path is visible and the socket file writable | closed by Landlock everywhere; the mount layer hides the usual places as well | `no_host_socket_is_connectable_from_inside` walks the runtime directory, `/run`, `/var/run`, `/tmp`, `/var/tmp`, `/dev/shm` and the home directory (4 levels) on the host and connects to every socket from inside |
+| `sendmsg` to a pathname datagram socket by address (syslog, the journal) | yes, same as above | closed by Landlock (it checks `sendmsg` with an explicit address too) | `a_datagram_sent_by_address_to_a_host_socket_is_refused` (to a datagram socket the test owns: it arrives when sent from the host, not from inside) |
+| Sockets the command creates itself | stay inside | allowed (they are created in the command's own Landlock domain) | runtime directory, Python, and abstract sockets of its own |
+| Inherited descriptors above 2 | yes, if passed on | closed: marked close-on-exec before the sandbox starts | `inherited_descriptors_do_not_reach_the_command` (a file, Unix and TCP sockets, a UDP socket, a listener and a pipe) |
+| Standard input, output, error that are sockets | they are the caller's, in the host's network namespace | UDP, raw, unconnected or listening TCP and other families are refused; connected TCP (reaches only its peer) and Unix sockets are allowed | `stdio_sockets_that_reach_the_host_network_are_refused`, `connected_tcp_and_unix_stdio_work` |
+| Descriptors passed with `SCM_RIGHTS` | yes: the peer of an exposed socket or of a Unix socket on stdio can hand the command any descriptor, including a socket in the host's network namespace | open, by design: a peer exists only where the operator exposed one or chose it as stdio | not tested |
+| `/proc` of host processes | would expose their descriptors and namespaces | closed: PID namespace and a fresh `/proc`; host processes do not exist inside | `host_processes_are_not_visible_in_proc` |
+| System V IPC, POSIX message queues | would reach host processes that cooperate | closed: own IPC namespace, fresh `/dev/mqueue` | `host_ipc_and_shared_memory_are_not_reachable` (a host shared memory segment, a host message queue) |
+| POSIX shared memory (`/dev/shm`) | files in a host tmpfs | closed: private empty `/dev/shm` | same test |
+| Named pipes (FIFOs), and files a host process reads or watches | yes, if a host process reads them: a sync client, a spooler, a mail drop | open: playpen does not confine files | none possible |
+| Network file systems (NFS, SMB, sshfs and other FUSE mounts) | yes: writing a file sends it | open, except FUSE mounts in the runtime directory (gvfs, the document portal), which the private runtime directory hides; use `--hide` | none |
+| The terminal: `TIOCSTI` (pushing input into the terminal, read by the host shell after playpen exits) | only where the kernel allows it | closed: refused by the kernel when `dev.tty.legacy_tiocsti` is 0; elsewhere the command runs in a new session without a controlling terminal, and `TIOCSTI` needs one | `the_command_cannot_type_into_the_terminal` (both modes; on this machine the kernel refuses in both, so the new-session layer is shown only by `/dev/tty` being unavailable) |
+| Other terminals of the same user (`/dev/pts/N`) | the command can open them: write text, read keystrokes | open; not a network path (`TIOCSTI` on them needs them to be the controlling terminal) | none |
+| The display server (X11, Wayland) | yes: an X11 client can type into any other window, for example a host terminal | closed by default (the sockets are refused and hidden); `--display` opens it, and the start line says so | `display_exposes_the_wayland_socket_and_is_off_by_default` |
+
+### The default: Landlock plus a mount layer
+
+**Landlock refuses, the mounts tidy up.** Landlock ABI 9 added
+`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`: a process restricted by it cannot
+connect to, or send by address to, a pathname Unix socket whose server was
+created outside its Landlock domain, wherever the socket is. Sockets the
+command creates itself are not affected. That is exactly the rule wanted,
+and it needs no list. X applies it just before `exec`, handling only that
+right (files and directories are not restricted) and scoping abstract
+sockets. A path-beneath rule lets a socket, or every socket below a
+directory, through again: that is `--expose`.
+
+The mount layer comes on top, for three reasons. Programs need a working
+runtime directory, and an empty private one behaves better than a host
+directory full of sockets that all fail with "Permission denied". It hides
+the FUSE mounts that live there. And it is the fallback on kernels without
+Landlock ABI 9. It replaces, with fresh empty writable tmpfs mounts that
+keep the host directory's mode:
+
+- `/run/user` (with a new `/run/user/UID`, mode 0700, owned by the caller)
+  and `XDG_RUNTIME_DIR` if it is elsewhere;
+- `/tmp/.X11-unix`, `/tmp/.ICE-unix`, `/tmp/.XIM-unix`, `/tmp/.font-unix`
+  and `/tmp/tmux-UID`;
+- `/dev/shm`; and `/dev/mqueue` gets a fresh mqueue mount for the
+  sandbox's own IPC namespace.
+
+**`/tmp` itself stays the host's.** A file a tool writes to `/tmp` is
+there after the run, as an operator expects (`curl -o /tmp/page`). Only
+the directories where servers put sockets are private. Sockets elsewhere in
+`/tmp` are refused by Landlock.
+
+**Why fail without Landlock, and `--without-landlock`.** Without ABI 9
+playpen does not start: the mount layer cannot reach sockets in the home
+directory or created after the start, so it is not the default-deny it
+promises. `--without-landlock` accepts that for older kernels and is said
+in the start line and the report (`socket_guard: "mounts_only"`). In that
+mode I also walks `/run`, `/tmp` and `/var/tmp` (not following links, at
+most 2,000,000 entries, else the run does not start) and binds `/dev/null`
+over every socket it finds. What stays open in that mode: sockets anywhere
+else (the home directory, `/var/lib`, ...), sockets created after the
+start, and a socket whose daemon removes and recreates it during the run
+(removing a mount point in another mount namespace detaches the mount).
+The test `without_landlock_the_mount_layer_still_hides_the_usual_places`
+shows both the hiding and that a home-directory socket stays reachable.
+
+**`--expose PATH`.** The path must exist (refused otherwise, and `/` is
+refused). It is canonicalised, held open by I before any mount changes, and
+after the mount layer bound back into place if the path no longer names
+the same object (creating parent directories in the private runtime
+directory as needed); then it gets a Landlock rule. A file in the walk's
+list is skipped if exposed. `--expose` inside a `--hide` path is refused.
+Exposing gives the command whatever the daemon behind the socket can do.
+
+**`--display`.** Off by default: an X11 server lets any client send key
+and mouse events to any other window, so a command with the display could
+type into a host terminal. Wayland compositors are stricter, but what they
+allow varies with the compositor. One flag turns it on: it exposes the
+Wayland socket named by `WAYLAND_DISPLAY` (relative to `XDG_RUNTIME_DIR`
+or absolute), the X11 socket for a local `DISPLAY` (`:N` gives
+`/tmp/.X11-unix/XN`; a display over the network is never exposed), and the
+`XAUTHORITY` file. With neither found it refuses. The start line lists the
+display sockets separately (`display exposed: ...`). X11 clients usually
+also try the abstract socket `@/tmp/.X11-unix/XN`, which does not exist in
+the sandbox's network namespace; they fall back to the path.
+
+**What the default breaks, on purpose.** Anything that needs a host
+daemon over a socket: the session and system D-Bus, `systemctl --user`,
+`ssh-agent` (`SSH_AUTH_SOCK`), `gpg-agent`, PulseAudio and PipeWire,
+logging to syslog or the journal (messages are lost), and user and group
+names served by a daemon (sssd, systemd-userdb, nscd: `ls -l` then shows
+numbers for directory users). Each can be brought back with `--expose`
+(for example `--expose "$SSH_AUTH_SOCK"`). The environment is not changed:
+variables such as `DBUS_SESSION_BUS_ADDRESS` still point at the hidden
+paths, and programs fail to connect as they would with the daemon down.
+
+## The terminal, job control and inherited descriptors
+
+**Standard streams.** The command gets the caller's stdin, stdout and
+stderr; every other descriptor is closed at `exec`. A stream that is a
+socket came from the caller's network namespace, outside the filter: a UDP
+socket can send to any address (also when connected), an unconnected TCP
+socket can be connected anywhere, a listening one accepts anyone. Those
+are refused before anything runs. A connected TCP stream reaches only its
+peer, which the caller chose (`playpen ... | nc host port` is the caller's
+own decision), and a Unix socket is covered by Landlock; both are allowed.
+The protocol behind a stream socket is not checked (SCTP one-to-one
+sockets would pass).
+
+**Job control.** The command stays in the terminal's foreground process
+group, as without playpen, so Ctrl-C, Ctrl-\, resizes and reading from the
+terminal reach it directly from the kernel. Ctrl-Z needed work: in v0.1 it
+stopped playpen (P) and the command, but a process in another process
+group (one started with `setsid`, or a job of a shell with job control)
+kept running while P, which enforces the end time and re-reads the pass,
+was stopped. Now P, C, S and I block the job-control signals. P reads
+SIGTSTP from its signalfd, asks I (one byte on the pipe P already used for
+"go") to freeze the sandbox, and stops itself with SIGSTOP, so the shell
+reports the job as stopped. I sends SIGSTOP to every process in the PID
+namespace that is not stopped already, repeating until a pass finds
+nothing new, and remembers them. On `fg` or `bg` the shell continues P,
+P reads SIGCONT and asks I to thaw, and I continues the processes it
+stopped (not those that were stopped before, such as a job a shell inside
+suspended). P never stops for terminal input or output (SIGTTIN and
+SIGTTOU are blocked in it). A shell inside (`playpen run -- bash -i`) takes
+the terminal for its own jobs; Ctrl-Z then suspends its foreground job, as
+usual. The test `ctrl_z_stops_the_whole_sandbox_and_fg_resumes_it` uses a
+child in its own session; with the freeze disabled, it fails (checked).
+
+What is left: SIGSTOP sent to playpen directly (`kill -STOP`), which
+cannot be caught, stops P without freezing the sandbox. While P is stopped
+like that, the end time and the pass re-read are not enforced; they are as
+soon as P continues. The filter itself is in the kernel and keeps working.
+
+**New session where `TIOCSTI` works.** Where the kernel still lets an
+unprivileged process push input into its controlling terminal (kernels
+before the `dev.tty.legacy_tiocsti` setting, or with it set to 1), a
+command could queue a shell command for the operator's shell to read after
+playpen exits. There playpen runs the command in a new session (`setsid`
+in X), with no controlling terminal: `TIOCSTI` needs the terminal to be the
+caller's controlling one. `--new-session` forces this mode. The price: the
+terminal no longer signals the command, so P passes kernel-generated
+SIGINT, SIGQUIT and SIGWINCH on, and I sends everything it passes on to the
+command's whole process group, as the terminal would; Ctrl-Z works through
+the freeze; but `/dev/tty` cannot be opened (password prompts of `ssh` or
+`sudo` fail) and a shell inside has no job control. Reading from the
+terminal on stdin works.
+
+## AppArmor
+
+Some distributions (Ubuntu 24.04 and later, for example) set
+`kernel.apparmor_restrict_unprivileged_userns = 1`. There an unprivileged
+program can still create a user namespace, but it holds no capabilities in
+it unless an AppArmor profile allows it, so playpen's first privileged
+step (writing the uid map, a mount, bringing up `lo`) fails with "Operation
+not permitted". `doctor` reports the setting. When `run` fails before the
+command starts and the setting is 1, the message says so and what to do.
+An administrator can allow playpen with a profile like this, saved as
+`/etc/apparmor.d/playpen` and loaded with `apparmor_parser -r
+/etc/apparmor.d/playpen` (adjust the path to the installed binary):
+
+```text
+abi <abi/4.0>,
+include <tunables/global>
+
+profile playpen /usr/local/bin/playpen flags=(unconfined) {
+  userns,
+  include if exists <local/playpen>
+}
+```
+
+This is the pattern Ubuntu uses for other programs that need user
+namespaces. The alternative is setting the sysctl to 0, which lifts the
+restriction for every program. Neither was tested: the development machine
+has no AppArmor.
 
 ## Passes (`--pass`)
 
@@ -185,35 +375,53 @@ matter for safety:
 | Traffic to any unapproved address, port or protocol, IPv4 or IPv6 | output policy drop; only listed `daddr`+`dport`+protocol accepted | yes (TCP, UDP, IPv6, network ranges, protocol mismatch) |
 | IPv6 forgotten while IPv4 is filtered | `inet` family table covers both; an IPv4 approval never opens IPv6 | yes |
 | ICMP / ICMPv6 as a side channel | not approvable; only neighbour solicitation/advertisement with hop limit 255 (link-local by RFC 4861) pass; kernel MLD reports and router solicitations are dropped silently; ICMP errors for accepted flows pass as `related` | NDP needed for pasta works (IPv6 tests pass through pasta-configured namespaces); not tested separately |
-| pasta's gateway mapped to the host's loopback | `--map-host-loopback none`; and the gateway address is not approved, so the filter drops it too | flag checked by unit test; filter drop covered by "different address blocked". Not tested end to end, because testing it would need an approval of the real gateway, which would send to the LAN router if the mapping were off |
+| pasta's gateway mapped to the host's loopback | `--map-host-loopback none`; and unless approved, the filter drops the gateway too | yes, end to end (`tests/gateway.rs`): playpen runs inside a throwaway network namespace whose only outside is a `dummy` interface, with gateway 192.0.2.1. With the gateway approved, a connection to it does not arrive at a listener on that namespace's wildcard address; with a pasta wrapper that drops the flag (the control) it does; unapproved, it is dropped and counted. The test reads the gateway pasta configured from `/proc/net/route` inside. Nothing can leave the machine: the dummy interface discards everything |
 | pasta forwarding namespace loopback ports to the host (`-T auto`, its default) | `--tcp-ns none --udp-ns none`. The filter does **not** catch this: it accepts loopback inside the namespace, and pasta's sockets there are spliced to the host | yes: a host listener on 127.0.0.1 and ::1 below 32768 is not reached. Removing the flags makes the test fail (checked). Note: pasta's auto mode skips the ephemeral range, so a test on an ephemeral port proves nothing |
 | pasta forwarding host ports into the namespace | `--tcp-ports none --udp-ports none`; input chain drops new inbound connections anyway | flag unit-tested |
 | DNS forwarded by pasta | `--dns none --search none`, no `--dns-forward`; port 53 to the gateway is not approved | flag unit-tested |
-| Names resolved by host daemons over filesystem sockets (systemd-resolved varlink, nscd, avahi) | generated `nsswitch.conf` with `hosts: files`; their sockets are bound over with `/dev/null` | `--host` name resolves, other names do not |
+| Names resolved by host daemons over filesystem sockets (systemd-resolved varlink, nscd, avahi) | generated `nsswitch.conf` with `hosts: files`; their sockets are refused like every host socket | `--host` name resolves, other names do not; the sockets are in the walk of `no_host_socket_is_connectable_from_inside` |
 | Host files changed | none are: all overrides are bind mounts in a private mount namespace | yes (`/etc/hosts` unchanged) |
 | Command changes the rules, adds addresses or links, opens raw/packet sockets, joins init's user namespace, reads init's memory | nested user namespace, no capabilities, init non-dumpable | yes, each one, for the command and for a grandchild; and the rules still block after the command ran `nft flush ruleset` |
 | Command joins the host's network namespace | it would need `CAP_SYS_ADMIN` in the host's user namespace; host processes are invisible (PID namespace, fresh `/proc`) | indirectly (no capabilities; `setns` to init's namespace denied) |
-| Inherited sockets from the caller (a host-namespace socket on fd 3+) | every descriptor above 2 is marked close-on-exec before the sandbox starts | not tested |
+| Inherited sockets from the caller (a host-namespace socket on fd 3+) | every descriptor above 2 is marked close-on-exec before the sandbox starts | yes (file, Unix, TCP, UDP, listener, pipe) |
+| Standard streams that are host-network sockets (UDP, unconnected or listening TCP, other families) | refused before anything runs | yes |
 | Children and daemons escaping | PID namespace; init's exit kills them all | yes (a background job does not outlive the command) |
-| Host daemons that start processes or open connections for the command (session/system D-Bus, systemd user manager, podman, docker, dirmngr, PulseAudio tunnels) | known sockets hidden (`/dev/null` bind for sockets, empty read-only tmpfs for directories); `--hide` for more | the session bus is no longer a socket inside |
+| Host daemons reached over pathname Unix sockets (buses, service managers, container engines, agents, resolvers, syslog, browser automation, sync clients), anywhere in the file system | Landlock `RESOLVE_UNIX`: refused unless exposed; private runtime and X11/ICE/tmux directories; `--expose` brings a path back | yes: every socket under the runtime directory, `/run`, `/var/run`, `/tmp`, `/var/tmp`, `/dev/shm` and the home directory is unreachable; exposed ones are reachable, their siblings not |
+| The same on kernels without Landlock ABI 9 (`--without-landlock`) | mount layer, plus `/dev/null` over every socket under `/run`, `/tmp`, `/var/tmp` at start | yes for those places; the test also shows a home-directory socket stays reachable |
+| Abstract Unix sockets of the host | own network namespace; Landlock scope | yes |
+| Host processes' System V IPC, message queues, `/dev/shm` | own IPC namespace, fresh `/dev/mqueue`, private `/dev/shm` | yes |
+| The display server typing into host windows | display sockets refused and hidden unless `--display` | yes |
+| Input pushed into the operator's terminal (`TIOCSTI`) | refused by the kernel (`legacy_tiocsti = 0`), else new session without a controlling terminal | yes (both modes; see the Unix sockets section for what that shows here) |
+| The command running on while playpen is suspended (Ctrl-Z), unchecked by the end time and the pass re-read | P freezes every process in the sandbox through I before it stops | yes, with a child outside the terminal's process group; the test fails without the freeze |
 | ptrace of the privileged helper or of playpen | helpers non-dumpable; playpen and other host processes invisible in the PID namespace; Yama ptrace_scope 1 on this machine adds another layer | `/proc/1/mem` and `/proc/1/ns/user` denied |
 | A fake or broken `nft` | output structure verified after load | yes |
 | pasta not coming up | its exit status is checked; the command is not started | yes (fake pasta) |
 | Approval running out while the command runs | timer in playpen: SIGTERM, then SIGKILL after 3 s to the PID namespace's init | yes, both paths |
-| A pass revoked, deleted or edited (destination in use) while the command runs | re-read every 2 s; SIGTERM, then SIGKILL after 3 s | yes (revoke, delete, port change) |
+| A pass revoked, deleted or edited (destination in use) while the command runs | re-read every 2 s; SIGTERM, then SIGKILL after 3 s | yes (revoke, delete, port change; and SIGKILL for a command that ignores SIGTERM after a revocation) |
 | A pass edited to add a destination or extend the window during a run | rules and end time fixed at start; never reloaded | yes (added destination stays blocked) |
-| A pass swapped for a symbolic link, or made writable by others | hallpass's loader refuses both, at start and on every re-read | at start (symlink, mode 0666) |
+| A pass swapped for a symbolic link, or made writable by others | hallpass's loader refuses both, at start and on every re-read | yes, at start (symlink, mode 0666) and during the run (renamed over by a symlink; mode 0620 and 0602) |
 | `--allow` adding a destination beside a pass | refused | yes |
 
 ## What is not closed
 
-- **Filesystem sockets to host daemons in general.** The abstract socket
-  namespace is per network namespace, so abstract sockets are isolated,
-  but a path socket is reachable by anyone with file permissions. playpen
-  hides a list of known dangerous ones. Others on your machine (an
-  ssh-agent with forwarding, a local proxy's control socket, an X server, a
-  Wayland compositor, an editor's server) remain reachable. If one of them
-  can make network connections for a client, it is a way out. Use `--hide`.
+- **Exposed sockets.** `--expose` and `--display` give the command
+  whatever the daemon behind the socket can do, including handing it
+  descriptors (`SCM_RIGHTS`) that belong to the host's network. The start
+  line and the report list every exposed path.
+- **Without Landlock** (`--without-landlock`): sockets outside `/run`,
+  `/tmp`, `/var/tmp` and the runtime directory, sockets created after the
+  start, and sockets a daemon recreates during the run stay reachable.
+- **Files as a channel.** A host process that reads files or named pipes
+  the command can write (a sync client watching the home directory, a print
+  spooler, a mail drop), and network file systems (NFS, SMB, sshfs and
+  other FUSE mounts outside the runtime directory), carry data off the
+  machine. playpen does not confine files; `--hide` covers known places.
+- **Other terminals of the same user.** The command can open the user's
+  other `/dev/pts/N` and write to them or read keystrokes from them. Not a
+  network path.
+- **SIGSTOP to playpen itself.** Unlike Ctrl-Z it cannot be caught: P stops
+  without freezing the sandbox, and the end time and the pass re-read wait
+  until P continues. The kernel's filter keeps working.
 - **The approved destination.** If it is a proxy, a VPN endpoint or a
   jump host, traffic continues from there. playpen cannot see it.
 - **Volume and content.** No rate limits, no inspection.
@@ -236,8 +444,6 @@ matter for safety:
   content back between two re-reads, or edit it before the run starts;
   hallpass's own threat model applies (it does not protect against a
   writer of the engagement directory).
-- **Interactive job control** (a shell inside playpen using Ctrl-Z and
-  `fg`) was not tested.
 
 ## Things that did not work rootless, and what was done instead
 

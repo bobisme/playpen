@@ -96,6 +96,8 @@ enum ProbeCmd {
         #[arg(long = "try")]
         tries: Vec<String>,
     },
+    /// Send one datagram by address to a Unix datagram socket.
+    UnixSend { path: String },
     /// List the open file descriptors.
     Fds,
     /// Try TIOCSTI on standard input and opening /dev/tty.
@@ -302,6 +304,10 @@ fn probe(what: ProbeCmd) -> i32 {
         },
         ProbeCmd::Fds => {
             println!("{}", crate::probe::fds());
+            0
+        }
+        ProbeCmd::UnixSend { path } => {
+            println!("{}", crate::probe::unix_send(&path));
             0
         }
         ProbeCmd::Tty => {
