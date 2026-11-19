@@ -1,14 +1,16 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! playpen: run a command with its network egress limited to the literal
+//! addresses, ports and protocols that were approved.
+//!
+//! See `README.md` for usage and `docs/DESIGN.md` for the mechanism.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod approval;
+pub mod cli;
+pub mod doctor;
+pub mod netlink;
+pub mod pasta;
+pub mod probe;
+pub mod report;
+pub mod resolver;
+pub mod ruleset;
+pub mod sandbox;
+pub mod tools;
