@@ -441,9 +441,19 @@ fn run_then(
     after: Duration,
     change: impl FnOnce(),
 ) -> (Output, Duration, serde_json::Value) {
+    run_cmd_then(pass, &["sleep", "30"], after, change)
+}
+
+/// Like [`run_then`], with any command.
+fn run_cmd_then(
+    pass: &Path,
+    command: &[&str],
+    after: Duration,
+    change: impl FnOnce(),
+) -> (Output, Duration, serde_json::Value) {
     let rep = pass.with_extension("report.json");
     let started = Instant::now();
-    let child = spawn(&[
+    let mut args = vec![
         "run",
         "--pass",
         s(pass),
@@ -452,9 +462,9 @@ fn run_then(
         "--report",
         s(&rep),
         "--",
-        "sleep",
-        "30",
-    ]);
+    ];
+    args.extend_from_slice(command);
+    let child = spawn(&args);
     std::thread::sleep(after);
     change();
     let out = child.wait_with_output().unwrap_or_else(|e| panic!("{e}"));
@@ -506,6 +516,80 @@ fn deleting_the_pass_stops_the_command() {
     assert!(took < Duration::from_millis(5700), "took {took:?}");
     assert!(err.contains("can no longer be read"), "{err}");
     assert_eq!(json["stopped_by_pass"], true);
+}
+
+#[test]
+fn a_revoked_pass_kills_a_command_that_ignores_sigterm() {
+    require_sandbox!();
+    let dir = tmpdir("revoke-kill");
+    let contents = valid_pass(&[WEB]);
+    let pass = new_pass(&dir, &contents);
+    let (out, took, json) = run_cmd_then(
+        &pass,
+        &["sh", "-c", "trap '' TERM; while :; do sleep 0.2; done"],
+        Duration::from_millis(800),
+        || {
+            write_pass(
+                &pass,
+                &contents.replace("revoked = false", "revoked = true"),
+            );
+        },
+    );
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 9), "{err}");
+    // The grace must have been waited out before SIGKILL...
+    assert!(took >= Duration::from_millis(800 + 3000), "took {took:?}");
+    // ...and not much more than the edit, one interval and the grace.
+    assert!(
+        took < Duration::from_millis(800 + 200 + 3000 + 1500),
+        "took {took:?}"
+    );
+    assert!(err.contains("revoked"), "{err}");
+    assert!(err.contains("SIGKILL"), "{err}");
+    assert_eq!(json["stopped_by_pass"], true);
+    assert_eq!(json["signal"], 9);
+}
+
+#[test]
+fn a_pass_swapped_for_a_symlink_stops_the_command() {
+    require_sandbox!();
+    let dir = tmpdir("swap-symlink");
+    let contents = valid_pass(&[WEB]);
+    let pass = new_pass(&dir, &contents);
+    // The link points at an identical, valid pass: only the link itself
+    // is wrong.
+    let target = dir.join("elsewhere.pass.toml");
+    write_pass(&target, &contents);
+    let (out, took, json) = run_then(&pass, Duration::from_millis(800), || {
+        let tmp = dir.join("link.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        std::os::unix::fs::symlink(&target, &tmp).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::rename(&tmp, &pass).unwrap_or_else(|e| panic!("{e}"));
+    });
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 15), "{err}");
+    assert!(took < Duration::from_millis(5500), "took {took:?}");
+    assert!(err.contains("symlink"), "{err}");
+    assert_eq!(json["stopped_by_pass"], true);
+}
+
+#[test]
+fn a_pass_made_writable_by_others_stops_the_command() {
+    use std::os::unix::fs::PermissionsExt as _;
+    require_sandbox!();
+    for mode in [0o620, 0o602] {
+        let dir = tmpdir(&format!("chmod-{mode:o}"));
+        let pass = new_pass(&dir, &valid_pass(&[WEB]));
+        let (out, took, json) = run_then(&pass, Duration::from_millis(800), || {
+            std::fs::set_permissions(&pass, std::fs::Permissions::from_mode(mode))
+                .unwrap_or_else(|e| panic!("{e}"));
+        });
+        let err = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(128 + 15), "mode {mode:o}: {err}");
+        assert!(took < Duration::from_millis(5500), "took {took:?}");
+        assert!(err.contains("insecure-permissions"), "{err}");
+        assert_eq!(json["stopped_by_pass"], true);
+    }
 }
 
 #[test]
