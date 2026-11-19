@@ -9,6 +9,13 @@ It is a guard for tools that do not police themselves. A tool that follows
 a redirect, resolves a name to an unexpected address, or was configured
 with the wrong target cannot reach anywhere else.
 
+The approval normally comes from a [hallpass](../hallpass) pass: the
+owner's written permission as a file (owner, literal destinations, a time
+window, a revocation marker). playpen allows exactly the pass's
+destinations until the window ends, and stops the command if the pass is
+revoked while it runs. For a quick run you can give the destinations on the
+command line with `--allow` instead.
+
 - [docs/spec.md](docs/spec.md): what playpen does, exactly: every command,
   option, exit code and report field. Start here.
 - [docs/DESIGN.md](docs/DESIGN.md): why it is built this way, and the leaks
@@ -27,15 +34,62 @@ ok   allowed reached, others blocked: TCP, UDP and IPv6 to in-sandbox addresses:
 ok   command cannot change the network: nft, netlink address/link changes, raw and packet sockets all denied; no capabilities
 playpen can run here.
 
+$ cat engagement.pass.toml          # written with hallpass init, mode 0600
+format = 1
+id = "example-2026-11"
+name = "Example web app"
+
+[approval]
+owner = "Pat Owner, Example Corp"
+reference = "email of 2026-11-18"
+operator = "Sam Tester"
+valid_from = 2026-11-19T08:00:00Z
+valid_until = 2026-11-19T17:00:00Z
+revoked = false
+
+[[destination]]
+label = "app"
+address = "192.0.2.10"
+protocol = "tcp"
+ports = 443
+hostname = "app.example.test"     # informational: grants nothing
+
+$ playpen run --pass engagement.pass.toml \
+              --host app.example.test=192.0.2.10 \
+              -- curl -sS https://app.example.test/
+playpen: under pass example-2026-11 ("Example web app", owner "Pat Owner, Example Corp", sha256:3f1c..., window ends 2026-11-19T17:00:00Z, destinations app): allowing only 192.0.2.10:443/tcp until 2026-11-19T17:00:00Z (no DNS, names app.example.test=192.0.2.10); everything else is dropped
+...curl output...
+playpen: command exited with status 0
+playpen: no packets to unapproved destinations were dropped
+```
+
+playpen refuses to start (exit 2, "nothing was run") when the pass is
+invalid, unreadable, a symbolic link, writable by others, not yet valid,
+expired or revoked. `--only LABEL` narrows the pass to some destinations;
+`--until` can end the run earlier than the window, never later. The pass's
+host names are never resolved for you; map them with `--host`.
+
+While the command runs, playpen re-reads the pass every 2 seconds. If the
+owner revokes it (`revoked = true`), the window ends, the file disappears
+or stops validating, or a destination in use is changed, playpen stops the
+command (SIGTERM, then SIGKILL after 3 seconds) and says why. Other edits
+(a raised ceiling, a later end) do not stop it, and do not apply to the
+running command either: the rules are fixed at start and never widened.
+playpen does not use the pass's ceilings; it limits where packets go, not
+how many.
+
+The quick form, without a pass:
+
+```console
 $ playpen run --allow 192.0.2.10:443/tcp \
               --host app.example.test=192.0.2.10 \
               --until 2026-11-19T18:00:00+01:00 \
               -- curl -sS https://app.example.test/
 playpen: allowing only 192.0.2.10:443/tcp until 2026-11-19T17:00:00Z (no DNS, names app.example.test=192.0.2.10); everything else is dropped
-...curl output...
-playpen: command exited with status 0
-playpen: no packets to unapproved destinations were dropped
 ```
+
+`--pass` and `--allow` cannot be combined: an `--allow` beside a pass would
+add a destination the owner did not approve.
 
 If the tool tries to go somewhere else, the connection fails at once
 ("No route to host" for TCP, "Operation not permitted" for UDP), and
@@ -53,6 +107,7 @@ playpen: ************************************************************
 To see the firewall rules without running anything:
 
 ```console
+$ playpen rules --pass engagement.pass.toml
 $ playpen rules --allow 192.0.2.10:443/tcp --allow '[2001:db8::10]:443/tcp'
 ```
 
@@ -99,7 +154,10 @@ playpen does not guard against:
 - the approved destination itself forwarding traffic elsewhere (an approved
   proxy is a way out to wherever that proxy goes);
 - what is sent: playpen limits where packets go, not how many or what they
-  contain.
+  contain (so it does not enforce a pass's ceilings);
+- the few seconds between a pass being revoked and the command being
+  stopped (the next re-read, up to 2 s, plus the 3 s grace), and anyone who
+  can write the pass file.
 
 ## License
 

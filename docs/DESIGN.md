@@ -50,6 +50,96 @@ shows as `nobody`, and supplementary groups cannot be dropped (writing
 count for file access. That is why the docker socket is hidden: a member of
 the `docker` group could otherwise start a container on the host network.
 
+## Passes (`--pass`)
+
+A hallpass pass is the owner's written approval in a form a tool can
+check. `--pass` exists so the operator does not retype it as `--allow`
+flags, where a typo widens or narrows the approval without anyone
+noticing.
+
+**hallpass's own loader, not a second parser.** playpen calls
+`hallpass::load`, so the pass is held to exactly the rules `hallpass check`
+applies (no links, mode, size, every validation rule), and an operator sees
+the same codes and messages from both tools. The price is three crates
+(sha2, toml, thiserror, with their own small dependencies). playpen
+depends on hallpass with `default-features = false`: hallpass's binary and
+clap sit behind its default `cli` feature, added for this.
+
+**Same `Approval`, plus a watch handle.** The pass becomes the same list of
+allow rules and the same end time as `--allow` and `--until`; the
+namespace code is unchanged except that the supervisor (P) holds a
+`PassWatch` and calls it on a timer. Nothing about the start-up order or
+the ruleset changes.
+
+**`--pass` and `--allow` cannot be combined.** The point of a pass is that
+every reachable destination is one the owner put in writing. An `--allow`
+beside it would add a destination nobody approved, and the report would
+still name the pass and its owner, which would be misleading. `--only`
+exists to go the other way: narrow the pass, never widen it. `--no-network`
+with a pass is refused as a contradiction.
+
+**`--until` only shortens.** The owner's `valid_until` is the outer limit;
+an operator may want to stop earlier (end of a working day), never later.
+
+**A name grants nothing.** A destination's `hostname` is informational in
+hallpass. playpen never writes it into `/etc/hosts` on its own: doing so
+would make the pass's text, not the operator, decide what a name resolves
+to inside the sandbox, and a wrong `hostname` would silently send a tool to
+the destination of another label. The start line says how to map it with
+`--host` instead, and `--host` must point at an address of a destination in
+use.
+
+**Loopback destinations are refused.** hallpass allows `127.0.0.0/8` and
+`::1` when listed. playpen cannot enforce them: inside the sandbox loopback
+is always allowed and is the sandbox's own, and the host's loopback is not
+reachable at all. Refusing (with a hint to leave the label out with
+`--only`) is clearer than a rule that means something else.
+
+**Ceilings are not spent.** playpen sees packets, not calls or requests,
+and cannot tell what one unit of a ceiling is. Spending would need a
+meaning it does not have, so it neither spends nor mentions ceilings. The
+tool that knows its units spends.
+
+**Re-reading while the command runs.** The pass can be revoked or edited
+during a run. P re-reads it every 2 seconds, once more just before the
+command starts, and judges the result:
+
+- anything that makes the pass permit nothing (unreadable, invalid,
+  revoked, expired, not yet valid) stops the command;
+- an edit to anything the run relies on stops it: the `id` or
+  `approval.owner` (the identity the report names), or any destination in
+  use (by label: removed, or converting to different allow rules, even if
+  wider);
+- any other edit is reported once and the run continues **under the rules
+  loaded at start**.
+
+Why keep running rather than stop on any change: the ruleset in the kernel
+is fixed when the sandbox starts, and playpen never changes it afterwards
+(C, the process that holds the capabilities over the network namespace,
+only waits after "go" and reads the drop counters at the end; reloading
+rules mid-run would add a second load, and a moment of changing rules, to
+the most sensitive step). So an edit can never widen the running command's
+access, whatever it says, and every edit that would narrow what is in use
+already stops it. What is left (a raised ceiling, a later `valid_until`, a
+new destination, a corrected `reference`) changes nothing the command can
+do. Stopping a long scan because the owner raised a ceiling it does not
+even use would only teach operators to avoid editing the pass during a
+run, which is when revocation matters. The notice tells the operator that
+the edit does not apply until a new run. A later `valid_until` does not
+extend the run: the end time is fixed at start like the rules.
+
+Why polling and not inotify: editors replace files by rename, which an
+inotify watch on the old inode misses unless the directory is watched too;
+a deleted or moved directory needs more cases; polling a small file every
+2 seconds costs nothing measurable and fails closed in every case (a file
+that cannot be read stops the run). A file caught half-written also stops
+the run; editors that write a new file and rename it never show one.
+
+The interval is the delay between the owner's revocation reaching the file
+and SIGTERM. 2 seconds keeps that well below a human reaction time without
+measurable load. It is the constant `pass::RECHECK_INTERVAL`; the hidden
+`--pass-recheck-ms` may only shorten it (tests use 200 ms).
+
 ## The mechanism, step by step
 
 The process tree and the order are given in the spec. The points that
@@ -110,6 +200,10 @@ matter for safety:
 | A fake or broken `nft` | output structure verified after load | yes |
 | pasta not coming up | its exit status is checked; the command is not started | yes (fake pasta) |
 | Approval running out while the command runs | timer in playpen: SIGTERM, then SIGKILL after 3 s to the PID namespace's init | yes, both paths |
+| A pass revoked, deleted or edited (destination in use) while the command runs | re-read every 2 s; SIGTERM, then SIGKILL after 3 s | yes (revoke, delete, port change) |
+| A pass edited to add a destination or extend the window during a run | rules and end time fixed at start; never reloaded | yes (added destination stays blocked) |
+| A pass swapped for a symbolic link, or made writable by others | hallpass's loader refuses both, at start and on every re-read | at start (symlink, mode 0666) |
+| `--allow` adding a destination beside a pass | refused | yes |
 
 ## What is not closed
 
@@ -136,6 +230,12 @@ matter for safety:
   process it started are gone, so the final content is playpen's, unless
   the command replaced the path with another file. Put the report in a
   directory the command is not expected to touch.
+- **The re-read gap.** A revoked pass stops the command at the next
+  re-read (up to 2 s) plus the grace (3 s); the command can still send in
+  that time. Anyone who can write the pass file can also put the old
+  content back between two re-reads, or edit it before the run starts;
+  hallpass's own threat model applies (it does not protect against a
+  writer of the engagement directory).
 - **Interactive job control** (a shell inside playpen using Ctrl-Z and
   `fg`) was not tested.
 
