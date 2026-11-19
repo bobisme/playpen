@@ -98,6 +98,14 @@ enum ProbeCmd {
     },
     /// List the open file descriptors.
     Fds,
+    /// Try TIOCSTI on standard input and opening /dev/tty.
+    Tty,
+    /// Listen on ADDR:PORT/tcp for MS milliseconds; print the connections.
+    Listen {
+        target: String,
+        #[arg(long, default_value_t = 5000)]
+        ms: u64,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -295,6 +303,23 @@ fn probe(what: ProbeCmd) -> i32 {
         ProbeCmd::Fds => {
             println!("{}", crate::probe::fds());
             0
+        }
+        ProbeCmd::Tty => {
+            println!("{}", crate::probe::tty());
+            0
+        }
+        ProbeCmd::Listen { target, ms } => {
+            match crate::probe::parse_target(&target).and_then(|t| crate::probe::listen_tcp(t, ms))
+            {
+                Ok(v) => {
+                    println!("{v}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("probe: {e}");
+                    EXIT_ERROR
+                }
+            }
         }
     }
 }

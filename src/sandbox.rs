@@ -1064,13 +1064,23 @@ fn stage_i(
         return Err(String::from_utf8_lossy(&msg).trim().to_owned());
     }
     write_line(up_w, "started");
-    init_loop(child, &sigfd, up_w, down_r)
+    // In its own session the command leads its own process group, and
+    // the terminal no longer signals it: send what P passes on to the whole
+    // group, as the terminal would.
+    let target = if plan.new_session {
+        Pid::from_raw(-child.as_raw())
+    } else {
+        child
+    };
+    init_loop(child, target, &sigfd, up_w, down_r)
 }
 
-/// I's work while the command runs: pass signals on, freeze and thaw on
-/// P's request, reap orphans, and report how the command ended.
+/// I's work while the command runs: pass signals on to `target`, freeze
+/// and thaw on P's request, reap orphans, and report how the command
+/// ended.
 fn init_loop(
     child: Pid,
+    target: Pid,
     sigfd: &SignalFd,
     up_w: &OwnedFd,
     down_r: &OwnedFd,
@@ -1115,7 +1125,7 @@ fn init_loop(
         if sig != Signal::SIGCHLD {
             // Job-control signals are P's business (freeze and thaw).
             if FORWARDED.contains(&sig) && info.ssi_code != SI_KERNEL {
-                let _ = kill(child, sig);
+                let _ = kill(target, sig);
             }
             continue;
         }

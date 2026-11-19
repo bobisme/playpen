@@ -232,6 +232,59 @@ pub fn unix(listen: &[String], tries: &[String]) -> Result<Vec<Value>, String> {
     Ok(lines)
 }
 
+/// `probe listen`: listens on a TCP address for `ms` milliseconds.
+///
+/// Prints `{"listening": ADDR}` once the socket is bound, `{"accepted":
+/// FROM}` for each connection as it arrives, and the count at the end.
+///
+/// # Errors
+/// When the address cannot be bound.
+pub fn listen_tcp(target: Target, ms: u64) -> Result<Value, String> {
+    use std::io::Write as _;
+    let listener =
+        TcpListener::bind(target.addr).map_err(|e| format!("listen {}: {e}", target.addr))?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    println!("{}", json!({"listening": target.addr.to_string()}));
+    let _ = std::io::stdout().flush();
+    let end = std::time::Instant::now() + Duration::from_millis(ms);
+    let mut accepted = 0u32;
+    while std::time::Instant::now() < end {
+        match listener.accept() {
+            Ok((_, from)) => {
+                accepted += 1;
+                println!("{}", json!({"accepted": from.to_string()}));
+                let _ = std::io::stdout().flush();
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    Ok(json!({"total": accepted}))
+}
+
+/// `probe tty`: whether this process can push a character into the input
+/// of the terminal on standard input (`TIOCSTI`), and open `/dev/tty`.
+///
+/// The character pushed would be a NUL byte, harmless if it got through.
+#[must_use]
+pub fn tty() -> Value {
+    let byte: libc::c_char = 0;
+    // SAFETY: TIOCSTI reads exactly one `char` through the pointer, which
+    // points at a live local. On a descriptor that is not a terminal the
+    // kernel only returns an error.
+    let rc = unsafe { libc::ioctl(0, libc::TIOCSTI, &raw const byte) };
+    let tiocsti = if rc == 0 {
+        Ok(())
+    } else {
+        Err(Errno::last().to_string())
+    };
+    let dev_tty = std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/tty")
+        .map(drop)
+        .map_err(|e| e.to_string());
+    json!({"tiocsti": outcome(tiocsti), "dev_tty": outcome(dev_tty)})
+}
+
 /// `probe fds`: the descriptors this process has open, with what they
 /// point to.
 #[must_use]
