@@ -2,5 +2,13 @@
 name = "playpen"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Run any command with its network egress limited to the literal addresses you approved"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+unnecessary_wraps = "allow"
 
 [dependencies]
