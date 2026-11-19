@@ -2,3 +2,5 @@
 # fields: timestamp	agent	type	item_id	data
 1795057768361900	sippycup-2u2m2v	itc:AQ		item.create	bn-22n	{"description":"A known list is hidden (session D-Bus, podman/docker, resolved, nscd, avahi) plus --hide. Anything unlisted stays reachable. Consider hiding /run/user/UID and abstract sockets wholesale with an allow option.","kind":"task","size":"m","title":"Filesystem sockets to host daemons remain a way out of the sandbox"}	blake3:jF3fK33-kM8D24xsvDr5tWpccU8gKV6YK2pcZJHkpvM
 1795057768452804	sippycup-2u2m2v	itc:AQ		item.create	bn-6xd	{"description":"Not tested in v0.1 per the builder's report.","kind":"task","size":"s","title":"Test closing of inherited descriptors and interactive job control"}	blake3:1s5kmaBcxo-c6m9klgBPZbXxFB1EZ1SrSveFW3n9f98
+1795106633455925	sippycup-2u2m2v	itc:AQ		item.move	bn-22n	{"state":"done"}	blake3:IEcknfTECrwFWWcg_e36UEJZ7egMxQcpVS-4N-f0IB4
+1795106633468427	sippycup-2u2m2v	itc:AQ		item.move	bn-6xd	{"state":"done"}	blake3:PD6KTvSP-Xwhxq92YVVr7fP4cFL8In9G2U8s3a65kYI
