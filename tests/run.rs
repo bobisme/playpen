@@ -224,18 +224,17 @@ fn host_loopback_is_unreachable_by_default() {
     // Listeners on the host's loopback, outside the sandbox. pasta's default
     // automatic forwarding (which playpen turns off) skips the ephemeral
     // range, so these must be below 32768 for the test to mean anything.
-    let pick = |base: u16| -> u16 {
-        (base..base + 500)
-            .find(|p| {
-                TcpListener::bind(("127.0.0.1", *p)).is_ok()
-                    && UdpSocket::bind(("127.0.0.1", *p)).is_ok()
-            })
-            .unwrap_or_else(|| panic!("no free port near {base}"))
-    };
-    let port = pick(23_000 + u16::try_from(std::process::id() % 5000).unwrap_or(0));
-    let tcp4 = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| panic!("{e}"));
+    // Bind and keep the sockets in one step: probing for a free port and
+    // binding it afterwards races with every other process on the machine.
+    let base = 23_000 + u16::try_from(std::process::id() % 5000).unwrap_or(0);
+    let (port, tcp4, udp4) = (base..base + 500)
+        .find_map(|p| {
+            let tcp = TcpListener::bind(("127.0.0.1", p)).ok()?;
+            let udp = UdpSocket::bind(("127.0.0.1", p)).ok()?;
+            Some((p, tcp, udp))
+        })
+        .unwrap_or_else(|| panic!("no free port near {base}"));
     let tcp6 = TcpListener::bind(("::1", port)).ok();
-    let udp4 = UdpSocket::bind(("127.0.0.1", port)).unwrap_or_else(|e| panic!("{e}"));
     tcp4.set_nonblocking(true).unwrap_or_else(|e| panic!("{e}"));
     udp4.set_nonblocking(true).unwrap_or_else(|e| panic!("{e}"));
     let mut tries = vec![
