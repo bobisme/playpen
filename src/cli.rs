@@ -615,8 +615,18 @@ fn start_line_net(c: &Checked, network: bool) -> String {
                 hostname_hint(&p.named, &c.hosts),
             )
         });
+        let limited = c
+            .from_pass
+            .as_ref()
+            .filter(|p| !p.name_limited.is_empty())
+            .map_or_else(String::new, |p| {
+                format!(
+                    "\nplaypen: NOTE: the pass approves these destinations only for the listed host names: {}. playpen filters addresses and ports and cannot see the name inside a request, so it does NOT enforce this; the command must send only those names",
+                    p.name_limited.join("; ")
+                )
+            });
         format!(
-            "playpen: {under}allowing only {} {until} ({names}); everything else is dropped{hint}",
+            "playpen: {under}allowing only {} {until} ({names}); everything else is dropped{hint}{limited}",
             list.join(", ")
         )
     } else {

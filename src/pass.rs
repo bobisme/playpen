@@ -70,6 +70,10 @@ pub struct FromPass {
     pub identity: PassIdentity,
     /// Destinations in use that carry a `hostname`.
     pub named: Vec<NamedDestination>,
+    /// Destinations in use that the pass approves only for listed host
+    /// names, as `label (name, name)`. playpen filters addresses and
+    /// ports and cannot enforce this.
+    pub name_limited: Vec<String>,
     /// The handle the supervisor re-reads the pass with.
     pub watch: PassWatch,
 }
@@ -92,7 +96,12 @@ pub fn load(path: &Path, only: &[String], now: OffsetDateTime) -> Result<FromPas
     let mut rules = Vec::new();
     let mut in_use = Vec::new();
     let mut named = Vec::new();
+    let mut name_limited = Vec::new();
     for d in &selected {
+        if !d.names.is_empty() {
+            let hosts: Vec<&str> = d.names.iter().map(hallpass::HostName::as_str).collect();
+            name_limited.push(format!("{} ({})", d.label, hosts.join(", ")));
+        }
         let converted = rules_for(d).map_err(|e| {
             format!(
                 "--pass {}: destination `{}` ({}): {e}; playpen cannot enforce it. Leave it out with --only, naming the other labels",
@@ -136,6 +145,7 @@ pub fn load(path: &Path, only: &[String], now: OffsetDateTime) -> Result<FromPas
         },
         identity,
         named,
+        name_limited,
         watch,
     })
 }

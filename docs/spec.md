@@ -264,6 +264,17 @@ resolved; if the tool needs them, map them with --host NAME=ADDR
 (destination LABEL)`; for a network destination `ADDR` is written
 `ADDR-IN-NETWORK`.
 
+A destination's `names` in the pass (the only host names the owner approved
+on that address) is **not enforced**: playpen filters addresses and ports
+and cannot see the name inside a request, least of all an encrypted one.
+The rules for such a destination are the same as without `names`. When a
+destination in use lists names, a second start line says so: `playpen:
+NOTE: the pass approves these destinations only for the listed host names:
+LABEL (NAME, NAME). … it does NOT enforce this; the command must send only
+those names`. Keeping to the names is the job of the tool that writes the
+request (`hallpass permits --name`). A change to `names` alone changes no
+rule, so the running command is not stopped.
+
 **`--until RFC3339`**. The approval ends at this moment. It must be an RFC
 3339 timestamp with an explicit offset (`Z` or `+hh:mm`); `-00:00`
 ("unknown offset") is refused. A time at or before now is refused. With

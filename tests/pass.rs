@@ -737,3 +737,36 @@ fn rules_prints_the_ruleset_for_a_pass() {
     assert_eq!(out.status.code(), Some(2));
     assert!(text(&out.stderr).contains("revoked"));
 }
+
+#[test]
+fn a_pass_that_limits_names_is_enforced_by_address_only_and_playpen_says_so() {
+    require_sandbox!();
+    let dir = tmpdir("names");
+    let web = WEB.replace(
+        "hostname = \"app.example.test\"",
+        "names = [\"app.example.test\", \"admin.example.test\"]",
+    );
+    assert!(web.contains("names = "));
+    let pass = new_pass(&dir, &valid_pass(&[&web, SIP]));
+    let (r, out) = reach(
+        &["--pass", s(&pass)],
+        &["192.0.2.1:9101/tcp", "192.0.2.1:9102/tcp"],
+    );
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    // The address and port rules are unchanged by the names.
+    assert!(reached(&r, "192.0.2.1:9101/tcp"));
+    assert!(!reached(&r, "192.0.2.1:9102/tcp"));
+    let note = err.lines().find(|l| l.contains("NOTE")).unwrap_or_default();
+    assert!(
+        note.contains("web (app.example.test, admin.example.test)"),
+        "{err}"
+    );
+    assert!(note.contains("does NOT enforce"), "{note}");
+    assert!(!note.contains("sip"), "{note}");
+
+    // A pass without names prints no such note.
+    let plain = new_pass(&dir, &valid_pass(&[WEB, SIP]));
+    let (_, out) = reach(&["--pass", s(&plain)], &["192.0.2.1:9101/tcp"]);
+    assert!(!text(&out.stderr).contains("NOTE"));
+}
