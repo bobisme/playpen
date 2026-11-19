@@ -15,6 +15,7 @@ use crate::pass::{self, FromPass, MIN_RECHECK_INTERVAL, NamedDestination, RECHEC
 use crate::report::{Outcome, PassReport, Report, text_summary};
 use crate::resolver::{HostEntry, check_hosts, parse_host};
 use crate::sandbox::{self, CommandStatus, Events, Plan, RunError};
+use crate::sockets;
 
 /// Why `--pass` and `--allow` cannot be combined.
 const PASS_AND_ALLOW: &str = "--pass and --allow cannot be combined: the pass lists every destination its owner approved in writing, and an --allow beside it would add a destination the owner did not approve. Add the destination to the pass (with the owner's written approval), or use --only LABEL to narrow the pass";
@@ -87,9 +88,23 @@ enum ProbeCmd {
     },
     /// Resolve a name with the system resolver.
     Resolve { name: String },
+    /// Listen on Unix sockets, then connect to Unix sockets (@NAME:
+    /// abstract) and close at once.
+    Unix {
+        #[arg(long = "listen")]
+        listen: Vec<String>,
+        #[arg(long = "try")]
+        tries: Vec<String>,
+    },
+    /// List the open file descriptors.
+    Fds,
 }
 
 #[derive(Debug, clap::Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent command-line switches"
+)]
 struct RunArgs {
     /// A hallpass pass: allow exactly its destinations until its approval
     /// window end, and stop the command if it is revoked or edited.
@@ -117,6 +132,26 @@ struct RunArgs {
     /// /dev/null; directories: an empty read-only tmpfs). Repeatable.
     #[arg(long = "hide", value_name = "PATH")]
     hide: Vec<PathBuf>,
+    /// Let the command reach this host socket, or every socket below this
+    /// directory. Host Unix sockets are unreachable otherwise. Repeatable.
+    #[arg(long = "expose", value_name = "PATH")]
+    expose: Vec<PathBuf>,
+    /// Let graphical programs reach the display: expose the Wayland and X11
+    /// sockets the environment names, and the X authority file. An X11
+    /// server lets any client type into other windows; off by default.
+    #[arg(long)]
+    display: bool,
+    /// Run on a kernel without Landlock ABI 9: hide host sockets by mounts
+    /// only (under /run, /tmp, /var/tmp and the runtime directory). Sockets
+    /// elsewhere, and ones created after the start, stay reachable.
+    #[arg(long)]
+    without_landlock: bool,
+    /// Run the command in a new session with no controlling terminal, so
+    /// it cannot type into the caller's terminal. Automatic on kernels that
+    /// allow TIOCSTI; then Ctrl-C still reaches the command, but programs
+    /// cannot open /dev/tty.
+    #[arg(long)]
+    new_session: bool,
     /// Summary format; json requires --report.
     #[arg(long, value_enum, default_value = "text")]
     format: Format,
@@ -245,6 +280,22 @@ fn probe(what: ProbeCmd) -> i32 {
             println!("{}", crate::probe::resolve(&name));
             0
         }
+        ProbeCmd::Unix { listen, tries } => match crate::probe::unix(&listen, &tries) {
+            Ok(lines) => {
+                for l in lines {
+                    println!("{l}");
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("probe: {e}");
+                EXIT_ERROR
+            }
+        },
+        ProbeCmd::Fds => {
+            println!("{}", crate::probe::fds());
+            0
+        }
     }
 }
 
@@ -254,6 +305,48 @@ struct Checked {
     hosts: Vec<HostEntry>,
     lo_addrs: Vec<IpAddr>,
     from_pass: Option<FromPass>,
+    /// Every exposed path, canonical (`--expose` and `--display`).
+    exposed: Vec<PathBuf>,
+    /// The display sockets among them.
+    display: Vec<PathBuf>,
+}
+
+/// `--expose` and `--display`, checked: every path exists, none lies in a
+/// `--hide` path.
+fn check_exposed(args: &RunArgs) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let mut exposed = Vec::new();
+    for p in &args.expose {
+        exposed.push(sockets::check_expose(p)?);
+    }
+    let mut display = Vec::new();
+    if args.display {
+        let env = |k: &str| std::env::var(k).ok();
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+        for p in sockets::display_paths(
+            env("WAYLAND_DISPLAY").as_deref(),
+            env("DISPLAY").as_deref(),
+            env("XAUTHORITY").as_deref(),
+            runtime_dir.as_deref(),
+        )? {
+            display.push(sockets::check_expose(&p)?);
+        }
+    }
+    exposed.extend(display.iter().cloned());
+    exposed.sort();
+    exposed.dedup();
+    for h in &args.hide {
+        let Ok(hidden) = std::fs::canonicalize(h) else {
+            continue;
+        };
+        if let Some(e) = exposed.iter().find(|e| e.starts_with(&hidden)) {
+            return Err(format!(
+                "{} is both exposed and inside --hide {}; give one or the other",
+                e.display(),
+                h.display()
+            ));
+        }
+    }
+    Ok((exposed, display))
 }
 
 /// The approval from `--pass`, narrowed by `--only` and `--until`.
@@ -386,11 +479,15 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
             "--format json writes the summary to a file; give it with --report FILE".into(),
         );
     }
+    let (exposed, display) = check_exposed(args)?;
+    sandbox::check_stdio()?;
     Ok(Checked {
         approval,
         hosts,
         lo_addrs,
         from_pass,
+        exposed,
+        display,
     })
 }
 
@@ -421,7 +518,50 @@ impl Events for StderrEvents {
     }
 }
 
-fn start_line(c: &Checked, network: bool) -> String {
+fn paths(list: &[PathBuf]) -> String {
+    list.iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What the start line says about host Unix sockets.
+fn sockets_clause(c: &Checked, landlock: bool) -> String {
+    let mut out = if landlock {
+        String::from("; host Unix sockets: none reachable")
+    } else {
+        String::from(
+            "; host Unix sockets: hidden under /run, /tmp, /var/tmp and the runtime directory only (--without-landlock); sockets elsewhere stay reachable",
+        )
+    };
+    let other: Vec<PathBuf> = c
+        .exposed
+        .iter()
+        .filter(|p| !c.display.contains(p))
+        .cloned()
+        .collect();
+    if !other.is_empty() {
+        out.push_str("; exposed: ");
+        out.push_str(&paths(&other));
+    }
+    if !c.display.is_empty() {
+        out.push_str("; display exposed: ");
+        out.push_str(&paths(&c.display));
+    }
+    out
+}
+
+fn start_line(c: &Checked, network: bool, landlock: bool, new_session: bool) -> String {
+    let line = start_line_net(c, network);
+    let session = if new_session {
+        "; the command runs in its own session, without a controlling terminal"
+    } else {
+        ""
+    };
+    format!("{line}{}{session}", sockets_clause(c, landlock))
+}
+
+fn start_line_net(c: &Checked, network: bool) -> String {
     let until = c.approval.ends_at.map_or_else(
         || "with no time limit".to_owned(),
         |e| format!("until {}", e.to_rfc3339()),
@@ -484,7 +624,24 @@ fn base_report(args: &RunArgs) -> Report {
         playpen_exit_status: EXIT_REFUSED,
         dropped: None,
         dropped_error: None,
+        socket_guard: if args.without_landlock {
+            "mounts_only"
+        } else {
+            "landlock"
+        },
+        exposed: args
+            .expose
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
+        display: args.display,
+        new_session: new_session(args),
     }
+}
+
+/// Whether the command gets its own session.
+fn new_session(args: &RunArgs) -> bool {
+    args.new_session || sandbox::tiocsti_allowed()
 }
 
 fn write_report(file: Option<&mut File>, report: &Report) {
@@ -568,8 +725,18 @@ fn run(args: &RunArgs) -> i32 {
             "pasta (from the passt package) was not found; install it, set PLAYPEN_PASTA, or use --no-network; nothing was run".into(),
         );
     };
+    report.exposed = checked
+        .exposed
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
     let mut events = StderrEvents {
-        start_line: start_line(&checked, !args.no_network),
+        start_line: start_line(
+            &checked,
+            !args.no_network,
+            !args.without_landlock,
+            new_session(args),
+        ),
         until: report.until.clone(),
     };
     let plan = Plan {
@@ -578,6 +745,9 @@ fn run(args: &RunArgs) -> i32 {
         network: !args.no_network,
         lo_addrs: checked.lo_addrs,
         hide: args.hide.clone(),
+        exposed: checked.exposed,
+        landlock: !args.without_landlock,
+        new_session: new_session(args),
         command: args.command.clone(),
         nft,
         pasta,

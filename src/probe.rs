@@ -5,8 +5,13 @@ use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process::Command;
 use std::time::Duration;
 
+use std::os::fd::AsRawFd as _;
+
 use nix::errno::Errno;
-use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType, socket};
+use nix::sys::socket::{
+    AddressFamily, Backlog, SockFlag, SockProtocol, SockType, UnixAddr, bind, connect,
+    listen as listen_on, socket,
+};
 use serde_json::{Value, json};
 
 /// A probe target: `ADDR:PORT/tcp` or `ADDR:PORT/udp` (IPv6 in brackets).
@@ -166,6 +171,81 @@ pub fn privs(nft: &str) -> Value {
 fn setns_pid1() -> Result<(), String> {
     let f = std::fs::File::open("/proc/1/ns/user").map_err(|e| e.to_string())?;
     nix::sched::setns(f, nix::sched::CloneFlags::CLONE_NEWUSER).map_err(|e| e.to_string())
+}
+
+fn unix_addr(target: &str) -> Result<UnixAddr, Errno> {
+    target.strip_prefix('@').map_or_else(
+        || UnixAddr::new(target),
+        |name| UnixAddr::new_abstract(name.as_bytes()),
+    )
+}
+
+/// Connects to one Unix socket (`@NAME` for the abstract namespace) and
+/// closes at once; nothing is written. Tries stream, datagram and
+/// seqpacket in turn, since `connect` fails with `EPROTOTYPE` on a socket
+/// of another type.
+fn unix_connect(target: &str) -> Result<(), String> {
+    let addr = unix_addr(target).map_err(|e| e.to_string())?;
+    let mut last = Errno::EPROTOTYPE;
+    for ty in [SockType::Stream, SockType::Datagram, SockType::SeqPacket] {
+        let fd = socket(AddressFamily::Unix, ty, SockFlag::SOCK_CLOEXEC, None)
+            .map_err(|e| e.to_string())?;
+        match connect(fd.as_raw_fd(), &addr) {
+            Ok(()) => return Ok(()),
+            Err(Errno::EPROTOTYPE) => last = Errno::EPROTOTYPE,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err(last.to_string())
+}
+
+/// `probe unix`: listens on each of `listen` (the command's own sockets),
+/// then connects to each of `tries` and closes again. One JSON line per
+/// try: `{"path", "connected", "error"}`.
+///
+/// # Errors
+/// When a listener cannot be created.
+pub fn unix(listen: &[String], tries: &[String]) -> Result<Vec<Value>, String> {
+    let mut keep = Vec::new();
+    for path in listen {
+        let addr = unix_addr(path).map_err(|e| format!("{path}: {e}"))?;
+        let fd = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .map_err(|e| format!("socket: {e}"))?;
+        bind(fd.as_raw_fd(), &addr).map_err(|e| format!("bind {path}: {e}"))?;
+        listen_on(&fd, Backlog::new(8).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("listen {path}: {e}"))?;
+        keep.push(fd);
+    }
+    let lines = tries
+        .iter()
+        .map(|t| match unix_connect(t) {
+            Ok(()) => json!({"path": t, "connected": true}),
+            Err(e) => json!({"path": t, "connected": false, "error": e}),
+        })
+        .collect();
+    drop(keep);
+    Ok(lines)
+}
+
+/// `probe fds`: the descriptors this process has open, with what they
+/// point to.
+#[must_use]
+pub fn fds() -> Value {
+    let mut list = Vec::new();
+    if let Ok(dir) = std::fs::read_dir("/proc/self/fd") {
+        for e in dir.filter_map(Result::ok) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let target = std::fs::read_link(e.path())
+                .map_or_else(|_| String::new(), |p| p.display().to_string());
+            list.push(json!({"fd": name.parse::<i32>().unwrap_or(-1), "target": target}));
+        }
+    }
+    json!({"fds": list})
 }
 
 /// `probe resolve NAME`: what the system resolver returns for `name`.

@@ -265,6 +265,76 @@ fn privs_check(nft: &Path) -> Check {
     }
 }
 
+fn landlock_check() -> Check {
+    let name = "Landlock (host Unix sockets)";
+    match crate::landlock::abi() {
+        Some(v) if v >= crate::landlock::RESOLVE_UNIX_ABI => Check {
+            name,
+            ok: true,
+            detail: format!("ABI {v}: connections to host Unix sockets can be refused"),
+        },
+        _ => Check {
+            name,
+            ok: false,
+            detail: crate::sandbox::landlock_missing(),
+        },
+    }
+}
+
+fn terminal_check() -> Check {
+    Check {
+        name: "terminal input injection (TIOCSTI)",
+        ok: true,
+        detail: if crate::sandbox::tiocsti_allowed() {
+            "this kernel allows TIOCSTI: the command runs in its own session, without a controlling terminal".into()
+        } else {
+            "refused by the kernel (dev.tty.legacy_tiocsti = 0): the command keeps the terminal and job control".into()
+        },
+    }
+}
+
+/// A host socket (in a fresh private directory) and a host abstract
+/// socket must not be connectable from inside.
+fn sockets_check() -> Check {
+    let name = "host Unix sockets unreachable";
+    let fail = |detail: String| Check {
+        name,
+        ok: false,
+        detail,
+    };
+    let dir = match crate::sandbox::private_dir() {
+        Ok(d) => d,
+        Err(e) => return fail(e),
+    };
+    let path = dir.join("doctor.sock");
+    let abstract_name = format!("playpen-doctor-{}", std::process::id());
+    let listeners = (|| {
+        use std::os::linux::net::SocketAddrExt as _;
+        let a = std::os::unix::net::UnixListener::bind(&path)?;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(abstract_name.as_bytes())?;
+        let b = std::os::unix::net::UnixListener::bind_addr(&addr)?;
+        Ok::<_, std::io::Error>((a, b))
+    })();
+    let path_s = path.display().to_string();
+    let at = format!("@{abstract_name}");
+    let result = match listeners {
+        Ok(_held) => self_run(&["--no-network"], &["unix", "--try", &path_s, "--try", &at]),
+        Err(e) => Err(format!("cannot create the test sockets: {e}")),
+    };
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir(&dir);
+    match result {
+        Ok(out) if out.lines().count() == 2 && !out.contains("\"connected\":true") => Check {
+            name,
+            ok: true,
+            detail: "a host socket and a host abstract socket were not reachable from inside"
+                .into(),
+        },
+        Ok(out) => fail(format!("unexpected probe output: {}", out.trim())),
+        Err(e) => fail(e),
+    }
+}
+
 /// Runs every check and prints the result. Returns the exit status.
 #[must_use]
 pub fn run(json: bool) -> i32 {
@@ -282,10 +352,13 @@ pub fn run(json: bool) -> i32 {
         pasta.as_deref(),
         "install passt (it provides /usr/bin/pasta) or set PLAYPEN_PASTA; without it only --no-network works",
     ));
+    checks.push(landlock_check());
+    checks.push(terminal_check());
     let basics_ok = checks.iter().all(|c| c.ok);
     if basics_ok && let Some(nft) = &nft {
         checks.push(reach_check());
         checks.push(privs_check(nft));
+        checks.push(sockets_check());
     } else {
         checks.push(Check {
             name: "namespace self-test",

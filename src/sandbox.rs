@@ -21,7 +21,12 @@
 //! could leave unfiltered.
 //!
 //! Children report to P over one pipe with one line per event; P talks to C
-//! over another pipe (one byte means "go", end of file means "abort").
+//! over another pipe (the byte `g` means "go", end of file means "abort").
+//! After "go" the same pipe reaches I: `f` asks it to freeze (SIGSTOP)
+//! every process in the sandbox, `t` to thaw the ones it froze. P sends
+//! them when it is suspended (Ctrl-Z) and continued, so the command never
+//! runs while P, which enforces the end time and re-reads the pass, is
+//! stopped.
 
 use std::ffi::OsString;
 use std::fs;
@@ -84,6 +89,18 @@ pub struct Plan {
     pub lo_addrs: Vec<IpAddr>,
     /// Extra paths to hide from the command (`--hide`).
     pub hide: Vec<PathBuf>,
+    /// Host paths brought back in deliberately (`--expose`, `--display`):
+    /// bound into place over the mount layer and let through Landlock.
+    /// Canonical, existing paths.
+    pub exposed: Vec<PathBuf>,
+    /// Refuse connections to host Unix sockets with Landlock (false for
+    /// `--without-landlock`, which also walks `/run`, `/tmp` and `/var/tmp`
+    /// for sockets to cover).
+    pub landlock: bool,
+    /// Run the command in a new session without a controlling terminal
+    /// (`--new-session`, or automatically where `TIOCSTI` is allowed), so
+    /// it cannot push input into the caller's terminal.
+    pub new_session: bool,
     /// The command and its arguments.
     pub command: Vec<OsString>,
     /// The `nft` binary.
@@ -199,6 +216,15 @@ fn write_line(fd: &OwnedFd, line: &str) {
     }
 }
 
+fn send_byte(fd: &OwnedFd, b: u8) {
+    loop {
+        match nix::unistd::write(fd, &[b]) {
+            Err(Errno::EINTR) => {}
+            _ => return,
+        }
+    }
+}
+
 fn write_file(path: &str, contents: &str) -> Result<(), String> {
     fs::write(path, contents).map_err(|e| format!("cannot write {path}: {e}"))
 }
@@ -217,21 +243,146 @@ fn fork_checked() -> Result<ForkResult, String> {
     unsafe { nix::unistd::fork() }.map_err(|e| format!("fork failed: {e}"))
 }
 
+/// Signals P, C, S and I block and read from a signalfd (I) or leave
+/// pending (C, S). Job-control signals are included so that only the
+/// command can be stopped by the terminal: P handles SIGTSTP itself (see
+/// the module comment), and never stops for terminal input or output.
 fn blocked_set() -> SigSet {
     let mut set = SigSet::empty();
     for s in FORWARDED {
         set.add(s);
     }
-    set.add(Signal::SIGCHLD);
+    for s in [
+        Signal::SIGCHLD,
+        Signal::SIGTSTP,
+        Signal::SIGCONT,
+        Signal::SIGTTIN,
+        Signal::SIGTTOU,
+    ] {
+        set.add(s);
+    }
     set
+}
+
+/// Refuses standard input, output or error that is a socket through which
+/// the command could reach the network outside the filter.
+///
+/// They come from the caller, so they belong to the host's network
+/// namespace. Allowed: anything that is not a socket; Unix sockets (a connection or
+/// send to another one is refused by Landlock); connected TCP (it reaches
+/// only its peer, which the caller chose). Refused: datagram sockets (UDP
+/// can send to any address even when connected), unconnected or listening
+/// stream sockets, and every other address family.
+///
+/// # Errors
+/// With a message saying which descriptor and what to do.
+pub fn check_stdio() -> Result<(), String> {
+    use nix::sys::socket::{SockaddrLike as _, SockaddrStorage, getpeername, getsockname};
+    use nix::sys::socket::{getsockopt, sockopt};
+    use std::os::fd::AsRawFd as _;
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    let fds = [
+        ("standard input", stdin.as_fd()),
+        ("standard output", stdout.as_fd()),
+        ("standard error", stderr.as_fd()),
+    ];
+    for (name, fd) in fds {
+        let Ok(st) = nix::sys::stat::fstat(fd) else {
+            continue;
+        };
+        if st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+            continue;
+        }
+        let raw = fd.as_raw_fd();
+        let family = getsockname::<SockaddrStorage>(raw)
+            .ok()
+            .and_then(|a| a.family());
+        let what = match family {
+            Some(AddressFamily::Unix) => continue,
+            Some(AddressFamily::Inet | AddressFamily::Inet6) => {
+                let ty = getsockopt(&fd, sockopt::SockType).ok();
+                let listening = getsockopt(&fd, sockopt::AcceptConn).unwrap_or(true);
+                let connected = getpeername::<SockaddrStorage>(raw).is_ok();
+                match ty {
+                    Some(SockType::Stream) if connected && !listening => continue,
+                    Some(SockType::Stream) if listening => {
+                        "a listening TCP socket, through which anyone could connect to the command"
+                    }
+                    Some(SockType::Stream) => {
+                        "an unconnected TCP socket, which the command could connect to any address"
+                    }
+                    _ => {
+                        "a datagram or raw IP socket, through which the command could send to any address"
+                    }
+                }
+            }
+            _ => "a socket of a kind playpen does not let through (not Unix, not TCP)",
+        };
+        return Err(format!(
+            "{name} is {what}, outside the filter: it belongs to the host's network. Give the command a pipe, a file or a terminal instead (for example add `| cat`)"
+        ));
+    }
+    Ok(())
+}
+
+/// Byte P sends I: stop every process in the sandbox.
+const FREEZE: u8 = b'f';
+/// Byte P sends I: continue the processes it stopped.
+const THAW: u8 = b't';
+/// Byte P sends C: build the PID namespace and start the command.
+const GO: u8 = b'g';
+
+/// True when this kernel lets an unprivileged process push input into its
+/// controlling terminal with `TIOCSTI`.
+///
+/// That is when `dev.tty.legacy_tiocsti` is not 0, or the setting does not
+/// exist because the kernel predates it.
+#[must_use]
+pub fn tiocsti_allowed() -> bool {
+    fs::read_to_string("/proc/sys/dev/tty/legacy_tiocsti").map_or(true, |v| v.trim() != "0")
 }
 
 /// Runs the plan. Returns when the command and the sandbox are gone.
 ///
 /// # Errors
 /// [`RunError::NotStarted`] when anything fails before the command starts
-/// (the message says why); [`RunError::Failed`] for trouble afterwards.
+/// (the message says why, and, where `AppArmor` restricts user namespaces,
+/// what the operator can do about it); [`RunError::Failed`] for trouble
+/// afterwards.
 pub fn run(plan: &Plan, events: &mut dyn Events) -> Result<RunResult, RunError> {
+    run_sandbox(plan, events).map_err(|e| match e {
+        RunError::NotStarted(m) => {
+            RunError::NotStarted(with_apparmor_hint(m, apparmor_restricts()))
+        }
+        other @ RunError::Failed(_) => other,
+    })
+}
+
+/// True when `kernel.apparmor_restrict_unprivileged_userns` is 1.
+#[must_use]
+pub fn apparmor_restricts() -> bool {
+    fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+        .is_ok_and(|v| v.trim() == "1")
+}
+
+/// Adds what to do on systems where `AppArmor` restricts unprivileged user
+/// namespaces.
+///
+/// There the namespace is created but holds no capabilities, so the first
+/// privileged step inside fails with a bare "permission denied".
+#[must_use]
+pub fn with_apparmor_hint(message: String, restricted: bool) -> String {
+    if !restricted {
+        return message;
+    }
+    format!(
+        "{message}. This system restricts unprivileged user namespaces with AppArmor (kernel.apparmor_restrict_unprivileged_userns = 1), which is the likely cause. An administrator can allow playpen with an AppArmor profile for its binary that grants `userns,` (an example is in docs/DESIGN.md, section \"AppArmor\"), or set kernel.apparmor_restrict_unprivileged_userns to 0 for the whole machine; `playpen doctor` shows the setting"
+    )
+}
+
+fn run_sandbox(plan: &Plan, events: &mut dyn Events) -> Result<RunResult, RunError> {
     let not_started = RunError::NotStarted;
     match thread_count() {
         Ok(1) => {}
@@ -246,6 +397,9 @@ pub fn run(plan: &Plan, events: &mut dyn Events) -> Result<RunResult, RunError> 
         return Err(not_started(
             "playpen is meant to run as an ordinary user, not root; run it without sudo".to_owned(),
         ));
+    }
+    if plan.landlock && !crate::landlock::resolve_unix_supported() {
+        return Err(not_started(landlock_missing()));
     }
     cloexec_inherited_fds().map_err(not_started)?;
     let mask = blocked_set();
@@ -286,6 +440,20 @@ pub fn run(plan: &Plan, events: &mut dyn Events) -> Result<RunResult, RunError> 
     }
 }
 
+/// Why the run cannot start when Landlock cannot refuse Unix socket
+/// connections.
+#[must_use]
+pub fn landlock_missing() -> String {
+    let have = crate::landlock::abi().map_or_else(
+        || "Landlock is not enabled in this kernel".to_owned(),
+        |v| format!("this kernel has Landlock ABI {v}"),
+    );
+    format!(
+        "playpen needs Landlock ABI {} or later to keep the command away from host Unix sockets (a host daemon reached through one can open connections for it), and {have}. Use a newer kernel (with landlock in its lsm= list), or run with --without-landlock to rely on hiding by mounts only: sockets under /run, /tmp, /var/tmp and the runtime directory are then hidden, sockets elsewhere (for example in the home directory) stay reachable",
+        crate::landlock::RESOLVE_UNIX_ABI
+    )
+}
+
 struct Ids {
     uid: Uid,
     gid: Gid,
@@ -298,7 +466,15 @@ struct SandboxFiles {
     hosts: String,
     resolv: String,
     nsswitch: Option<String>,
+    /// Directories replaced by fresh private ones.
+    covers: Vec<crate::sockets::Cover>,
+    /// `--hide`.
     hide: Vec<PathBuf>,
+    /// `--expose` and `--display`.
+    exposed: Vec<PathBuf>,
+    /// Walk `/run`, `/tmp` and `/var/tmp` and cover every socket found
+    /// (`--without-landlock`).
+    walk: bool,
 }
 
 impl SandboxFiles {
@@ -309,60 +485,17 @@ impl SandboxFiles {
         let nsswitch = fs::read_to_string("/etc/nsswitch.conf")
             .ok()
             .map(|t| resolver::nsswitch_conf(&t));
-        let mut hide = default_hidden_paths(getuid());
-        hide.extend(plan.hide.iter().cloned());
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
         Self {
             hosts: resolver::hosts_file(&plan.hosts, hostname.as_deref()),
             resolv: resolver::resolv_conf(),
             nsswitch,
-            hide,
+            covers: crate::sockets::covers(getuid(), runtime_dir.as_deref()),
+            hide: plan.hide.clone(),
+            exposed: plan.exposed.clone(),
+            walk: !plan.landlock,
         }
     }
-}
-
-/// Host daemon sockets that would act on the host's network, or start
-/// processes outside the sandbox, on the command's behalf.
-#[must_use]
-pub fn default_hidden_paths(uid: Uid) -> Vec<PathBuf> {
-    let run_user = format!("/run/user/{uid}");
-    let mut paths: Vec<PathBuf> = [
-        // Name resolution done by host daemons.
-        "/run/systemd/resolve/io.systemd.Resolve",
-        "/run/systemd/resolve/io.systemd.Resolve.Monitor",
-        "/run/nscd/socket",
-        "/run/avahi-daemon/socket",
-        // Buses and service managers that can start processes outside.
-        "/run/dbus/system_bus_socket",
-        "/run/systemd/private",
-        "/run/podman",
-        "/run/docker.sock",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .collect();
-    for rel in [
-        "bus",
-        "systemd",
-        "podman",
-        "docker.sock",
-        "gnupg/S.dirmngr",
-        "pulse/native",
-    ] {
-        paths.push(PathBuf::from(format!("{run_user}/{rel}")));
-    }
-    if let Ok(addr) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
-        for part in addr.split(';') {
-            if let Some(path) = part
-                .strip_prefix("unix:path=")
-                .map(|p| p.split(',').next().unwrap_or(p))
-            {
-                paths.push(PathBuf::from(path));
-            }
-        }
-    }
-    paths.sort();
-    paths.dedup();
-    paths
 }
 
 // ---------------------------------------------------------------- P ----
@@ -554,7 +687,7 @@ fn parent(
         return Err(RunError::NotStarted(why));
     }
     events.starting();
-    write_line(&down_w, "go");
+    send_byte(&down_w, GO);
 
     // Phase 3: the command runs.
     let mut term_sent_at: Option<Instant> = None;
@@ -637,10 +770,18 @@ fn parent(
                 let Ok(sig) = Signal::try_from(i32::try_from(info.ssi_signo).unwrap_or(0)) else {
                     continue;
                 };
-                if sig == Signal::SIGCHLD || info.ssi_code == SI_KERNEL {
-                    continue;
+                match sig {
+                    Signal::SIGCHLD | Signal::SIGTTIN | Signal::SIGTTOU => {}
+                    // Signals are read only after "go"; I reads the bytes
+                    // once its loop runs, even if they come before that.
+                    Signal::SIGTSTP => suspend(&down_w),
+                    Signal::SIGCONT => send_byte(&down_w, THAW),
+                    // The terminal sent it to its foreground process group,
+                    // which holds the command too, unless the command runs
+                    // in its own session.
+                    _ if info.ssi_code == SI_KERNEL && !plan.new_session => {}
+                    _ => pending.push(sig),
                 }
-                pending.push(sig);
             }
         }
     }
@@ -672,6 +813,14 @@ fn parent(
             .drops
             .unwrap_or_else(|| Err("the drop counters were not reported".into())),
     })
+}
+
+/// Ctrl-Z (or SIGTSTP from anyone): have I stop every process in the
+/// sandbox, then stop P itself, so the shell sees playpen as stopped. When
+/// P is continued, it reads SIGCONT and has I continue them.
+fn suspend(down_w: &OwnedFd) {
+    send_byte(down_w, FREEZE);
+    let _ = kill(getpid(), Signal::SIGSTOP);
 }
 
 /// First step of stopping the command: SIGTERM to the sandbox's init, which
@@ -726,7 +875,7 @@ fn stage_c(
 
     let mut go = [0u8; 1];
     match read(down_r, &mut go) {
-        Ok(1) => {}
+        Ok(1) if go[0] == GO => {}
         _ => exit_now(0),
     }
     // This process holds every capability over the network namespace. It
@@ -738,7 +887,7 @@ fn stage_c(
 
     match fork_checked()? {
         ForkResult::Child => {
-            let code = match stage_s(plan, files, up_w) {
+            let code = match stage_s(plan, files, up_w, down_r) {
                 Ok(()) => 0,
                 Err(msg) => {
                     write_line(up_w, &format!("fail {msg}"));
@@ -821,12 +970,17 @@ fn read_counters(nft: &Path) -> Result<DropSummary, String> {
 
 // ---------------------------------------------------------------- S ----
 
-fn stage_s(plan: &Plan, files: &SandboxFiles, up_w: &OwnedFd) -> Result<(), String> {
+fn stage_s(
+    plan: &Plan,
+    files: &SandboxFiles,
+    up_w: &OwnedFd,
+    down_r: &OwnedFd,
+) -> Result<(), String> {
     prctl::set_pdeathsig(Signal::SIGKILL).map_err(|e| format!("PR_SET_PDEATHSIG: {e}"))?;
     unshare(CloneFlags::CLONE_NEWPID).map_err(|e| format!("cannot create a PID namespace: {e}"))?;
     match fork_checked()? {
         ForkResult::Child => {
-            let code = match stage_i(plan, files, up_w) {
+            let code = match stage_i(plan, files, up_w, down_r) {
                 Ok(code) => code,
                 Err(msg) => {
                     write_line(up_w, &format!("fail {msg}"));
@@ -845,10 +999,18 @@ fn stage_s(plan: &Plan, files: &SandboxFiles, up_w: &OwnedFd) -> Result<(), Stri
 
 // ---------------------------------------------------------------- I ----
 
-fn stage_i(plan: &Plan, files: &SandboxFiles, up_w: &OwnedFd) -> Result<i32, String> {
+fn stage_i(
+    plan: &Plan,
+    files: &SandboxFiles,
+    up_w: &OwnedFd,
+    down_r: &OwnedFd,
+) -> Result<i32, String> {
     prctl::set_pdeathsig(Signal::SIGKILL).map_err(|e| format!("PR_SET_PDEATHSIG: {e}"))?;
-    unshare(CloneFlags::CLONE_NEWNS)
-        .map_err(|e| format!("cannot create a mount namespace: {e}"))?;
+    // A private IPC namespace: System V shared memory, semaphores and
+    // message queues, and POSIX message queues, of host processes are not
+    // reachable from inside.
+    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWIPC)
+        .map_err(|e| format!("cannot create a mount and IPC namespace: {e}"))?;
     mount(
         None::<&str>,
         "/",
@@ -868,8 +1030,11 @@ fn stage_i(plan: &Plan, files: &SandboxFiles, up_w: &OwnedFd) -> Result<i32, Str
     setup_files(plan, files)?;
 
     let (err_r, err_w) = pipe2(OFlag::O_CLOEXEC).map_err(|e| format!("pipe: {e}"))?;
-    let sigfd = SignalFd::with_flags(&blocked_set(), SfdFlags::SFD_CLOEXEC)
-        .map_err(|e| format!("cannot create signalfd: {e}"))?;
+    let sigfd = SignalFd::with_flags(
+        &blocked_set(),
+        SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK,
+    )
+    .map_err(|e| format!("cannot create signalfd: {e}"))?;
     let child = match fork_checked()? {
         ForkResult::Child => {
             drop(err_r);
@@ -899,18 +1064,57 @@ fn stage_i(plan: &Plan, files: &SandboxFiles, up_w: &OwnedFd) -> Result<i32, Str
         return Err(String::from_utf8_lossy(&msg).trim().to_owned());
     }
     write_line(up_w, "started");
+    init_loop(child, &sigfd, up_w, down_r)
+}
 
+/// I's work while the command runs: pass signals on, freeze and thaw on
+/// P's request, reap orphans, and report how the command ended.
+fn init_loop(
+    child: Pid,
+    sigfd: &SignalFd,
+    up_w: &OwnedFd,
+    down_r: &OwnedFd,
+) -> Result<i32, String> {
+    let mut frozen: Vec<Pid> = Vec::new();
+    let mut p_open = true;
     loop {
+        let mut fds = vec![PollFd::new(sigfd.as_fd(), PollFlags::POLLIN)];
+        if p_open {
+            fds.push(PollFd::new(down_r.as_fd(), PollFlags::POLLIN));
+        }
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(_) | Err(Errno::EINTR) => {}
+            Err(e) => return Err(format!("poll failed: {e}")),
+        }
+        let from_p = p_open && fds[1].revents().is_some_and(|r| !r.is_empty());
+        drop(fds);
+        if from_p {
+            let mut b = [0u8; 16];
+            match read(down_r, &mut b) {
+                Ok(0) | Err(Errno::EBADF) => p_open = false,
+                Ok(n) => {
+                    for &byte in &b[..n] {
+                        match byte {
+                            FREEZE => freeze(&mut frozen),
+                            THAW => thaw(&mut frozen),
+                            _ => {}
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
         let info = match sigfd.read_signal() {
             Ok(Some(info)) => info,
-            Ok(None) | Err(Errno::EINTR) => continue,
+            Ok(None) | Err(Errno::EINTR | Errno::EAGAIN) => continue,
             Err(e) => return Err(format!("signalfd read failed: {e}")),
         };
         let Ok(sig) = Signal::try_from(i32::try_from(info.ssi_signo).unwrap_or(0)) else {
             continue;
         };
         if sig != Signal::SIGCHLD {
-            if info.ssi_code != SI_KERNEL {
+            // Job-control signals are P's business (freeze and thaw).
+            if FORWARDED.contains(&sig) && info.ssi_code != SI_KERNEL {
                 let _ = kill(child, sig);
             }
             continue;
@@ -929,6 +1133,55 @@ fn stage_i(plan: &Plan, files: &SandboxFiles, up_w: &OwnedFd) -> Result<i32, Str
                 Ok(_) => {}
             }
         }
+    }
+}
+
+/// The processes in this PID namespace other than init, with their state
+/// letter from `/proc/PID/stat`.
+fn sandbox_processes() -> Vec<(Pid, char)> {
+    let Ok(dir) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<i32>().ok()))
+        .filter(|&pid| pid > 1)
+        .filter_map(|pid| {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // The state follows the command name, which is in parentheses
+            // and may itself contain ") ".
+            let state = stat.rsplit_once(") ")?.1.chars().next()?;
+            Some((Pid::from_raw(pid), state))
+        })
+        .collect()
+}
+
+/// Stops (SIGSTOP) every process in the sandbox that is not stopped
+/// already, and remembers them. Processes stopped before (for example a job
+/// a shell inside suspended) are left alone, so a later thaw does not
+/// resume them. Repeated until a pass finds nothing new, so a child forked
+/// during the pass is caught too.
+fn freeze(frozen: &mut Vec<Pid>) {
+    for _ in 0..20 {
+        let mut new = false;
+        for (pid, state) in sandbox_processes() {
+            if frozen.contains(&pid) || matches!(state, 'T' | 't' | 'Z' | 'X') {
+                continue;
+            }
+            if kill(pid, Signal::SIGSTOP).is_ok() {
+                frozen.push(pid);
+                new = true;
+            }
+        }
+        if !new {
+            break;
+        }
+    }
+}
+
+/// Continues the processes [`freeze`] stopped.
+fn thaw(frozen: &mut Vec<Pid>) {
+    for pid in frozen.drain(..) {
+        let _ = kill(pid, Signal::SIGCONT);
     }
 }
 
@@ -994,10 +1247,171 @@ fn hide_path(path: &Path) -> Result<(), String> {
     result.map_err(|e| format!("cannot hide {} from the command: {e}", path.display()))
 }
 
+/// Mounts a fresh, empty, writable tmpfs over `cover.path` with the host
+/// directory's mode, and creates its child directory if it has one.
+fn cover_dir(cover: &crate::sockets::Cover) -> Result<(), String> {
+    let opts = format!("mode={:o}", cover.mode);
+    mount(
+        Some("tmpfs"),
+        &cover.path,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some(opts.as_str()),
+    )
+    .map_err(|e| {
+        format!(
+            "cannot replace {} with a private directory: {e}",
+            cover.path.display()
+        )
+    })?;
+    if let Some(child) = &cover.child {
+        let dir = cover.path.join(child);
+        crate::sockets::mkdir_all(&dir)?;
+        fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .map_err(|e| format!("cannot set the mode of {}: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// An exposed host path, held open from before the mount layer so it can
+/// be bound back over it.
+struct Held {
+    path: PathBuf,
+    fd: OwnedFd,
+    dir: bool,
+}
+
+fn hold(path: &Path) -> Result<Held, String> {
+    let fd = nix::fcntl::open(
+        path,
+        OFlag::O_PATH | OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(|e| format!("cannot open the exposed path {}: {e}", path.display()))?;
+    let dir = nix::sys::stat::fstat(&fd)
+        .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+    Ok(Held {
+        path: path.to_path_buf(),
+        fd,
+        dir,
+    })
+}
+
+/// Binds an exposed path back into place if the mount layer hid it (the
+/// path no longer names the same object).
+fn restore(held: &Held) -> Result<(), String> {
+    use std::os::fd::AsRawFd as _;
+    let orig = nix::sys::stat::fstat(&held.fd)
+        .map_err(|e| format!("cannot stat {}: {e}", held.path.display()))?;
+    if let Ok(now) = nix::sys::stat::stat(&held.path)
+        && now.st_dev == orig.st_dev
+        && now.st_ino == orig.st_ino
+    {
+        return Ok(());
+    }
+    if fs::symlink_metadata(&held.path).is_err() {
+        if let Some(parent) = held.path.parent() {
+            crate::sockets::mkdir_all(parent)?;
+        }
+        let made = if held.dir {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&held.path)
+                .map_err(|e| e.to_string())
+        } else {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&held.path)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        };
+        made.map_err(|e| {
+            format!(
+                "cannot create a mount point for {}: {e}",
+                held.path.display()
+            )
+        })?;
+    }
+    let source = format!("/proc/self/fd/{}", held.fd.as_raw_fd());
+    mount(
+        Some(source.as_str()),
+        &held.path,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .map_err(|e| format!("cannot expose {}: {e}", held.path.display()))
+}
+
+/// Finds the sockets to cover for `--without-landlock`.
+fn walk_targets(files: &SandboxFiles) -> Result<Vec<PathBuf>, String> {
+    let mut roots: Vec<PathBuf> = crate::sockets::WALK_ROOTS
+        .iter()
+        .filter_map(|r| fs::canonicalize(r).ok())
+        .collect();
+    roots.sort();
+    roots.dedup();
+    let mut skip: Vec<PathBuf> = files.covers.iter().map(|c| c.path.clone()).collect();
+    skip.extend(files.exposed.iter().cloned());
+    crate::sockets::find_sockets(&roots, &skip, crate::sockets::WALK_LIMIT)
+}
+
 fn setup_files(plan: &Plan, files: &SandboxFiles) -> Result<(), String> {
+    // Everything that must be looked at in the host's view of the tree is
+    // done first, before any of the mounts below change it.
+    let held: Vec<Held> = files
+        .exposed
+        .iter()
+        .map(|p| hold(p))
+        .collect::<Result<_, _>>()?;
+    let walked = if files.walk {
+        walk_targets(files)?
+    } else {
+        Vec::new()
+    };
+    let mqueue = Path::new("/dev/mqueue").is_dir();
+
+    stage_resolver_files(plan, files)?;
+    for cover in &files.covers {
+        cover_dir(cover)?;
+    }
+    if mqueue {
+        // The fresh IPC namespace's own message queues; the host's queues
+        // were reachable through the host's mqueue mount.
+        mount(
+            Some("mqueue"),
+            "/dev/mqueue",
+            Some("mqueue"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+            None::<&str>,
+        )
+        .map_err(|e| format!("cannot mount a private /dev/mqueue: {e}"))?;
+    }
+    for sock in &walked {
+        match mount(
+            Some("/dev/null"),
+            sock,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        ) {
+            // Removed on the host since the walk: nothing left to cover.
+            Ok(()) | Err(Errno::ENOENT) => {}
+            Err(e) => return Err(format!("cannot cover the socket {}: {e}", sock.display())),
+        }
+    }
+    for h in &held {
+        restore(h)?;
+    }
     for path in &files.hide {
         hide_path(path)?;
     }
+    Ok(())
+}
+
+fn stage_resolver_files(plan: &Plan, files: &SandboxFiles) -> Result<(), String> {
     mount(
         Some("tmpfs"),
         STAGING,
@@ -1143,6 +1557,15 @@ fn stage_x(plan: &Plan) -> Result<std::convert::Infallible, String> {
     prctl::set_no_new_privs().map_err(|e| format!("PR_SET_NO_NEW_PRIVS: {e}"))?;
     verify_dropped(uid, gid)
         .map_err(|e| format!("the privilege drop could not be verified: {e}"))?;
+    if plan.landlock {
+        crate::landlock::restrict(&plan.exposed)
+            .map_err(|e| format!("cannot restrict Unix socket connections with Landlock: {e}"))?;
+    }
+    if plan.new_session {
+        // No controlling terminal: TIOCSTI needs the terminal to be the
+        // caller's controlling terminal, and /dev/tty cannot be opened.
+        nix::unistd::setsid().map_err(|e| format!("cannot start a new session: {e}"))?;
+    }
     sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
         .map_err(|e| format!("cannot unblock signals: {e}"))?;
     let (program, args) = plan.command.split_first().ok_or("no command was given")?;
@@ -1199,11 +1622,16 @@ mod tests {
     }
 
     #[test]
-    fn hidden_paths_include_known_daemons() {
-        let paths = default_hidden_paths(Uid::from_raw(4242));
-        assert!(paths.contains(&PathBuf::from("/run/user/4242/bus")));
-        assert!(paths.contains(&PathBuf::from("/run/systemd/resolve/io.systemd.Resolve")));
-        assert!(paths.contains(&PathBuf::from("/run/docker.sock")));
+    fn apparmor_hint_only_where_apparmor_restricts() {
+        assert_eq!(
+            with_apparmor_hint("cannot mount".into(), false),
+            "cannot mount"
+        );
+        let m = with_apparmor_hint("cannot mount".into(), true);
+        assert!(m.starts_with("cannot mount. "), "{m}");
+        assert!(m.contains("userns,"), "{m}");
+        assert!(m.contains("apparmor_restrict_unprivileged_userns"), "{m}");
+        assert!(m.contains("docs/DESIGN.md"), "{m}");
     }
 
     #[test]

@@ -1,0 +1,568 @@
+//! Integration tests for host Unix sockets, IPC and `/proc`: what the
+//! command can reach on the host machine without the network.
+//!
+//! Connecting to a local daemon's socket and closing it at once sends
+//! nothing off the machine; nothing is ever written into a connected
+//! socket. All sandboxes here use `--no-network`.
+
+use std::os::linux::net::SocketAddrExt as _;
+use std::os::unix::fs::FileTypeExt as _;
+use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+
+const BIN: &str = env!("CARGO_BIN_EXE_playpen");
+
+fn skip_reason() -> Option<String> {
+    let max = std::fs::read_to_string("/proc/sys/user/max_user_namespaces").unwrap_or_default();
+    if max.trim().is_empty() || max.trim() == "0" {
+        return Some("user namespaces are not available".into());
+    }
+    let nft = ["/usr/bin", "/usr/sbin", "/bin", "/sbin"]
+        .iter()
+        .any(|d| Path::new(d).join("nft").exists());
+    if !nft {
+        return Some("nft is not installed".into());
+    }
+    None
+}
+
+macro_rules! require_sandbox {
+    () => {
+        if let Some(why) = skip_reason() {
+            eprintln!("SKIPPED: {why}");
+            return;
+        }
+    };
+}
+
+fn landlock_ok() -> bool {
+    playpen::landlock::resolve_unix_supported()
+}
+
+fn text(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
+}
+
+fn tmpdir(name: &str) -> PathBuf {
+    let dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sock-{name}-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn uid() -> u32 {
+    nix::unistd::getuid().as_raw()
+}
+
+fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
+        || PathBuf::from(format!("/run/user/{}", uid())),
+        PathBuf::from,
+    )
+}
+
+/// Runs `playpen run --no-network EXTRA -- ARGS`.
+fn sandbox(extra: &[&str], args: &[&str]) -> Output {
+    Command::new(BIN)
+        .arg("run")
+        .arg("--no-network")
+        .args(extra)
+        .arg("--")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run playpen: {e}"))
+}
+
+/// Connects to each Unix socket from inside a sandbox; returns the paths
+/// that connected.
+fn connectable_inside(extra: &[&str], listen: &[&str], tries: &[String]) -> (Vec<String>, Output) {
+    let mut args = vec![BIN, "probe", "unix"];
+    for l in listen {
+        args.extend_from_slice(&["--listen", l]);
+    }
+    for t in tries {
+        args.extend_from_slice(&["--try", t]);
+    }
+    let out = sandbox(extra, &args);
+    let stdout = text(&out.stdout);
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert_eq!(
+        lines.len(),
+        tries.len(),
+        "probe output incomplete: {stdout} / {}",
+        text(&out.stderr)
+    );
+    let ok = lines
+        .iter()
+        .filter(|v| v["connected"] == true)
+        .map(|v| v["path"].as_str().unwrap_or("").to_owned())
+        .collect();
+    (ok, out)
+}
+
+/// A listening socket at `path`, removed again on drop.
+struct Listening {
+    path: PathBuf,
+    _l: UnixListener,
+}
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn listen(path: &Path) -> Listening {
+    let _ = std::fs::remove_file(path);
+    let l = UnixListener::bind(path).unwrap_or_else(|e| panic!("bind {}: {e}", path.display()));
+    Listening {
+        path: path.to_path_buf(),
+        _l: l,
+    }
+}
+
+/// Every socket below `root`, at most `depth` levels down, not following
+/// symbolic links and not entering `skip`.
+fn sockets_below(root: &Path, depth: usize, skip: &[PathBuf], out: &mut Vec<PathBuf>) {
+    if depth == 0 || skip.iter().any(|s| root.starts_with(s)) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in entries.filter_map(Result::ok) {
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_socket() {
+            out.push(e.path());
+        } else if ft.is_dir() {
+            sockets_below(&e.path(), depth - 1, skip, out);
+        }
+    }
+}
+
+/// The usual places host sockets live.
+fn host_sockets(with_home: bool) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let target = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let mut roots = vec![
+        (runtime_dir(), 8),
+        (PathBuf::from("/run"), 8),
+        (PathBuf::from("/var/run"), 8),
+        (PathBuf::from("/tmp"), 8),
+        (PathBuf::from("/var/tmp"), 8),
+        (PathBuf::from("/dev/shm"), 8),
+    ];
+    if with_home && let Some(home) = std::env::var_os("HOME") {
+        roots.push((PathBuf::from(home), 4));
+    }
+    for (root, depth) in roots {
+        // The test's own sockets are checked separately.
+        sockets_below(&root, depth, std::slice::from_ref(&target), &mut found);
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn strings(paths: &[PathBuf]) -> Vec<String> {
+    paths.iter().map(|p| p.display().to_string()).collect()
+}
+
+#[test]
+fn no_host_socket_is_connectable_from_inside() {
+    require_sandbox!();
+    if !landlock_ok() {
+        eprintln!("SKIPPED: this kernel lacks Landlock ABI 9");
+        return;
+    }
+    // Sockets of our own in each kind of place, so there is always
+    // something connectable on the host.
+    let dir = tmpdir("all");
+    let own = [
+        listen(&dir.join("home.sock")),
+        listen(&runtime_dir().join(format!("playpen-test-{}.sock", std::process::id()))),
+        listen(Path::new(&format!(
+            "/tmp/playpen-test-{}.sock",
+            std::process::id()
+        ))),
+    ];
+    let mut all = host_sockets(true);
+    all.extend(own.iter().map(|l| l.path.clone()));
+    for l in &own {
+        assert!(
+            UnixStream::connect(&l.path).is_ok(),
+            "{} not connectable on the host",
+            l.path.display()
+        );
+    }
+    let tries = strings(&all);
+    let (connected, out) = connectable_inside(&[], &[], &tries);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        connected.is_empty(),
+        "host sockets reachable from inside: {connected:?}"
+    );
+    assert!(
+        text(&out.stderr).contains("host Unix sockets: none reachable"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn without_landlock_the_mount_layer_still_hides_the_usual_places() {
+    require_sandbox!();
+    let dir = tmpdir("mounts");
+    let in_home = listen(&dir.join("home.sock"));
+    let own = [
+        listen(&runtime_dir().join(format!("playpen-test-m-{}.sock", std::process::id()))),
+        listen(Path::new(&format!(
+            "/tmp/playpen-test-m-{}.sock",
+            std::process::id()
+        ))),
+    ];
+    let mut usual = host_sockets(false);
+    usual.extend(own.iter().map(|l| l.path.clone()));
+    let tries = strings(&usual);
+    let (connected, out) = connectable_inside(&["--without-landlock"], &[], &tries);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        connected.is_empty(),
+        "sockets in the usual places reachable: {connected:?}"
+    );
+    // What stays open in this mode: a socket elsewhere, here in the home
+    // directory. Landlock is what closes it.
+    let (connected, out) = connectable_inside(
+        &["--without-landlock"],
+        &[],
+        &strings(std::slice::from_ref(&in_home.path)),
+    );
+    assert_eq!(connected.len(), 1, "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("--without-landlock"));
+}
+
+#[test]
+fn abstract_sockets_of_the_host_are_not_reachable() {
+    require_sandbox!();
+    let name = format!("playpen-test-abstract-{}", std::process::id());
+    let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap_or_else(|e| panic!("{e}"));
+    let _l = UnixListener::bind_addr(&addr).unwrap_or_else(|e| panic!("{e}"));
+    assert!(UnixStream::connect_addr(&addr).is_ok());
+    let at = format!("@{name}");
+    let mut modes: Vec<&[&str]> = vec![&["--without-landlock"]];
+    if landlock_ok() {
+        modes.push(&[]);
+    }
+    for extra in modes {
+        let (connected, out) = connectable_inside(extra, &[], std::slice::from_ref(&at));
+        assert!(connected.is_empty(), "{extra:?}: {}", text(&out.stderr));
+    }
+    // The command's own abstract sockets work.
+    let own = format!("@playpen-inside-{}", std::process::id());
+    let (connected, out) = connectable_inside(&[], &[&own], std::slice::from_ref(&own));
+    assert_eq!(connected, vec![own], "{}", text(&out.stderr));
+}
+
+#[test]
+fn expose_lets_exactly_the_named_socket_or_directory_through() {
+    require_sandbox!();
+    let dir = tmpdir("expose");
+    let exposed_sock = listen(&dir.join("a.sock"));
+    let sibling = listen(&dir.join("b.sock"));
+    let sub = dir.join("sub");
+    let _ = std::fs::create_dir_all(&sub);
+    let in_dir_1 = listen(&sub.join("c.sock"));
+    let in_dir_2 = listen(&sub.join("d.sock"));
+    let rt_name = format!("playpen-test-x-{}.sock", std::process::id());
+    let rt = listen(&runtime_dir().join(&rt_name));
+    let rt_other =
+        listen(&runtime_dir().join(format!("playpen-test-y-{}.sock", std::process::id())));
+    let all = strings(&[
+        exposed_sock.path.clone(),
+        sibling.path.clone(),
+        in_dir_1.path.clone(),
+        in_dir_2.path.clone(),
+        rt.path.clone(),
+        rt_other.path.clone(),
+    ]);
+    let s = |p: &Path| p.display().to_string();
+    let (ap, sp, rp) = (s(&exposed_sock.path), s(&sub), s(&rt.path));
+    let rep = dir.join("report.json");
+    let reps = s(&rep);
+    let mut modes: Vec<Vec<&str>> = vec![vec!["--without-landlock"]];
+    if landlock_ok() {
+        modes.push(vec![]);
+    }
+    for mode in modes {
+        let mut extra = mode.clone();
+        extra.extend_from_slice(&["--expose", &ap, "--expose", &sp, "--expose", &rp]);
+        extra.extend_from_slice(&["--report", &reps]);
+        let (mut connected, out) = connectable_inside(&extra, &[], &all);
+        connected.sort();
+        let mut want = vec![
+            s(&exposed_sock.path),
+            s(&in_dir_1.path),
+            s(&in_dir_2.path),
+            s(&rt.path),
+        ];
+        // With Landlock only the exposed ones connect. Without it, the
+        // sibling in the home directory is the residual.
+        if !mode.is_empty() {
+            want.push(s(&sibling.path));
+        }
+        want.sort();
+        let err = text(&out.stderr);
+        assert_eq!(connected, want, "{err}");
+        assert!(err.contains("exposed: "), "{err}");
+        assert!(err.contains(&ap) && err.contains(&rp), "{err}");
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&rep).unwrap_or_default())
+                .unwrap_or_default();
+        let listed: Vec<&str> = json["exposed"].as_array().map_or_else(Vec::new, |v| {
+            v.iter().filter_map(serde_json::Value::as_str).collect()
+        });
+        assert!(
+            listed.contains(&ap.as_str()) && listed.contains(&sp.as_str()),
+            "{json}"
+        );
+        assert_eq!(json["display"], false);
+        let guard = if mode.is_empty() {
+            "landlock"
+        } else {
+            "mounts_only"
+        };
+        assert_eq!(json["socket_guard"], guard);
+    }
+}
+
+#[test]
+fn expose_refuses_missing_paths_and_root() {
+    for (args, expect) in [
+        (
+            vec!["--expose", "/nonexistent/playpen.sock"],
+            "only an existing path",
+        ),
+        (vec!["--expose", "/"], "every host socket"),
+    ] {
+        let out = sandbox(&args, &["true"]);
+        let err = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{err}");
+        assert!(err.contains(expect), "{err}");
+        assert!(err.contains("nothing was run"), "{err}");
+    }
+}
+
+#[test]
+fn display_exposes_the_wayland_socket_and_is_off_by_default() {
+    require_sandbox!();
+    let dir = tmpdir("display");
+    let wl = listen(&dir.join("wayland-test"));
+    let wls = wl.path.display().to_string();
+    let run = |extra: &[&str]| {
+        Command::new(BIN)
+            .args(["run", "--no-network"])
+            .args(extra)
+            .args(["--", BIN, "probe", "unix", "--try", &wls])
+            .env("WAYLAND_DISPLAY", &wl.path)
+            .env_remove("DISPLAY")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let off = run(&[]);
+    assert!(
+        text(&off.stdout).contains("\"connected\":false"),
+        "{}",
+        text(&off.stdout)
+    );
+    assert!(!text(&off.stderr).contains("display exposed"));
+    let on = run(&["--display"]);
+    assert!(
+        text(&on.stdout).contains("\"connected\":true"),
+        "{} {}",
+        text(&on.stdout),
+        text(&on.stderr)
+    );
+    assert!(
+        text(&on.stderr).contains(&format!("display exposed: {wls}")),
+        "{}",
+        text(&on.stderr)
+    );
+    // No display at all: refused.
+    let none = Command::new(BIN)
+        .args(["run", "--no-network", "--display", "--", "true"])
+        .env_remove("WAYLAND_DISPLAY")
+        .env("DISPLAY", "host.example.test:0")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(none.status.code(), Some(2));
+    assert!(
+        text(&none.stderr).contains("network"),
+        "{}",
+        text(&none.stderr)
+    );
+}
+
+#[test]
+fn the_runtime_directory_is_private_empty_and_usable() {
+    require_sandbox!();
+    let marker = runtime_dir().join(format!("playpen-test-file-{}", std::process::id()));
+    std::fs::write(&marker, "host").unwrap_or_else(|e| panic!("{e}"));
+    let inside = runtime_dir().join("made-inside");
+    let script = format!(
+        "set -e; d=\"$XDG_RUNTIME_DIR\"; test -d \"$d\"; test -w \"$d\"; \
+         test \"$(stat -c %a \"$d\")\" = 700; test \"$(stat -c %u \"$d\")\" = \"$(id -u)\"; \
+         test -z \"$(ls -A \"$d\")\"; test ! -e {}; echo x > {}; \
+         {BIN} probe unix --listen \"$d/own.sock\" --try \"$d/own.sock\"",
+        marker.display(),
+        inside.display()
+    );
+    let out = sandbox(&[], &["sh", "-c", &script]);
+    let _ = std::fs::remove_file(&marker);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("\"connected\":true"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(!inside.exists(), "a file made inside appeared on the host");
+}
+
+#[test]
+fn common_programs_work() {
+    require_sandbox!();
+    let dir = tmpdir("programs");
+    let repo = dir.join("repo");
+    let _ = std::fs::remove_dir_all(&repo);
+    let tmp_out = format!("/tmp/playpen-test-out-{}", std::process::id());
+    let _ = std::fs::remove_file(&tmp_out);
+    let py = "import socket, os, tempfile\n\
+              p = os.path.join(os.environ['XDG_RUNTIME_DIR'], 'py.sock')\n\
+              s = socket.socket(socket.AF_UNIX); s.bind(p); s.listen()\n\
+              c = socket.socket(socket.AF_UNIX); c.connect(p)\n\
+              with tempfile.NamedTemporaryFile() as f: pass\n\
+              print('python-ok')\n";
+    let cases: Vec<(Vec<String>, &str)> = vec![
+        (
+            vec!["sh".into(), "-c".into(), "echo shell-ok".into()],
+            "shell-ok",
+        ),
+        (vec!["curl".into(), "--version".into()], "curl"),
+        (
+            vec!["python3".into(), "-I".into(), "-c".into(), py.into()],
+            "python-ok",
+        ),
+        (
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "git init -q {} && git -C {} status --short && echo git-ok",
+                    repo.display(),
+                    repo.display()
+                ),
+            ],
+            "git-ok",
+        ),
+        (
+            vec!["sh".into(), "-c".into(), "ssh -V 2>&1".into()],
+            "OpenSSH",
+        ),
+        (
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!("echo tmp-ok > {tmp_out} && cat {tmp_out}"),
+            ],
+            "tmp-ok",
+        ),
+    ];
+    for (cmd, expect) in cases {
+        let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        let out = sandbox(&[], &args);
+        assert_eq!(out.status.code(), Some(0), "{cmd:?}: {}", text(&out.stderr));
+        assert!(
+            text(&out.stdout).contains(expect),
+            "{cmd:?}: {}",
+            text(&out.stdout)
+        );
+    }
+    // /tmp is the host's: a file written there is there afterwards.
+    assert_eq!(
+        std::fs::read_to_string(&tmp_out).unwrap_or_default(),
+        "tmp-ok\n"
+    );
+    let _ = std::fs::remove_file(&tmp_out);
+}
+
+#[test]
+fn host_ipc_and_shared_memory_are_not_reachable() {
+    require_sandbox!();
+    let pid = std::process::id();
+    // POSIX shared memory lives in /dev/shm.
+    let shm = PathBuf::from(format!("/dev/shm/playpen-test-{pid}"));
+    std::fs::write(&shm, "host").unwrap_or_else(|e| panic!("{e}"));
+    // A POSIX message queue, created through the host's mqueue mount.
+    let mq = PathBuf::from(format!("/dev/mqueue/playpen-test-{pid}"));
+    let have_mq = std::fs::File::create(&mq).is_ok();
+    // A System V shared memory segment.
+    let key = i32::try_from(0x5070_0000_u32 | (pid & 0xffff)).unwrap_or(0x5070_0001);
+    // SAFETY: plain syscall wrapper with integer arguments.
+    let id = unsafe { libc::shmget(key, 4096, libc::IPC_CREAT | 0o600) };
+    assert!(id >= 0, "shmget failed");
+    let host_ipcs = Command::new("ipcs").arg("-m").output();
+    let key_hex = format!("0x{key:08x}");
+    let script = format!(
+        "test ! -e {}; test ! -e {}; ipcs -m; echo shm-checked",
+        shm.display(),
+        mq.display()
+    );
+    let out = sandbox(&[], &["sh", "-c", &script]);
+    let _ = std::fs::remove_file(&shm);
+    let _ = std::fs::remove_file(&mq);
+    // SAFETY: removes the segment created above; null buffer for IPC_RMID.
+    unsafe { libc::shmctl(id, libc::IPC_RMID, std::ptr::null_mut()) };
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(stdout.contains("shm-checked"), "{stdout}");
+    if let Ok(h) = host_ipcs {
+        assert!(
+            text(&h.stdout).contains(&key_hex),
+            "the test segment is not visible on the host"
+        );
+    }
+    assert!(
+        !stdout.contains(&key_hex),
+        "host segment visible inside: {stdout}"
+    );
+    let _ = have_mq;
+}
+
+#[test]
+fn host_processes_are_not_visible_in_proc() {
+    require_sandbox!();
+    let me = std::process::id();
+    let script = format!(
+        "test ! -e /proc/{me}; ls /proc | grep -E '^[0-9]+$' | sort -n | tail -n 1; cat /proc/1/cmdline | tr '\\0' ' '"
+    );
+    let out = sandbox(&[], &["sh", "-c", &script]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    let highest: u32 = stdout
+        .lines()
+        .next()
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or(u32::MAX);
+    // Only the sandbox's own handful of processes.
+    assert!(highest < 100, "{stdout}");
+    assert!(
+        stdout.contains("playpen"),
+        "PID 1 is not playpen's init: {stdout}"
+    );
+}

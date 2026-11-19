@@ -23,6 +23,10 @@ pub enum Outcome {
 
 /// The JSON report. Field names are stable.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is a stable, independent JSON field"
+)]
 pub struct Report {
     /// Version of playpen that wrote this.
     pub playpen_version: &'static str,
@@ -60,6 +64,19 @@ pub struct Report {
     pub dropped: Option<DropSummary>,
     /// Why the drop counters could not be read.
     pub dropped_error: Option<String>,
+    /// How host Unix sockets are kept from the command: `"landlock"`
+    /// (refused wherever they are, plus the mount layer) or `"mounts_only"`
+    /// (`--without-landlock`: hidden under `/run`, `/tmp`, `/var/tmp` and
+    /// the runtime directory only).
+    pub socket_guard: &'static str,
+    /// Host paths the command was let reach (`--expose` and `--display`),
+    /// canonical once checked; as typed when refused.
+    pub exposed: Vec<String>,
+    /// True with `--display`.
+    pub display: bool,
+    /// True when the command ran in its own session without a controlling
+    /// terminal (`--new-session`, or a kernel that allows `TIOCSTI`).
+    pub new_session: bool,
 }
 
 /// The pass a run was held to. Everything but `file` is null when the pass
@@ -174,6 +191,10 @@ mod tests {
             playpen_exit_status: 0,
             dropped: Some(DropSummary::default()),
             dropped_error: None,
+            socket_guard: "landlock",
+            exposed: vec![],
+            display: false,
+            new_session: false,
         }
     }
 
