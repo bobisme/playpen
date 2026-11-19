@@ -12,6 +12,8 @@ unwrap_used = "deny"
 unnecessary_wraps = "allow"
 
 [dependencies]
+# The pass loader and its checks; the library only (no clap of its own).
+hallpass = { path = "../hallpass", default-features = false }
 clap = { version = "4.6.8", features = ["derive"] }
 libc = "0.2.191"
 nix = { version = "0.32.0", features = ["sched", "mount", "signal", "process", "user", "socket", "fs", "poll", "mman", "uio"] }

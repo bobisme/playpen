@@ -46,12 +46,40 @@ pub struct Report {
     pub signal: Option<i32>,
     /// True when playpen stopped the command because the approval ended.
     pub stopped_by_until: bool,
+    /// True when playpen stopped the command after re-reading the pass
+    /// (revoked, expired, unreadable, invalid, or a destination in use
+    /// edited).
+    pub stopped_by_pass: bool,
+    /// Why playpen stopped the command, when it did.
+    pub stop_reason: Option<String>,
+    /// The pass, with `--pass`.
+    pub pass: Option<PassReport>,
     /// The exit status playpen itself returns.
     pub playpen_exit_status: i32,
     /// Drop counters, when they could be read.
     pub dropped: Option<DropSummary>,
     /// Why the drop counters could not be read.
     pub dropped_error: Option<String>,
+}
+
+/// The pass a run was held to. Everything but `file` is null when the pass
+/// could not be loaded.
+#[derive(Debug, Clone, Serialize)]
+pub struct PassReport {
+    /// The pass file as given.
+    pub file: String,
+    /// The pass id.
+    pub id: Option<String>,
+    /// The pass name.
+    pub name: Option<String>,
+    /// `approval.owner`.
+    pub owner: Option<String>,
+    /// `sha256:` digest of the file as loaded at start.
+    pub digest: Option<String>,
+    /// `approval.valid_until`, RFC 3339 UTC.
+    pub valid_until: Option<String>,
+    /// Labels of the destinations in use.
+    pub labels: Vec<String>,
 }
 
 /// The closing text summary for stderr.
@@ -63,6 +91,15 @@ pub fn text_summary(r: &Report) -> String {
             out,
             "playpen: stopped the command because the approval ended at {}",
             r.until.as_deref().unwrap_or("?")
+        );
+    }
+    if r.stopped_by_pass {
+        let _ = writeln!(
+            out,
+            "playpen: stopped the command because {}",
+            r.stop_reason
+                .as_deref()
+                .unwrap_or("the pass no longer permits it")
         );
     }
     match (r.exit_code, r.signal) {
@@ -131,6 +168,9 @@ mod tests {
             exit_code: Some(0),
             signal: None,
             stopped_by_until: false,
+            stopped_by_pass: false,
+            stop_reason: None,
+            pass: None,
             playpen_exit_status: 0,
             dropped: Some(DropSummary::default()),
             dropped_error: None,

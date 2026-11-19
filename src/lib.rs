@@ -7,6 +7,7 @@ pub mod approval;
 pub mod cli;
 pub mod doctor;
 pub mod netlink;
+pub mod pass;
 pub mod pasta;
 pub mod probe;
 pub mod report;

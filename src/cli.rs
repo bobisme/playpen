@@ -4,14 +4,20 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write as _;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use time::OffsetDateTime;
 
 use crate::approval::{Approval, EndsAt, parse_allow, parse_literal_addr};
-use crate::report::{Outcome, Report, text_summary};
+use crate::pass::{self, FromPass, MIN_RECHECK_INTERVAL, NamedDestination, RECHECK_INTERVAL};
+use crate::report::{Outcome, PassReport, Report, text_summary};
 use crate::resolver::{HostEntry, check_hosts, parse_host};
 use crate::sandbox::{self, CommandStatus, Events, Plan, RunError};
+
+/// Why `--pass` and `--allow` cannot be combined.
+const PASS_AND_ALLOW: &str = "--pass and --allow cannot be combined: the pass lists every destination its owner approved in writing, and an --allow beside it would add a destination the owner did not approve. Add the destination to the pass (with the owner's written approval), or use --only LABEL to narrow the pass";
 
 /// Exit status when playpen refuses by policy.
 pub const EXIT_REFUSED: i32 = 2;
@@ -34,13 +40,19 @@ enum Format {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Run COMMAND with egress limited to the --allow destinations.
+    /// Run COMMAND with egress limited to a pass's destinations or the --allow ones.
     Run(RunArgs),
     /// Print the nftables ruleset that would be loaded; sends and creates nothing.
     Rules {
         /// Approved destination: ADDR:PORT/PROTO, ADDR:FROM-TO/PROTO or NET/PREFIX:PORTS/PROTO.
         #[arg(long = "allow", value_name = "SPEC")]
         allow: Vec<String>,
+        /// Take the destinations from this hallpass pass instead of --allow.
+        #[arg(long, value_name = "FILE")]
+        pass: Option<PathBuf>,
+        /// With --pass: only the destination with this label. Repeatable.
+        #[arg(long = "only", value_name = "LABEL")]
+        only: Vec<String>,
         /// Output format.
         #[arg(long, value_enum, default_value = "text")]
         format: Format,
@@ -79,6 +91,14 @@ enum ProbeCmd {
 
 #[derive(Debug, clap::Args)]
 struct RunArgs {
+    /// A hallpass pass: allow exactly its destinations until its approval
+    /// window end, and stop the command if it is revoked or edited.
+    /// Cannot be combined with --allow.
+    #[arg(long, value_name = "FILE")]
+    pass: Option<PathBuf>,
+    /// With --pass: use only the destination with this label. Repeatable.
+    #[arg(long = "only", value_name = "LABEL")]
+    only: Vec<String>,
     /// Approved destination: ADDR:PORT/PROTO, ADDR:FROM-TO/PROTO or
     /// NET/PREFIX:PORTS/PROTO; IPv6 in brackets. Repeatable.
     #[arg(long = "allow", value_name = "SPEC")]
@@ -86,7 +106,8 @@ struct RunArgs {
     /// Make NAME resolve to ADDR inside the sandbox (ADDR must be approved). Repeatable.
     #[arg(long = "host", value_name = "NAME=ADDR")]
     host: Vec<String>,
-    /// When the approval ends (RFC 3339 with offset); the command is stopped then.
+    /// When the approval ends (RFC 3339 with offset); the command is stopped
+    /// then. With --pass it can only be earlier than the pass's window end.
     #[arg(long, value_name = "RFC3339")]
     until: Option<String>,
     /// No network at all: only loopback inside the sandbox.
@@ -105,6 +126,10 @@ struct RunArgs {
     /// Test aid: add ADDR to the sandbox's lo before the ruleset loads.
     #[arg(long = "lo-addr", hide = true, value_name = "ADDR")]
     lo_addr: Vec<String>,
+    /// Test aid: re-read the pass every MS milliseconds (50 up to the
+    /// default interval; never longer).
+    #[arg(long = "pass-recheck-ms", hide = true, value_name = "MS")]
+    pass_recheck_ms: Option<u64>,
     /// The command to run, after `--`.
     #[arg(last = true, required = true, value_name = "COMMAND")]
     command: Vec<OsString>,
@@ -123,21 +148,42 @@ pub fn main() -> i32 {
     };
     match cli.command {
         Cmd::Run(args) => run(&args),
-        Cmd::Rules { allow, format } => rules(&allow, format),
+        Cmd::Rules {
+            allow,
+            pass,
+            only,
+            format,
+        } => rules(&allow, pass.as_deref(), &only, format),
         Cmd::Doctor { format } => crate::doctor::run(format == Format::Json),
         Cmd::Probe { what } => probe(what),
     }
 }
 
-fn rules(allow: &[String], format: Format) -> i32 {
+fn rules(allow: &[String], pass_file: Option<&Path>, only: &[String], format: Format) -> i32 {
+    let refuse = |e: &str| {
+        eprintln!("playpen: refused: {e}");
+        EXIT_REFUSED
+    };
     let mut parsed = Vec::new();
+    let mut from_pass = None;
+    if let Some(path) = pass_file {
+        if !allow.is_empty() {
+            return refuse(PASS_AND_ALLOW);
+        }
+        match pass::load(path, only, OffsetDateTime::now_utc()) {
+            Ok(p) => {
+                parsed.clone_from(&p.approval.rules);
+                from_pass = Some(p);
+            }
+            Err(e) => return refuse(&e),
+        }
+    } else if !only.is_empty() {
+        return refuse(ONLY_WITHOUT_PASS);
+    }
     for spec in allow {
         match parse_allow(spec) {
             Ok(r) => parsed.push(r),
-            Err(e) => {
-                eprintln!("playpen: refused: {e}");
-                return EXIT_REFUSED;
-            }
+            Err(e) => return refuse(&e.to_string()),
         }
     }
     let text = crate::ruleset::render(&parsed);
@@ -147,11 +193,26 @@ fn rules(allow: &[String], format: Format) -> i32 {
             "{}",
             serde_json::json!({
                 "allowed": parsed.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "pass": from_pass.as_ref().map(|p| pass_report(&p.identity)),
                 "ruleset": text,
             })
         ),
     }
     0
+}
+
+const ONLY_WITHOUT_PASS: &str = "--only narrows the destinations of a pass; it needs --pass FILE";
+
+fn pass_report(id: &pass::PassIdentity) -> PassReport {
+    PassReport {
+        file: id.file.display().to_string(),
+        id: Some(id.id.clone()),
+        name: Some(id.name.clone()),
+        owner: Some(id.owner.clone()),
+        digest: Some(id.digest.to_string()),
+        valid_until: Some(hallpass::stamp(id.valid_until)),
+        labels: id.labels.clone(),
+    }
 }
 
 fn probe(what: ProbeCmd) -> i32 {
@@ -192,37 +253,130 @@ struct Checked {
     approval: Approval,
     hosts: Vec<HostEntry>,
     lo_addrs: Vec<IpAddr>,
+    from_pass: Option<FromPass>,
 }
 
-fn check(args: &RunArgs) -> Result<Checked, String> {
-    let mut rules = Vec::new();
-    for spec in &args.allow {
-        rules.push(parse_allow(spec).map_err(|e| e.to_string())?);
+/// The approval from `--pass`, narrowed by `--only` and `--until`.
+fn check_pass(args: &RunArgs, path: &Path, now: OffsetDateTime) -> Result<FromPass, String> {
+    if !args.allow.is_empty() {
+        return Err(PASS_AND_ALLOW.into());
     }
-    if args.no_network && !rules.is_empty() {
-        return Err("--no-network and --allow contradict each other; give one or the other".into());
-    }
-    if !args.no_network && rules.is_empty() {
+    if args.no_network {
         return Err(
-            "no --allow was given. An empty allow list is almost always a mistake: give the approved destinations with --allow ADDR:PORT/PROTO, or use --no-network to run with loopback only"
+            "--no-network and --pass contradict each other: --no-network allows no destination at all; give one or the other"
                 .into(),
         );
     }
-    let ends_at = args
-        .until
-        .as_deref()
-        .map(EndsAt::parse)
-        .transpose()
-        .map_err(|e| e.to_string())?;
-    let approval = Approval { rules, ends_at };
-    approval
-        .check_active(time::OffsetDateTime::now_utc())
-        .map_err(|e| e.to_string())?;
+    let mut from_pass = pass::load(path, &args.only, now)?;
+    if let Some(text) = &args.until {
+        let until = EndsAt::parse(text).map_err(|e| e.to_string())?;
+        if until.at() > from_pass.identity.valid_until {
+            return Err(format!(
+                "--until {} is later than the pass's valid_until {}; --until can only end the run earlier than the window the owner approved. Leave --until out to run until {}",
+                until.to_rfc3339(),
+                hallpass::stamp(from_pass.identity.valid_until),
+                hallpass::stamp(from_pass.identity.valid_until)
+            ));
+        }
+        from_pass.approval.ends_at = Some(until);
+    }
+    if let Some(ms) = args.pass_recheck_ms {
+        from_pass.watch.interval =
+            Duration::from_millis(ms).clamp(MIN_RECHECK_INTERVAL, RECHECK_INTERVAL);
+    }
+    Ok(from_pass)
+}
+
+/// Every `--host` address must be in a destination of the pass that is in
+/// use. A host name the pass mentions grants nothing.
+fn check_pass_hosts(hosts: &[HostEntry], from_pass: &FromPass) -> Result<(), String> {
+    for h in hosts {
+        if !from_pass.approval.covers_addr(h.addr) {
+            return Err(format!(
+                "--host {}={}: {} is not in any destination of the pass in use ({}), for any port, so the name would lead to an address nobody approved; map the name to an address the pass lists{}",
+                h.name,
+                h.addr,
+                h.addr,
+                from_pass.identity.labels.join(", "),
+                hostname_hint(&from_pass.named, &[])
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Names the pass mentions that no `--host` maps: they are not resolved.
+fn hostname_hint(named: &[NamedDestination], hosts: &[HostEntry]) -> String {
+    let unmapped: Vec<String> = named
+        .iter()
+        .filter(|n| {
+            !hosts
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case(&n.hostname))
+        })
+        .map(|n| {
+            let addr = if n.single {
+                n.destination.clone()
+            } else {
+                format!("ADDR-IN-{}", n.destination)
+            };
+            format!("--host {}={addr} (destination {})", n.hostname, n.label)
+        })
+        .collect();
+    if unmapped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; host names in the pass grant nothing and are not resolved; if the tool needs them, map them with {}",
+            unmapped.join(", ")
+        )
+    }
+}
+
+fn check(args: &RunArgs) -> Result<Checked, String> {
+    let now = OffsetDateTime::now_utc();
+    let mut from_pass = None;
+    let approval = if let Some(path) = &args.pass {
+        let p = check_pass(args, path, now)?;
+        let approval = p.approval.clone();
+        from_pass = Some(p);
+        approval
+    } else {
+        if !args.only.is_empty() {
+            return Err(ONLY_WITHOUT_PASS.into());
+        }
+        let mut rules = Vec::new();
+        for spec in &args.allow {
+            rules.push(parse_allow(spec).map_err(|e| e.to_string())?);
+        }
+        if args.no_network && !rules.is_empty() {
+            return Err(
+                "--no-network and --allow contradict each other; give one or the other".into(),
+            );
+        }
+        if !args.no_network && rules.is_empty() {
+            return Err(
+                "no --allow or --pass was given. An empty allow list is almost always a mistake: give the approved destinations with --pass FILE or --allow ADDR:PORT/PROTO, or use --no-network to run with loopback only"
+                    .into(),
+            );
+        }
+        let ends_at = args
+            .until
+            .as_deref()
+            .map(EndsAt::parse)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        Approval { rules, ends_at }
+    };
+    approval.check_active(now).map_err(|e| e.to_string())?;
     let mut hosts = Vec::new();
     for h in &args.host {
         hosts.push(parse_host(h).map_err(|e| e.to_string())?);
     }
-    check_hosts(&hosts, &approval).map_err(|e| e.to_string())?;
+    match &from_pass {
+        Some(p) => check_pass_hosts(&hosts, p)?,
+        None => check_hosts(&hosts, &approval).map_err(|e| e.to_string())?,
+    }
     let mut lo_addrs = Vec::new();
     for a in &args.lo_addr {
         lo_addrs.push(parse_literal_addr(a).map_err(|e| format!("--lo-addr {a:?}: {e}"))?);
@@ -236,6 +390,7 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
         approval,
         hosts,
         lo_addrs,
+        from_pass,
     })
 }
 
@@ -252,6 +407,15 @@ impl Events for StderrEvents {
         eprintln!(
             "playpen: the approval ended at {}; sending SIGTERM to the command (SIGKILL in {} s)",
             self.until.as_deref().unwrap_or("?"),
+            sandbox::GRACE.as_secs()
+        );
+    }
+    fn pass_edited(&mut self, message: &str) {
+        eprintln!("playpen: {message}");
+    }
+    fn pass_withdrawn(&mut self, reason: &str) {
+        eprintln!(
+            "playpen: {reason}; sending SIGTERM to the command (SIGKILL in {} s)",
             sandbox::GRACE.as_secs()
         );
     }
@@ -274,8 +438,14 @@ fn start_line(c: &Checked, network: bool) -> String {
     };
     if network {
         let list: Vec<String> = c.approval.rules.iter().map(ToString::to_string).collect();
+        let (under, hint) = c.from_pass.as_ref().map_or_else(Default::default, |p| {
+            (
+                format!("under {}: ", pass::describe(&p.identity)),
+                hostname_hint(&p.named, &c.hosts),
+            )
+        });
         format!(
-            "playpen: allowing only {} {until} ({names}); everything else is dropped",
+            "playpen: {under}allowing only {} {until} ({names}); everything else is dropped{hint}",
             list.join(", ")
         )
     } else {
@@ -300,6 +470,17 @@ fn base_report(args: &RunArgs) -> Report {
         exit_code: None,
         signal: None,
         stopped_by_until: false,
+        stopped_by_pass: false,
+        stop_reason: None,
+        pass: args.pass.as_ref().map(|p| PassReport {
+            file: p.display().to_string(),
+            id: None,
+            name: None,
+            owner: None,
+            digest: None,
+            valid_until: None,
+            labels: Vec::new(),
+        }),
         playpen_exit_status: EXIT_REFUSED,
         dropped: None,
         dropped_error: None,
@@ -356,6 +537,9 @@ fn run(args: &RunArgs) -> i32 {
         .map(ToString::to_string)
         .collect();
     report.until = checked.approval.ends_at.map(EndsAt::to_rfc3339);
+    if let Some(p) = &checked.from_pass {
+        report.pass = Some(pass_report(&p.identity));
+    }
     let fail = |report: &mut Report, file: Option<&mut File>, outcome, msg: String| {
         eprintln!("playpen: {msg}");
         report.outcome = outcome;
@@ -397,6 +581,7 @@ fn run(args: &RunArgs) -> i32 {
         command: args.command.clone(),
         nft,
         pasta,
+        watch: checked.from_pass.map(|p| p.watch),
     };
     let result = match sandbox::run(&plan, &mut events) {
         Ok(r) => r,
@@ -419,6 +604,16 @@ fn run(args: &RunArgs) -> i32 {
     };
     report.outcome = Outcome::Ran;
     report.stopped_by_until = result.stopped_by_until;
+    if result.stopped_by_until {
+        report.stop_reason = Some(format!(
+            "the approval ended at {}",
+            report.until.as_deref().unwrap_or("?")
+        ));
+    }
+    if let Some(why) = result.stopped_by_pass {
+        report.stopped_by_pass = true;
+        report.stop_reason = Some(why);
+    }
     let code = match result.status {
         CommandStatus::Exited(c) => {
             report.exit_code = Some(c);

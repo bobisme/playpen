@@ -1,0 +1,655 @@
+//! Integration tests for `--pass`: run the built binary with a hallpass
+//! pass written by the test.
+//!
+//! As in `run.rs`, every destination is a documentation address added to
+//! the sandbox's own `lo` (hidden `--lo-addr`), so nothing leaves the
+//! machine even if the filter were broken. Windows are set relative to the
+//! real clock (an hour either side), so no test clock is needed.
+
+use std::fs::OpenOptions;
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+const BIN: &str = env!("CARGO_BIN_EXE_playpen");
+
+fn skip_reason() -> Option<String> {
+    let max = std::fs::read_to_string("/proc/sys/user/max_user_namespaces").unwrap_or_default();
+    if max.trim().is_empty() || max.trim() == "0" {
+        return Some("user namespaces are not available".into());
+    }
+    for tool in ["nft", "pasta"] {
+        let found = ["/usr/bin", "/usr/sbin", "/bin", "/sbin"]
+            .iter()
+            .any(|d| Path::new(d).join(tool).exists());
+        if !found {
+            return Some(format!("{tool} is not installed"));
+        }
+    }
+    None
+}
+
+macro_rules! require_sandbox {
+    () => {
+        if let Some(why) = skip_reason() {
+            eprintln!("SKIPPED: {why}");
+            return;
+        }
+    };
+}
+
+fn text(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
+}
+
+fn tmpdir(name: &str) -> PathBuf {
+    let dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("pass-{name}-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn stamp(t: OffsetDateTime) -> String {
+    t.replace_nanosecond(0)
+        .unwrap_or(t)
+        .format(&Rfc3339)
+        .unwrap_or_default()
+}
+
+fn hours(h: i64) -> String {
+    stamp(OffsetDateTime::now_utc() + time::Duration::hours(h))
+}
+
+fn secs_from_now(s: i64) -> String {
+    stamp(OffsetDateTime::now_utc() + time::Duration::seconds(s))
+}
+
+const WEB: &str = r#"
+[[destination]]
+label = "web"
+address = "192.0.2.1"
+protocol = "tcp"
+ports = [9101, "9103-9104"]
+hostname = "app.example.test"
+"#;
+
+const SIP: &str = r#"
+[[destination]]
+label = "sip"
+address = "192.0.2.2"
+protocol = "udp"
+ports = 5060
+"#;
+
+const V6: &str = r#"
+[[destination]]
+label = "v6"
+network = "2001:db8::/120"
+protocol = "tcp"
+ports = 9301
+"#;
+
+/// A pass valid from `from` until `until`, with these destinations.
+fn pass_text(from: &str, until: &str, revoked: bool, destinations: &[&str]) -> String {
+    format!(
+        "format = 1\nid = \"test-pass-1\"\nname = \"Practice range\"\n\n[approval]\nowner = \"Pat Owner, Example Corp\"\nreference = \"email of 2026-11-18\"\noperator = \"Sam Tester\"\nvalid_from = {from}\nvalid_until = {until}\nrevoked = {revoked}\n{}\n[ceilings]\ncalls = 6\n",
+        destinations.join("")
+    )
+}
+
+fn valid_pass(destinations: &[&str]) -> String {
+    pass_text(&hours(-1), &hours(1), false, destinations)
+}
+
+/// Writes `contents` to `path` with mode 0600, atomically (a new file
+/// renamed over the old one), so a re-read never sees half a file.
+fn write_pass(path: &Path, contents: &str) {
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .unwrap_or_else(|e| panic!("cannot create {}: {e}", tmp.display()));
+    f.write_all(contents.as_bytes())
+        .unwrap_or_else(|e| panic!("{e}"));
+    drop(f);
+    std::fs::rename(&tmp, path).unwrap_or_else(|e| panic!("{e}"));
+}
+
+fn new_pass(dir: &Path, contents: &str) -> PathBuf {
+    let path = dir.join("test.pass.toml");
+    write_pass(&path, contents);
+    path
+}
+
+fn s(p: &Path) -> &str {
+    p.to_str().unwrap_or("")
+}
+
+const LO: &[&str] = &[
+    "--lo-addr",
+    "192.0.2.1",
+    "--lo-addr",
+    "192.0.2.2",
+    "--lo-addr",
+    "2001:db8::1",
+];
+
+fn run(args: &[&str]) -> Output {
+    Command::new(BIN)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run playpen: {e}"))
+}
+
+fn spawn(args: &[&str]) -> Child {
+    Command::new(BIN)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("cannot run playpen: {e}"))
+}
+
+fn report(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap_or_default()).unwrap_or_default()
+}
+
+fn parse_reach(stdout: &str) -> Vec<(String, bool)> {
+    stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .map(|v| {
+            (
+                v["target"].as_str().unwrap_or("").to_owned(),
+                v["reached"].as_bool().unwrap_or(true),
+            )
+        })
+        .collect()
+}
+
+fn reached(results: &[(String, bool)], target: &str) -> bool {
+    results.iter().find(|(t, _)| t == target).map_or_else(
+        || panic!("no result for {target} in {results:?}"),
+        |(_, r)| *r,
+    )
+}
+
+/// Runs a reach probe under `extra` (`--pass FILE` and so on); every
+/// target is both served and tried.
+fn reach(extra: &[&str], targets: &[&str]) -> (Vec<(String, bool)>, Output) {
+    let mut args = vec!["run"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(LO);
+    args.extend_from_slice(&["--", BIN, "probe", "reach"]);
+    for t in targets {
+        args.extend_from_slice(&["--serve", t]);
+    }
+    for t in targets {
+        args.extend_from_slice(&["--try", t]);
+    }
+    let out = run(&args);
+    (parse_reach(&text(&out.stdout)), out)
+}
+
+/// Asserts a refusal: exit 2, `expect` and "nothing was run" on stderr,
+/// the command not run, and a report with outcome "refused".
+fn assert_refused(extra: &[&str], expect: &str) {
+    let dir = tmpdir(&format!(
+        "refused-{}",
+        expect.replace(|c: char| !c.is_ascii_alphanumeric(), "")
+    ));
+    let marker = dir.join("ran");
+    let _ = std::fs::remove_file(&marker);
+    let rep = dir.join("report.json");
+    let mut args = vec!["run"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--report", s(&rep), "--", "touch", s(&marker)]);
+    let out = run(&args);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains(expect), "expected {expect:?} in: {err}");
+    assert!(err.contains("nothing was run"), "{err}");
+    assert!(!marker.exists(), "the command ran");
+    let json = report(&rep);
+    assert_eq!(json["outcome"], "refused", "{json}");
+}
+
+#[test]
+fn pass_destinations_are_reachable_and_nothing_else_and_the_report_names_the_pass() {
+    require_sandbox!();
+    let dir = tmpdir("reach");
+    let pass = new_pass(&dir, &valid_pass(&[WEB, SIP, V6]));
+    let rep = dir.join("report.json");
+    let (r, out) = reach(
+        &["--pass", s(&pass), "--report", s(&rep)],
+        &[
+            "192.0.2.1:9101/tcp",
+            "192.0.2.1:9104/tcp",
+            "192.0.2.1:9102/tcp",
+            "192.0.2.1:9101/udp",
+            "192.0.2.2:5060/udp",
+            "192.0.2.2:9101/tcp",
+            "[2001:db8::1]:9301/tcp",
+            "[2001:db8::1]:9302/tcp",
+        ],
+    );
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(reached(&r, "192.0.2.1:9101/tcp"));
+    assert!(reached(&r, "192.0.2.1:9104/tcp"));
+    assert!(!reached(&r, "192.0.2.1:9102/tcp"));
+    assert!(!reached(&r, "192.0.2.1:9101/udp"));
+    assert!(reached(&r, "192.0.2.2:5060/udp"));
+    assert!(!reached(&r, "192.0.2.2:9101/tcp"));
+    assert!(reached(&r, "[2001:db8::1]:9301/tcp"));
+    assert!(!reached(&r, "[2001:db8::1]:9302/tcp"));
+
+    // The start line names the pass and says nothing about ceilings.
+    let start = err
+        .lines()
+        .find(|l| l.contains("allowing only"))
+        .unwrap_or_default();
+    assert!(start.contains("under pass test-pass-1"), "{start}");
+    assert!(
+        start.contains("owner \"Pat Owner, Example Corp\""),
+        "{start}"
+    );
+    assert!(start.contains("destinations web, sip, v6"), "{start}");
+    assert!(start.contains("sha256:"), "{start}");
+    assert!(!start.contains("calls"), "{start}");
+    assert!(!start.contains("ceiling"), "{start}");
+    // The host name is not used, but the operator is told how to map it.
+    assert!(
+        start.contains("--host app.example.test=192.0.2.1"),
+        "{start}"
+    );
+
+    let json = report(&rep);
+    assert_eq!(json["outcome"], "ran");
+    let p = &json["pass"];
+    assert_eq!(p["file"], s(&pass));
+    assert_eq!(p["id"], "test-pass-1");
+    assert_eq!(p["name"], "Practice range");
+    assert_eq!(p["owner"], "Pat Owner, Example Corp");
+    assert!(p["digest"].as_str().unwrap_or("").starts_with("sha256:"));
+    assert_eq!(p["labels"], serde_json::json!(["web", "sip", "v6"]));
+    assert_eq!(p["valid_until"], json["until"]);
+    assert_eq!(
+        json["allowed"],
+        serde_json::json!([
+            "192.0.2.1:9101/tcp",
+            "192.0.2.1:9103-9104/tcp",
+            "192.0.2.2:5060/udp",
+            "[2001:db8::/120]:9301/tcp"
+        ])
+    );
+    assert_eq!(json["stopped_by_pass"], false);
+    // Dropped-packet reporting is unchanged.
+    assert!(
+        json["dropped"]["packets"].as_u64().unwrap_or(0) >= 1,
+        "{json}"
+    );
+}
+
+#[test]
+fn only_narrows_to_the_named_destinations() {
+    require_sandbox!();
+    let dir = tmpdir("only");
+    let pass = new_pass(&dir, &valid_pass(&[WEB, SIP]));
+    let rep = dir.join("report.json");
+    let (r, out) = reach(
+        &["--pass", s(&pass), "--only", "sip", "--report", s(&rep)],
+        &["192.0.2.1:9101/tcp", "192.0.2.2:5060/udp"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(!reached(&r, "192.0.2.1:9101/tcp"));
+    assert!(reached(&r, "192.0.2.2:5060/udp"));
+    assert_eq!(report(&rep)["pass"]["labels"], serde_json::json!(["sip"]));
+}
+
+#[test]
+fn unknown_label_is_refused() {
+    let dir = tmpdir("unknown-label");
+    let pass = new_pass(&dir, &valid_pass(&[WEB, SIP]));
+    assert_refused(
+        &["--pass", s(&pass), "--only", "sip", "--only", "nope"],
+        "the pass has no destination with this label; its labels are web, sip",
+    );
+}
+
+#[test]
+fn pass_with_allow_is_refused_and_says_why() {
+    let dir = tmpdir("with-allow");
+    let pass = new_pass(&dir, &valid_pass(&[WEB]));
+    assert_refused(
+        &["--pass", s(&pass), "--allow", "192.0.2.9:443/tcp"],
+        "would add a destination the owner did not approve",
+    );
+    assert_refused(
+        &["--only", "web", "--allow", "192.0.2.9:443/tcp"],
+        "needs --pass FILE",
+    );
+    assert_refused(&["--pass", s(&pass), "--no-network"], "contradict");
+}
+
+#[test]
+fn passes_that_permit_nothing_refuse_and_run_nothing() {
+    let dir = tmpdir("bad-passes");
+    let expired = dir.join("expired.pass.toml");
+    write_pass(&expired, &pass_text(&hours(-3), &hours(-1), false, &[WEB]));
+    assert_refused(&["--pass", s(&expired)], "expired");
+
+    let early = dir.join("early.pass.toml");
+    write_pass(&early, &pass_text(&hours(1), &hours(3), false, &[WEB]));
+    assert_refused(&["--pass", s(&early)], "not-yet-valid");
+
+    let revoked = dir.join("revoked.pass.toml");
+    write_pass(&revoked, &pass_text(&hours(-1), &hours(1), true, &[WEB]));
+    assert_refused(&["--pass", s(&revoked)], "revoked");
+
+    let invalid = dir.join("invalid.pass.toml");
+    write_pass(
+        &invalid,
+        &valid_pass(&[WEB]).replace("address = \"192.0.2.1\"", "address = \"app.example.test\""),
+    );
+    assert_refused(&["--pass", s(&invalid)], "invalid-pass");
+    assert_refused(&["--pass", s(&invalid)], "destination[1].address");
+
+    let link = dir.join("link.pass.toml");
+    let target = dir.join("real.pass.toml");
+    write_pass(&target, &valid_pass(&[WEB]));
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&target, &link).unwrap_or_else(|e| panic!("{e}"));
+    assert_refused(&["--pass", s(&link)], "symbolic link");
+
+    let open = dir.join("open.pass.toml");
+    write_pass(&open, &valid_pass(&[WEB]));
+    std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o666))
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_refused(&["--pass", s(&open)], "insecure-permissions");
+
+    assert_refused(
+        &["--pass", s(&dir.join("missing.pass.toml"))],
+        "no such file",
+    );
+
+    // playpen cannot enforce a loopback destination (hallpass accepts one
+    // when listed); it refuses rather than drop it silently.
+    let lo = dir.join("lo.pass.toml");
+    write_pass(&lo, &valid_pass(&[&WEB.replace("192.0.2.1", "127.0.0.1")]));
+    assert_refused(&["--pass", s(&lo)], "loopback");
+}
+
+#[test]
+fn a_later_until_is_refused() {
+    let dir = tmpdir("later-until");
+    let pass = new_pass(&dir, &valid_pass(&[WEB]));
+    assert_refused(
+        &["--pass", s(&pass), "--until", &hours(2)],
+        "can only end the run earlier",
+    );
+}
+
+#[test]
+fn an_earlier_until_is_honoured() {
+    require_sandbox!();
+    let dir = tmpdir("earlier-until");
+    let pass = new_pass(&dir, &valid_pass(&[WEB]));
+    let rep = dir.join("report.json");
+    let until = secs_from_now(2);
+    let started = Instant::now();
+    let out = run(&[
+        "run",
+        "--pass",
+        s(&pass),
+        "--until",
+        &until,
+        "--report",
+        s(&rep),
+        "--",
+        "sleep",
+        "30",
+    ]);
+    let took = started.elapsed();
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 15), "{err}");
+    assert!(took < Duration::from_secs(8), "took {took:?}");
+    assert!(err.contains("approval ended"), "{err}");
+    let json = report(&rep);
+    assert_eq!(json["stopped_by_until"], true);
+    assert_eq!(json["stopped_by_pass"], false);
+    assert_eq!(json["until"].as_str(), Some(until.as_str()));
+    assert_ne!(json["until"], json["pass"]["valid_until"]);
+}
+
+const RECHECK_MS: &str = "200";
+
+/// Starts `sleep 30` under the pass, waits `after`, applies `change`, and
+/// returns playpen's output, how long the whole run took, and the report.
+fn run_then(
+    pass: &Path,
+    after: Duration,
+    change: impl FnOnce(),
+) -> (Output, Duration, serde_json::Value) {
+    let rep = pass.with_extension("report.json");
+    let started = Instant::now();
+    let child = spawn(&[
+        "run",
+        "--pass",
+        s(pass),
+        "--pass-recheck-ms",
+        RECHECK_MS,
+        "--report",
+        s(&rep),
+        "--",
+        "sleep",
+        "30",
+    ]);
+    std::thread::sleep(after);
+    change();
+    let out = child.wait_with_output().unwrap_or_else(|e| panic!("{e}"));
+    (out, started.elapsed(), report(&rep))
+}
+
+#[test]
+fn revoking_the_pass_stops_the_command() {
+    require_sandbox!();
+    let dir = tmpdir("revoke");
+    let contents = valid_pass(&[WEB]);
+    let pass = new_pass(&dir, &contents);
+    let (out, took, json) = run_then(&pass, Duration::from_secs(1), || {
+        write_pass(
+            &pass,
+            &contents.replace("revoked = false", "revoked = true"),
+        );
+    });
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 15), "{err}");
+    // 1 s before the edit, then at most the interval and the grace.
+    assert!(
+        took < Duration::from_millis(1000 + 200 + 3000 + 1500),
+        "took {took:?}"
+    );
+    assert!(err.contains("revoked"), "{err}");
+    assert!(err.contains("SIGTERM"), "{err}");
+    assert_eq!(json["stopped_by_pass"], true);
+    assert_eq!(json["stopped_by_until"], false);
+    assert!(
+        json["stop_reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("revoked"),
+        "{json}"
+    );
+}
+
+#[test]
+fn deleting_the_pass_stops_the_command() {
+    require_sandbox!();
+    let dir = tmpdir("delete");
+    let pass = new_pass(&dir, &valid_pass(&[WEB]));
+    let (out, took, json) = run_then(&pass, Duration::from_secs(1), || {
+        std::fs::remove_file(&pass).unwrap_or_else(|e| panic!("{e}"));
+    });
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 15), "{err}");
+    assert!(took < Duration::from_millis(5700), "took {took:?}");
+    assert!(err.contains("can no longer be read"), "{err}");
+    assert_eq!(json["stopped_by_pass"], true);
+}
+
+#[test]
+fn editing_a_destination_in_use_stops_the_command() {
+    require_sandbox!();
+    let dir = tmpdir("edit-in-use");
+    let contents = valid_pass(&[WEB, SIP]);
+    let pass = new_pass(&dir, &contents);
+    let (out, took, json) = run_then(&pass, Duration::from_millis(800), || {
+        write_pass(&pass, &contents.replace("ports = 5060", "ports = 5061"));
+    });
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 15), "{err}");
+    assert!(took < Duration::from_millis(5500), "took {took:?}");
+    assert!(err.contains("destination `sip`"), "{err}");
+    assert_eq!(json["stopped_by_pass"], true);
+}
+
+#[test]
+fn a_harmless_edit_keeps_the_run_under_the_rules_loaded_at_start() {
+    require_sandbox!();
+    let dir = tmpdir("harmless");
+    let before = valid_pass(&[WEB]);
+    let pass = new_pass(&dir, &before);
+    // After the edit: a raised ceiling, a later window end, and a new
+    // destination. The run continues, and the new destination stays
+    // blocked: an edit never widens the rules in the kernel.
+    let after =
+        pass_text(&hours(-1), &hours(5), false, &[WEB, SIP]).replace("calls = 6", "calls = 60");
+    let rep = dir.join("report.json");
+    let started = Instant::now();
+    let script = format!(
+        "sleep 1.2; exec {BIN} probe reach --serve 192.0.2.2:5060/udp --serve 192.0.2.1:9101/tcp --try 192.0.2.2:5060/udp --try 192.0.2.1:9101/tcp"
+    );
+    let mut args = vec![
+        "run",
+        "--pass",
+        s(&pass),
+        "--pass-recheck-ms",
+        RECHECK_MS,
+        "--report",
+        s(&rep),
+    ];
+    args.extend_from_slice(LO);
+    args.extend_from_slice(&["--", "sh", "-c", &script]);
+    let child = spawn(&args);
+    std::thread::sleep(Duration::from_millis(400));
+    write_pass(&pass, &after);
+    let out = child.wait_with_output().unwrap_or_else(|e| panic!("{e}"));
+    let took = started.elapsed();
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(took < Duration::from_secs(6), "took {took:?}");
+    assert!(
+        err.contains("continues under the rules loaded at start"),
+        "{err}"
+    );
+    let r = parse_reach(&text(&out.stdout));
+    assert!(reached(&r, "192.0.2.1:9101/tcp"));
+    assert!(!reached(&r, "192.0.2.2:5060/udp"));
+    let json = report(&rep);
+    assert_eq!(json["stopped_by_pass"], false);
+    assert_eq!(
+        json["allowed"],
+        serde_json::json!(["192.0.2.1:9101/tcp", "192.0.2.1:9103-9104/tcp"])
+    );
+}
+
+#[test]
+fn host_must_map_to_an_address_in_the_pass() {
+    let dir = tmpdir("host");
+    let pass = new_pass(&dir, &valid_pass(&[WEB, SIP]));
+    assert_refused(
+        &["--pass", s(&pass), "--host", "app.example.test=192.0.2.77"],
+        "is not in any destination of the pass in use",
+    );
+    // An address of the pass outside --only is not in use either.
+    assert_refused(
+        &[
+            "--pass",
+            s(&pass),
+            "--only",
+            "web",
+            "--host",
+            "sip.example.test=192.0.2.2",
+        ],
+        "is not in any destination of the pass in use (web)",
+    );
+}
+
+#[test]
+fn host_mapped_to_a_pass_address_resolves() {
+    require_sandbox!();
+    let dir = tmpdir("host-ok");
+    let pass = new_pass(&dir, &valid_pass(&[WEB]));
+    let out = run(&[
+        "run",
+        "--pass",
+        s(&pass),
+        "--host",
+        "app.example.test=192.0.2.1",
+        "--",
+        BIN,
+        "probe",
+        "resolve",
+        "app.example.test",
+    ]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        text(&out.stdout).contains("192.0.2.1"),
+        "{}",
+        text(&out.stdout)
+    );
+    // Once mapped, the start line no longer suggests mapping it.
+    assert!(!err.contains("map them with"), "{err}");
+}
+
+#[test]
+fn rules_prints_the_ruleset_for_a_pass() {
+    let dir = tmpdir("rules");
+    let pass = new_pass(&dir, &valid_pass(&[WEB, SIP]));
+    let out = run(&["rules", "--pass", s(&pass), "--only", "sip"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let ruleset = text(&out.stdout);
+    assert!(
+        ruleset.contains("ip daddr 192.0.2.2 udp dport 5060 accept"),
+        "{ruleset}"
+    );
+    assert!(!ruleset.contains("192.0.2.1"), "{ruleset}");
+
+    let out = run(&["rules", "--pass", s(&pass), "--format", "json"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    assert_eq!(json["pass"]["id"], "test-pass-1");
+    assert_eq!(json["allowed"].as_array().map(Vec::len), Some(3));
+
+    let out = run(&["rules", "--pass", s(&pass), "--allow", "192.0.2.9:1/tcp"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(text(&out.stdout), "");
+    let out = run(&["rules", "--pass", s(&pass), "--only", "nope"]);
+    assert_eq!(out.status.code(), Some(2));
+    let revoked = dir.join("revoked.pass.toml");
+    write_pass(&revoked, &pass_text(&hours(-1), &hours(1), true, &[WEB]));
+    let out = run(&["rules", "--pass", s(&revoked)]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(text(&out.stderr).contains("revoked"));
+}

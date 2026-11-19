@@ -47,6 +47,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Gid, Pid, Uid, getgid, getpid, getppid, getuid, pipe2, read};
 
 use crate::approval::Approval;
+use crate::pass::{PassWatch, Recheck};
 use crate::resolver::{self, HostEntry};
 use crate::ruleset::{self, DropSummary};
 
@@ -89,6 +90,9 @@ pub struct Plan {
     pub nft: PathBuf,
     /// The `pasta` binary.
     pub pasta: PathBuf,
+    /// With `--pass`: the pass file to re-read while the command runs. A
+    /// re-read can stop the run, never change the rules.
+    pub watch: Option<PassWatch>,
 }
 
 /// How the command ended.
@@ -107,6 +111,8 @@ pub struct RunResult {
     pub status: CommandStatus,
     /// True when playpen stopped the command because the approval ended.
     pub stopped_by_until: bool,
+    /// Why playpen stopped the command after re-reading the pass, if it did.
+    pub stopped_by_pass: Option<String>,
     /// The drop counters, or why they could not be read.
     pub drops: Result<DropSummary, String>,
 }
@@ -135,6 +141,11 @@ pub trait Events {
     fn starting(&mut self);
     /// The approval ended; the command is being stopped.
     fn until_reached(&mut self);
+    /// A re-read of the pass found an edit that changes nothing in use.
+    fn pass_edited(&mut self, message: &str);
+    /// A re-read of the pass withdrew the approval; the command is being
+    /// stopped for this reason.
+    fn pass_withdrawn(&mut self, reason: &str);
 }
 
 /// Number of threads in this process, from `/proc/self/status`.
@@ -519,17 +530,28 @@ fn parent(
         let left = end.at() - time::OffsetDateTime::now_utc();
         Instant::now() + left.try_into().unwrap_or(Duration::ZERO)
     });
+    let mut watch = plan.watch.clone();
+    let mut withdrawn = None;
     if let Some(d) = wall_deadline
         && d <= Instant::now()
     {
+        withdrawn = Some("the approval ended while the sandbox was being built".to_owned());
+    } else if let Some(w) = watch.as_mut() {
+        match w.recheck(time::OffsetDateTime::now_utc()) {
+            Recheck::Unchanged => {}
+            Recheck::Edited(m) => events.pass_edited(&m),
+            Recheck::Stop(why) => {
+                withdrawn = Some(format!("while the sandbox was being built, {why}"));
+            }
+        }
+    }
+    if let Some(why) = withdrawn {
         drop(down_w);
         let _ = waitpid(child, None);
         if let Some(p) = pasta {
             p.stop();
         }
-        return Err(RunError::NotStarted(
-            "the approval ended while the sandbox was being built".into(),
-        ));
+        return Err(RunError::NotStarted(why));
     }
     events.starting();
     write_line(&down_w, "go");
@@ -538,23 +560,38 @@ fn parent(
     let mut term_sent_at: Option<Instant> = None;
     let mut killed = false;
     let mut pending: Vec<Signal> = Vec::new();
+    let mut stopped_by_pass: Option<String> = None;
+    let mut next_recheck = watch.as_ref().map(|w| Instant::now() + w.interval);
     while !st.eof {
         let now = Instant::now();
         let mut wake = now + Duration::from_secs(10);
+        if let (Some(w), Some(due)) = (watch.as_mut(), next_recheck)
+            && term_sent_at.is_none()
+        {
+            if now >= due {
+                match w.recheck(time::OffsetDateTime::now_utc()) {
+                    Recheck::Unchanged => {}
+                    Recheck::Edited(m) => events.pass_edited(&m),
+                    Recheck::Stop(why) => {
+                        events.pass_withdrawn(&why);
+                        stopped_by_pass = Some(why);
+                        term_sent_at = Some(now);
+                        stop_command(st.init, child);
+                    }
+                }
+                next_recheck = Some(Instant::now() + w.interval);
+            }
+            if let Some(due) = next_recheck {
+                wake = wake.min(due);
+            }
+        }
         if let Some(d) = wall_deadline
             && term_sent_at.is_none()
         {
             if now >= d {
                 events.until_reached();
                 term_sent_at = Some(now);
-                match st.init {
-                    Some(init) => {
-                        let _ = kill(init, Signal::SIGTERM);
-                    }
-                    None => {
-                        let _ = kill(child, Signal::SIGKILL);
-                    }
-                }
+                stop_command(st.init, child);
             } else {
                 wake = wake.min(d);
             }
@@ -629,11 +666,25 @@ fn parent(
     };
     Ok(RunResult {
         status,
-        stopped_by_until: term_sent_at.is_some(),
+        stopped_by_until: term_sent_at.is_some() && stopped_by_pass.is_none(),
+        stopped_by_pass,
         drops: st
             .drops
             .unwrap_or_else(|| Err("the drop counters were not reported".into())),
     })
+}
+
+/// First step of stopping the command: SIGTERM to the sandbox's init, which
+/// passes it on; SIGKILL to C if init is not known yet.
+fn stop_command(init: Option<Pid>, child: Pid) {
+    match init {
+        Some(init) => {
+            let _ = kill(init, Signal::SIGTERM);
+        }
+        None => {
+            let _ = kill(child, Signal::SIGKILL);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- C ----

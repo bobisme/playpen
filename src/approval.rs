@@ -1,10 +1,9 @@
 //! What was approved: the allow rules and the time the approval ends.
 //!
-//! This module is deliberately independent of the namespace code. Today the
-//! rules come from `--allow` and `--until` on the command line; a later
-//! version will also build an [`Approval`] from a permission-slip file. Both
-//! sources produce the same typed values, and nothing downstream sees text a
-//! user typed.
+//! This module is deliberately independent of the namespace code. The rules
+//! come from `--allow` and `--until` on the command line, or from a hallpass
+//! pass (`--pass`, see [`crate::pass`]). Both sources produce the same typed
+//! values, and nothing downstream sees text a user typed.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -475,6 +474,12 @@ impl EndsAt {
                 "--until {text:?} is not an RFC 3339 timestamp with an explicit offset, for example 2026-11-18T22:00:00Z or 2026-11-18T23:00:00+01:00"
             ))
         })
+    }
+
+    /// An end time taken from another source (a pass's `valid_until`).
+    #[must_use]
+    pub const fn from_time(at: OffsetDateTime) -> Self {
+        Self(at)
     }
 
     /// The moment as a time value.
