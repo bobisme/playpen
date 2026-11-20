@@ -715,14 +715,17 @@ fn parent(
             }
         }
     }
-    let wall_deadline = plan.approval.ends_at.map(|end| {
+    let deadline = plan.approval.ends_at.map(|end| {
         let left = end.at() - time::OffsetDateTime::now_utc();
-        Instant::now() + left.try_into().unwrap_or(Duration::ZERO)
+        Deadline {
+            monotonic: Instant::now() + left.try_into().unwrap_or(Duration::ZERO),
+            wall: end.at(),
+        }
     });
     let mut watch = plan.watch.clone();
     let mut withdrawn = None;
-    if let Some(d) = wall_deadline
-        && d <= Instant::now()
+    if let Some(d) = deadline
+        && d.passed(Instant::now(), time::OffsetDateTime::now_utc())
     {
         withdrawn = Some("the approval ended while the sandbox was being built".to_owned());
     } else if let Some(w) = watch.as_mut() {
@@ -779,15 +782,15 @@ fn parent(
                 wake = wake.min(due);
             }
         }
-        if let Some(d) = wall_deadline
+        if let Some(d) = deadline
             && term_sent_at.is_none()
         {
-            if now >= d {
+            if d.passed(now, time::OffsetDateTime::now_utc()) {
                 events.until_reached();
                 term_sent_at = Some(now);
                 stop_command(st.init, child, &down_w);
             } else {
-                wake = wake.min(d);
+                wake = wake.min(d.monotonic);
             }
         }
         if let Some(t) = term_sent_at
@@ -847,9 +850,17 @@ fn parent(
         p.stop();
     }
     if !st.started {
-        let why = st
-            .failure
-            .unwrap_or_else(|| "the sandbox ended before the command started".into());
+        let why = st.failure.unwrap_or_else(|| {
+            let ended = if term_sent_at.is_some() {
+                "the approval ended before the command started"
+            } else {
+                "the sandbox ended before the command started"
+            };
+            stopped_by_pass.as_ref().map_or_else(
+                || ended.to_owned(),
+                |why| format!("{why}, before the command started"),
+            )
+        });
         return Err(RunError::NotStarted(why));
     }
     let status = match st.status {
@@ -869,6 +880,25 @@ fn parent(
             .drops
             .unwrap_or_else(|| Err("the drop counters were not reported".into())),
     })
+}
+
+/// When the approval ends, on two clocks.
+///
+/// The monotonic deadline is fixed when the sandbox starts, so setting the
+/// system clock back cannot extend the run. But that clock stands still
+/// while the machine is suspended, and the approval's end is a moment in
+/// real time, so the wall clock is looked at as well: the approval is over
+/// as soon as either clock says so.
+#[derive(Debug, Clone, Copy)]
+struct Deadline {
+    monotonic: Instant,
+    wall: time::OffsetDateTime,
+}
+
+impl Deadline {
+    fn passed(self, now: Instant, wall_now: time::OffsetDateTime) -> bool {
+        now >= self.monotonic || wall_now >= self.wall
+    }
 }
 
 /// Ctrl-Z (or SIGTSTP from anyone): have I stop every process in the
@@ -1148,41 +1178,45 @@ fn init_loop(
     down_r: &OwnedFd,
 ) -> Result<i32, String> {
     let mut frozen: Vec<Pid> = Vec::new();
-    let mut p_open = true;
     // When P was last heard, whether P asked for the freeze in force
     // (Ctrl-Z), and whether I froze the sandbox because P went silent.
     let mut heard = Instant::now();
     let mut asked = false;
     let mut silent = false;
     loop {
-        let mut fds = vec![PollFd::new(sigfd.as_fd(), PollFlags::POLLIN)];
-        if p_open {
-            fds.push(PollFd::new(down_r.as_fd(), PollFlags::POLLIN));
-        }
+        let mut fds = [
+            PollFd::new(sigfd.as_fd(), PollFlags::POLLIN),
+            PollFd::new(down_r.as_fd(), PollFlags::POLLIN),
+        ];
         // Wake when P has been silent too long; while frozen for that,
         // every interval, to stop whatever a pass of the freeze missed.
         // Not after Ctrl-Z: P asked for that freeze before it stopped.
-        let watching = p_open && !asked;
-        let timeout = if watching {
+        let timeout = if asked {
+            PollTimeout::NONE
+        } else {
             let left = if silent {
                 BEAT_INTERVAL
             } else {
                 (heard + SILENCE_LIMIT).saturating_duration_since(Instant::now())
             };
             PollTimeout::from(u16::try_from(left.as_millis() + 1).unwrap_or(u16::MAX))
-        } else {
-            PollTimeout::NONE
         };
         match poll(&mut fds, timeout) {
             Ok(_) | Err(Errno::EINTR) => {}
             Err(e) => return Err(format!("poll failed: {e}")),
         }
-        let from_p = p_open && fds[1].revents().is_some_and(|r| !r.is_empty());
-        drop(fds);
+        let from_p = fds[1].revents().is_some_and(|r| !r.is_empty());
         if from_p {
             let mut b = [0u8; 16];
             match read(down_r, &mut b) {
-                Ok(0) | Err(Errno::EBADF) => p_open = false,
+                // P holds the other end until the sandbox is gone, so
+                // this is P's death. PR_SET_PDEATHSIG is on its way down
+                // the chain; do not depend on it (it is lost if a parent
+                // dies before its child has asked for it). Init's exit
+                // kills everything in the sandbox.
+                Ok(0) | Err(Errno::EBADF) => {
+                    return Err("playpen itself is gone; the sandbox was stopped".into());
+                }
                 Ok(n) => {
                     // Any byte shows that P runs. The sandbox I froze for
                     // P's silence continues, unless P itself asked for a
@@ -1215,7 +1249,7 @@ fn init_loop(
                 Err(_) => {}
             }
         }
-        if p_open && !asked && heard.elapsed() >= SILENCE_LIMIT {
+        if !asked && heard.elapsed() >= SILENCE_LIMIT {
             if !silent {
                 silent = true;
                 eprintln!(
@@ -1764,6 +1798,24 @@ mod tests {
         assert!(m.contains("userns,"), "{m}");
         assert!(m.contains("apparmor_restrict_unprivileged_userns"), "{m}");
         assert!(m.contains("docs/DESIGN.md"), "{m}");
+    }
+
+    #[test]
+    fn the_approval_is_over_when_either_clock_says_so() {
+        let start = Instant::now();
+        let wall = time::macros::datetime!(2026-11-18 22:00:00 UTC);
+        let d = Deadline {
+            monotonic: start + Duration::from_secs(3600),
+            wall,
+        };
+        let sec = time::Duration::SECOND;
+        assert!(!d.passed(start, wall - sec));
+        assert!(d.passed(start + Duration::from_secs(3600), wall - sec));
+        // The machine slept: the monotonic clock stood still, the end
+        // came all the same.
+        assert!(d.passed(start, wall));
+        // The system clock was set back: the run is not extended.
+        assert!(d.passed(start + Duration::from_secs(3601), wall - 7200 * sec));
     }
 
     #[test]

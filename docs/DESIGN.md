@@ -406,7 +406,11 @@ matter for safety:
 6. **Death of playpen kills the sandbox.** Each stage sets
    `PR_SET_PDEATHSIG(SIGKILL)` and checks its parent is still the expected
    one. If playpen is killed with SIGKILL, the chain collapses, and pasta
-   exits when the namespace's process is gone.
+   exits when the namespace's process is gone. The sandbox's init does not
+   rely on the chain alone: the end of its pipe from playpen means playpen
+   is gone, and it exits, which kills everything in the PID namespace
+   (`killing_playpen_kills_the_sandbox`). What a killed playpen leaves
+   behind is the small directory of pasta's PID file.
 
 ## Leaks considered
 
@@ -472,9 +476,14 @@ matter for safety:
 - **Kernel or tool bugs.** A kernel exploit, or a bug in nftables
   (ruleset evaluation) or in pasta (which runs on the host), defeats the
   guard.
-- **Time is wall-clock at start.** `--until` is converted to a monotonic
-  deadline when the command starts; changing the system clock later does
-  not move it.
+- **A system clock set forward ends the run early.** The end time is
+  held on two clocks: a monotonic deadline fixed when the command starts,
+  and the wall clock, read every second. The run ends when either says so.
+  Setting the system clock back therefore does not extend the run; and a
+  machine that was suspended (the monotonic clock stands still meanwhile)
+  stops the command when it wakes after the end, instead of giving it the
+  time slept on top. A clock set forward past the end stops the command at
+  once.
 - **Report file tampering.** The command runs as the same user and could
   write to the `--report` path while it runs. playpen writes the report
   through the file it opened before starting, after the command and every

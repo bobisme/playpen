@@ -605,6 +605,55 @@ fn sigstop_of_playpen_itself_freezes_the_command() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// If playpen itself is killed outright, the sandbox goes with it: the
+/// command does not run on with nobody watching the end time or the pass.
+#[test]
+fn killing_playpen_kills_the_sandbox() {
+    require_sandbox!();
+    let dir = tmpdir("killed");
+    for extra in [&["--no-network"][..], &["--allow", "192.0.2.1:9/tcp"]] {
+        let ticks = dir.join(format!("ticks-{}", extra.len()));
+        let _ = std::fs::remove_file(&ticks);
+        // In its own session, so nothing but playpen's death can stop it.
+        let script = format!(
+            "setsid sh -c 'while :; do echo t >> {0}; sleep 0.1; done' & while :; do echo t >> {0}; sleep 0.1; done",
+            ticks.display()
+        );
+        let mut args = vec!["run"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", "sh", "-c", &script]);
+        let mut child = playpen(&args)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("{e}"));
+        let count = || std::fs::read_to_string(&ticks).map_or(0, |t| t.lines().count());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while count() < 4 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(count() >= 4, "{extra:?}: the command did not start");
+        child.kill().unwrap_or_else(|e| panic!("{e}"));
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_millis(500));
+        let after = count();
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(count(), after, "{extra:?}: the command outlived playpen");
+        // A killed playpen cannot remove the directory of pasta's PID file.
+        let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let mine = format!("playpen-{}-", child.id());
+        for e in std::fs::read_dir(&base).into_iter().flatten().flatten() {
+            if e.file_name().to_string_lossy().starts_with(&mine) {
+                let _ = std::fs::remove_file(e.path().join("pasta.pid"));
+                let _ = std::fs::remove_dir(e.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn fake_tool(name: &str, script: &str) -> PathBuf {
     let dir = tmpdir(name);
     let path = dir.join("tool");

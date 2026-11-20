@@ -289,8 +289,10 @@ rule, so the running command is not stopped.
 or earlier replaces `valid_until` as the end time. While
 the command runs, when the time comes playpen prints why, sends SIGTERM to
 the command, and after a grace of 3 seconds kills the whole PID namespace
-with SIGKILL. The deadline is fixed against the monotonic clock when the
-sandbox starts.
+with SIGKILL. The time has come when a monotonic deadline fixed at the
+start of the sandbox has passed, or the system clock shows the end time,
+whichever is first: setting the clock back does not extend the run, and
+time the machine spent suspended counts.
 
 **Host Unix sockets.** By default the command cannot connect to, or send
 by address to, any pathname Unix socket created outside the sandbox
@@ -593,7 +595,8 @@ gone), removes pasta's PID file and its private directory, prints the
 summary, writes the report, and exits.
 
 If playpen itself is killed, each stage dies with its parent
-(`PR_SET_PDEATHSIG`), so the sandbox goes with it.
+(`PR_SET_PDEATHSIG`), and I exits when its pipe from P closes, so the
+sandbox goes with it. Only the directory of pasta's PID file is left.
 
 ## 6. What is allowed and dropped
 

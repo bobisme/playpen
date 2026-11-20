@@ -99,6 +99,13 @@ impl Pasta {
     /// Stops pasta if it is still running and removes its files. pasta
     /// also exits on its own once the namespace is gone.
     pub fn stop(self) {
+        drop(self);
+    }
+}
+
+/// On every way out of the run, an early error included.
+impl Drop for Pasta {
+    fn drop(&mut self) {
         if let Some(pid) = self.pid {
             let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
             if comm.starts_with("pasta") || comm.starts_with("passt") {
