@@ -365,10 +365,14 @@ a deleted or moved directory needs more cases; polling a small file every
 that cannot be read stops the run). A file caught half-written also stops
 the run; editors that write a new file and rename it never show one.
 
-The interval is the delay between the owner's revocation reaching the file
-and SIGTERM. 2 seconds keeps that well below a human reaction time without
-measurable load. It is the constant `pass::RECHECK_INTERVAL`; the hidden
-`--pass-recheck-ms` may only shorten it (tests use 200 ms).
+The supervisor schedules pass checks at `pass::RECHECK_INTERVAL` (2 seconds).
+A scheduled check must run and read the file before it can send SIGTERM.
+The original monotonic deadline is captured before namespace setup and is
+checked alongside the wall deadline, including immediately before release.
+The first stop decision starts one monotonic grace period. Once it expires,
+the supervisor requests SIGKILL if needed. A delayed supervisor or init and
+kernel signal delivery affect when the command actually stops. The hidden
+`--pass-recheck-ms` may shorten the poll interval in tests.
 
 ## The mechanism, step by step
 

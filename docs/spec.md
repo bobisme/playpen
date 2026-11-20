@@ -416,6 +416,28 @@ holds its status), `"refused"` or `"not_started"` when nothing ran,
 `"error"` when playpen failed after starting it. Messages for the
 not-run cases always contain `nothing was run`.
 
+### Supervisor lifecycle events
+
+`run --events-fd N` accepts an inherited pipe writer above stderr. Close the
+caller's copy after spawning. Read newline-delimited JSON until EOF. For
+example, with Bash process substitution:
+
+```bash
+playpen run --events-fd 3 --no-network -- printf hello 3> >(jq -c '{seq,event,details}' >&2)
+```
+
+Version 1 records have `version`, a sequence number starting at 1, `event`
+and `details`. Ignore unfamiliar fields. Buffer partial lines until a newline.
+A validated request emits `validated`; `starting` is immediately before the
+supervisor releases the workload. `stopping` carries `reason` of `expiry` or
+`pass_withdrawn`. `terminal` carries the outcome, startup evidence, child
+exit/signal, wrapper exit and drop assertion. A policy refusal can emit just
+the terminal record. Pre-parse errors and an invalid descriptor have no stream.
+The supervisor sets the supplied pipe writer nonblocking and closes it on a
+write failure, including a full pipe. A missing terminal record, a sequence
+gap or a partial final line means the stream is incomplete. An event reader
+can disappear without delaying supervision.
+
 ### Previewing a run
 
 `playpen plan --no-network -- printf hello` describes the command and its
@@ -780,8 +802,8 @@ Not guarded against, or known limits:
   after 5 seconds of silence (section 4.1); in that time the end time and
   the pass re-read are not enforced;
 - the command can open the caller's other terminals (`/dev/pts/N`);
-- with `--pass`: a revocation or edit takes effect at the next re-read (up
-  to 2 seconds) plus the grace; traffic in that time is still allowed. Who
+- with `--pass`: a revocation or edit takes effect when a scheduled re-read observes it
+  (normally every 2 seconds), followed by the grace; traffic in that time is still allowed. Who
   can write the pass file can also restore it between two re-reads.
   Ceilings are not enforced by playpen.
 

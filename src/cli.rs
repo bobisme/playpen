@@ -1,6 +1,8 @@
 //! Command-line interface.
 
+mod event_pipe;
 mod preview;
+use event_pipe::EventPipe;
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -181,6 +183,9 @@ struct RunArgs {
     /// cannot open /dev/tty.
     #[arg(long)]
     new_session: bool,
+    /// Write lifecycle JSON lines to an inherited pipe above stderr.
+    #[arg(long, value_name = "FD")]
+    events_fd: Option<i32>,
     /// Require the effective scope to match the digest from playpen plan.
     #[arg(long, value_name = "SHA256")]
     expect_plan: Option<hallpass::Digest>,
@@ -579,12 +584,16 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
 }
 
 struct StderrEvents<'a> {
+    pipe: &'a EventPipe,
     args: &'a RunArgs,
     start_line: String,
     until: Option<String>,
 }
 
 impl Events for StderrEvents<'_> {
+    fn in_setup_child(&mut self) {
+        self.pipe.close();
+    }
     fn before_start(&mut self) -> Result<(), String> {
         if self.args.expect_plan.is_some() {
             let current = check(self.args)?;
@@ -594,9 +603,12 @@ impl Events for StderrEvents<'_> {
     }
 
     fn starting(&mut self) {
+        self.pipe.send("starting", &serde_json::Value::Null);
         eprintln!("{}", self.start_line);
     }
     fn until_reached(&mut self) {
+        self.pipe
+            .send("stopping", &serde_json::json!({"reason":"expiry"}));
         eprintln!(
             "playpen: the approval ended at {}; sending SIGTERM to the command (SIGKILL in {} s)",
             self.until.as_deref().unwrap_or("?"),
@@ -607,6 +619,8 @@ impl Events for StderrEvents<'_> {
         eprintln!("playpen: {message}");
     }
     fn pass_withdrawn(&mut self, reason: &str) {
+        self.pipe
+            .send("stopping", &serde_json::json!({"reason":"pass_withdrawn"}));
         eprintln!(
             "playpen: {reason}; sending SIGTERM to the command (SIGKILL in {} s)",
             sandbox::GRACE.as_secs()
@@ -774,13 +788,21 @@ fn write_report(file: Option<&mut File>, report: &Report, shareable: bool) {
     reason = "a linear sequence of steps, each mapping to a report field"
 )]
 fn run(args: &RunArgs) -> i32 {
+    let pipe = match EventPipe::open(args.events_fd) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("playpen: refused: {e}");
+            return EXIT_REFUSED;
+        }
+    };
+    let mut report = base_report(args);
     if args.format == Format::Json && args.report.is_none() {
         eprintln!(
             "playpen: refused: --format json writes the summary to a file; give it with --report FILE"
         );
+        pipe.terminal(&report);
         return EXIT_REFUSED;
     }
-    let mut report = base_report(args);
     if args.fail_on_drop {
         report.drop_assertion = Some(crate::report::DropAssertion::Unknown);
     }
@@ -792,6 +814,7 @@ fn run(args: &RunArgs) -> i32 {
                     "playpen: refused: cannot create the report file {}: {e}; nothing was run",
                     p.display()
                 );
+                pipe.terminal(&report);
                 return EXIT_REFUSED;
             }
         },
@@ -809,9 +832,11 @@ fn run(args: &RunArgs) -> i32 {
             }
             report.message = Some(e);
             write_report(report_file.as_mut(), &report, args.shareable_report);
+            pipe.terminal(&report);
             return EXIT_REFUSED;
         }
     };
+    pipe.send("validated", &serde_json::Value::Null);
     report.allowed = checked
         .approval
         .rules()
@@ -830,6 +855,7 @@ fn run(args: &RunArgs) -> i32 {
         }
         report.message = Some(msg);
         report.playpen_exit_status = EXIT_ERROR;
+        pipe.terminal(report);
         write_report(file, report, args.shareable_report);
         EXIT_ERROR
     };
@@ -860,6 +886,7 @@ fn run(args: &RunArgs) -> i32 {
         .collect();
     report.new_session = checked.new_session;
     let mut events = StderrEvents {
+        pipe: &pipe,
         args,
         start_line: start_line(
             &checked,
@@ -932,6 +959,7 @@ fn run(args: &RunArgs) -> i32 {
     }
     let code = apply_drop_assertion(&mut report, code, args.fail_on_drop);
     report.playpen_exit_status = code;
+    pipe.terminal(&report);
     eprint!("{}", text_summary(&report));
     write_report(report_file.as_mut(), &report, args.shareable_report);
     code

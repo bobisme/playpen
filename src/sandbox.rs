@@ -160,6 +160,8 @@ impl std::fmt::Display for RunError {
 
 /// Things P reports while the command runs.
 pub trait Events {
+    /// Close any supervisor-only event writer in the freshly forked setup child.
+    fn in_setup_child(&mut self) {}
     /// Validate any caller-supplied scope pin immediately before releasing the child.
     ///
     /// # Errors
@@ -483,6 +485,7 @@ fn run_sandbox(plan: &Plan, events: &mut dyn Events) -> Result<RunResult, RunErr
 
     match fork_checked().map_err(not_started)? {
         ForkResult::Child => {
+            events.in_setup_child();
             drop(up_r);
             drop(down_w);
             drop(sigfd);
@@ -701,6 +704,13 @@ fn parent(
     down_w: OwnedFd,
     events: &mut dyn Events,
 ) -> Result<RunResult, RunError> {
+    let deadline = plan.approval.ends_at.map(|end| {
+        let left = end.at() - time::OffsetDateTime::now_utc();
+        Deadline {
+            monotonic: Instant::now() + left.try_into().unwrap_or(Duration::ZERO),
+            wall: end.at(),
+        }
+    });
     let mut st = ParentState::default();
     // Phase 1: C builds the namespaces and loads the ruleset.
     let setup_deadline = Instant::now() + Duration::from_secs(30);
@@ -732,13 +742,6 @@ fn parent(
             }
         }
     }
-    let deadline = plan.approval.ends_at.map(|end| {
-        let left = end.at() - time::OffsetDateTime::now_utc();
-        Deadline {
-            monotonic: Instant::now() + left.try_into().unwrap_or(Duration::ZERO),
-            wall: end.at(),
-        }
-    });
     let mut watch = plan.watch.clone();
     let mut withdrawn = None;
     if let Some(d) = deadline
@@ -754,7 +757,13 @@ fn parent(
             }
         }
     }
-    let withdrawn = withdrawn.or_else(|| events.before_start().err());
+    let withdrawn = withdrawn
+        .or_else(|| events.before_start().err())
+        .or_else(|| {
+            deadline
+                .filter(|d| d.passed(Instant::now(), time::OffsetDateTime::now_utc()))
+                .map(|_| "the approval ended during the final launch check".to_owned())
+        });
     if let Some(why) = withdrawn {
         drop(down_w);
         let _ = waitpid(child, None);
@@ -767,8 +776,7 @@ fn parent(
     send_byte(&down_w, GO);
 
     // Phase 3: the command runs.
-    let mut term_sent_at: Option<Instant> = None;
-    let mut killed = false;
+    let mut shutdown = Shutdown::default();
     let mut stopped_by_pass: Option<String> = None;
     let mut next_recheck = watch.as_ref().map(|w| Instant::now() + w.interval);
     let mut next_beat = Instant::now();
@@ -781,7 +789,7 @@ fn parent(
         }
         let mut wake = next_beat;
         if let (Some(w), Some(due)) = (watch.as_mut(), next_recheck)
-            && term_sent_at.is_none()
+            && shutdown.started.is_none()
         {
             if now >= due {
                 match w.recheck(time::OffsetDateTime::now_utc()) {
@@ -790,7 +798,7 @@ fn parent(
                     Recheck::Stop(why) => {
                         events.pass_withdrawn(&why);
                         stopped_by_pass = Some(why);
-                        term_sent_at = Some(now);
+                        shutdown.request(now);
                         stop_command(st.init, child, &down_w);
                     }
                 }
@@ -801,25 +809,20 @@ fn parent(
             }
         }
         if let Some(d) = deadline
-            && term_sent_at.is_none()
+            && shutdown.started.is_none()
         {
             if d.passed(now, time::OffsetDateTime::now_utc()) {
                 events.until_reached();
-                term_sent_at = Some(now);
+                shutdown.request(now);
                 stop_command(st.init, child, &down_w);
             } else {
                 wake = wake.min(d.monotonic);
             }
         }
-        if let Some(t) = term_sent_at
-            && !killed
-        {
-            if now >= t + GRACE {
-                killed = true;
-                let _ = kill(st.init.unwrap_or(child), Signal::SIGKILL);
-            } else {
-                wake = wake.min(t + GRACE);
-            }
+        if shutdown.take_kill(now) {
+            let _ = kill(st.init.unwrap_or(child), Signal::SIGKILL);
+        } else if let Some(due) = shutdown.kill_at() {
+            wake = wake.min(due);
         }
         let ms = u16::try_from(
             wake.saturating_duration_since(Instant::now())
@@ -870,7 +873,7 @@ fn parent(
     st.launch_result()?;
     let status = match st.status {
         Some(s) => s,
-        None if killed => CommandStatus::Signaled(Signal::SIGKILL as i32),
+        None if shutdown.killed => CommandStatus::Signaled(Signal::SIGKILL as i32),
         None => {
             return Err(RunError::Failed(
                 "the sandbox ended without reporting the command's exit status".into(),
@@ -879,12 +882,38 @@ fn parent(
     };
     Ok(RunResult {
         status,
-        stopped_by_until: term_sent_at.is_some() && stopped_by_pass.is_none(),
+        stopped_by_until: shutdown.started.is_some() && stopped_by_pass.is_none(),
         stopped_by_pass,
         drops: st
             .drops
             .unwrap_or_else(|| Err("the drop counters were not reported".into())),
     })
+}
+
+/// The first withdrawal starts grace. Repeated withdrawals leave it fixed.
+#[derive(Default)]
+struct Shutdown {
+    started: Option<Instant>,
+    killed: bool,
+}
+
+impl Shutdown {
+    fn request(&mut self, now: Instant) {
+        self.started.get_or_insert(now);
+    }
+
+    fn kill_at(&self) -> Option<Instant> {
+        self.started.filter(|_| !self.killed).map(|t| t + GRACE)
+    }
+
+    fn take_kill(&mut self, now: Instant) -> bool {
+        if self.kill_at().is_some_and(|deadline| now >= deadline) {
+            self.killed = true;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// When the approval ends, on two clocks.
@@ -1842,6 +1871,52 @@ mod tests {
         assert!(m.contains("userns,"), "{m}");
         assert!(m.contains("apparmor_restrict_unprivileged_userns"), "{m}");
         assert!(m.contains("docs/DESIGN.md"), "{m}");
+    }
+
+    #[test]
+    fn deadline_and_withdrawal_share_an_irreversible_grace_period() {
+        let base = Instant::now();
+        let epoch = time::macros::datetime!(2026-11-18 22:00:00 UTC);
+        let deadline = Deadline {
+            monotonic: base + Duration::from_secs(5),
+            wall: epoch + time::Duration::seconds(5),
+        };
+        // Three ordered supervisor polls. A wall reading may jump in either
+        // direction, a poll can be late, and withdrawal can arrive at any poll.
+        for first in 0..=5 {
+            for second in first..=8 {
+                for third in second..=11 {
+                    for choices in 0_u32..216 {
+                        let mut digits = choices;
+                        let mut shutdown = Shutdown::default();
+                        let mut first_stop = None;
+                        let mut kill_sent = false;
+                        for seconds in [first, second, third] {
+                            let choice = digits % 6;
+                            digits /= 6;
+                            let wall_seconds = [-2, 5, 9][(choice % 3) as usize];
+                            let withdrawn = choice >= 3;
+                            let now = base + Duration::from_secs(seconds);
+                            if deadline.passed(now, epoch + time::Duration::seconds(wall_seconds))
+                                || withdrawn
+                            {
+                                shutdown.request(now);
+                            }
+                            if seconds >= 5 || wall_seconds >= 5 || withdrawn {
+                                first_stop.get_or_insert(seconds);
+                            }
+                            assert_eq!(
+                                shutdown.started,
+                                first_stop.map(|s| base + Duration::from_secs(s))
+                            );
+                            let due = first_stop.is_some_and(|s| seconds >= s + GRACE.as_secs());
+                            assert_eq!(shutdown.take_kill(now), due && !kill_sent);
+                            kill_sent |= due;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

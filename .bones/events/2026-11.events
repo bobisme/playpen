@@ -208,3 +208,16 @@
 1795204851403444	lead	itc:AQ		item.move	bn-2bp	{"reason":"Six production-bound Kani harnesses, 23 covers, low-bit negative control; valid-domain scope and solver limits recorded.","state":"done"}	blake3:GzFD6kAb3iixJ9TSZdydLvlkW6WR1ae3O_RIXOAoqCI
 1795204851415461	lead	itc:AQ		item.move	bn-k0v	{"reason":"Full-pass IPv4 exclusions preserved across label narrowing and active rechecks. 6305 nonempty subset pairs checked on 255 passes; native IPv6 only.","state":"done"}	blake3:jkK7OG0WSA8l6wabcygo0Lzo_BeVS5aWxE69jCHqr1s
 1795204851614992	lead	itc:AQ		item.create	bn-1w6	{"description":"Sol verified native IPv6 tuples in bn-k0v. Inspect the pinned Hallpass transition-address predicate and ensure selected IPv6 prefixes either enforce its exclusions or are conservatively refused at conversion. Validate with an independent, in-memory address-class specification, valid native IPv6 witnesses, and source-bound arithmetic tests. Explain the supported subset in the spec.","kind":"task","labels":["correctness"],"size":"m","title":"Preserve Hallpass IPv6 transition exclusions in packet policy"}	blake3:x2IRpLUyp2ap6lpl0dGQ-zoVC3CoYRQP9uC9DkrKv2k
+1795204873705953	lead	itc:AQ		item.move	bn-yad	{"state":"doing"}	blake3:0n5DsZ6LGlA2ABHoX09UNO9G4wZdMUV2mx4rD4bbXDw
+1795204873711525	lead	itc:AQ		item.assign	bn-yad	{"action":"assign","agent":"lead"}	blake3:FwLt0f5M7WOH9lw9bnkgywkO0Bu6h7RFzlxGohS9QgA
+1795204873721378	terra	itc:AQ		item.move	bn-3q2	{"state":"doing"}	blake3:Kg9s4EOWDPIBBiApsPyo1W0_LEY0xxeLiQvmmXVjLxM
+1795204873727034	terra	itc:AQ		item.assign	bn-3q2	{"action":"assign","agent":"terra"}	blake3:S-mLYzzLpCRujjoyzvstRrhXMAm2T0rWukzf63x9Oj4
+1795204873737224	sol	itc:AQ		item.move	bn-1c6	{"state":"doing"}	blake3:M0dt3lFtUASe_A9exC7hgZ8YpOiwQxZt4mGtroqA5ak
+1795204873740018	sol	itc:AQ		item.assign	bn-1c6	{"action":"assign","agent":"sol"}	blake3:spEQdmxLGmf3zdPZ7iolT01Vfhfq12lu6qNAdB175jI
+1795204873750591	luna	itc:AQ		item.move	bn-8r5	{"state":"doing"}	blake3:lLurTAWXcYS-EuOhQVxA47V1hBGwNTQ1kS4wh1D_5ps
+1795204873756028	luna	itc:AQ		item.assign	bn-8r5	{"action":"assign","agent":"luna"}	blake3:EfUBPbWeR-fO-zPoem_919HSCeY0tQhlWGSw3dyVcnw
+1795205016106101	lead	itc:AQ		item.move	bn-yad	{"reason":"Native tests separated stdout, stderr and private pipe for child exit 2, refusal 2, full pipe and atomic pass revocation. Terminal records preserve child vs wrapper evidence.","state":"done"}	blake3:JzTiBcFEA6-5YDV52VQYfzsVrroZ8wGAIN4jDEZNyLE
+1795205016127830	lead	itc:AQ		item.move	bn-1th	{"state":"doing"}	blake3:1MZE_g-tnFhhsQartzeMDjxyr2kqPUVykQy6aTQvAYw
+1795205016134860	lead	itc:AQ		item.assign	bn-1th	{"action":"assign","agent":"lead"}	blake3:jgep6u2lkeZrarsPKKBDtD9nRCx69RsD8Yg4SKyI1_s
+1795205109313620	lead	itc:AQ		item.move	bn-1th	{"reason":"Three-poll exhaustive trace model covers monotonic delays, wall jumps, withdrawal and exact grace. Strict boundary mutant failed. Original deadline now starts before namespace setup.","state":"done"}	blake3:bwqoNbZHChKKJzDFVUNcGSZiImx73Y5AzWuiFv2_u8k
+1795205109340359	lead	itc:AQ		item.move	bn-1ms	{"reason":"Native tests observed pre-release atomic revocation suppressing payload, post-readiness withdrawal and signal 15, continued valid edit, expiry and forced kill; README, spec and design distinguish scheduling from observed exit.","state":"done"}	blake3:lnKDcEOhMqOvhISWV6LaYIC8s5pQOHFAO7vR5xuLwJ4

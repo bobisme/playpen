@@ -82,7 +82,7 @@ host names are never resolved for you; map them with `--host`.
 ### How a pass-backed run ends
 
 If the owner sets `revoked = true`, playpen normally detects it at the
-next pass check, within 2 seconds. It sends the command `SIGTERM` and
+next pass check. The supervisor schedules checks 2 seconds apart. It sends the command `SIGTERM` and
 gives it 3 seconds to exit before killing the remaining sandbox. The same
 shutdown applies when the deadline passes, the file disappears or becomes
 invalid, or a destination in use changes. The original firewall stays in
@@ -93,7 +93,10 @@ If the supervisor is stopped directly or gets stuck, it cannot check the
 pass or enforce the deadline. After 5 seconds without a heartbeat, a
 watchdog inside the sandbox starts freezing its processes. When the
 supervisor resumes, it checks the deadline and re-reads the pass if due.
-Time spent in system suspend counts toward the deadline.
+Time spent in system suspend counts toward the deadline. Poll intervals,
+grace periods and watchdog actions depend on Linux scheduling the supervisor
+and the sandbox init. A signal request and the final process exit can occur
+at different times.
 
 ### Run with a command-line allow list
 

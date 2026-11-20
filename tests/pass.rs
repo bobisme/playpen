@@ -813,3 +813,113 @@ fn pin_refuses_an_edit_even_when_grants_are_identical() {
     assert_eq!(out.status.code(), Some(2));
     assert!(text(&out.stderr).contains("differs from current scope"));
 }
+
+#[test]
+fn live_events_record_atomic_revocation_after_the_command_is_ready() {
+    use std::io::{BufRead as _, BufReader};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+    require_sandbox!();
+    let dir = tmpdir("events-revoked");
+    let contents = valid_pass(&[WEB]);
+    let path = new_pass(&dir, &contents);
+    let (r, w) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("pipe");
+    let mut cmd = Command::new(BIN);
+    cmd.args(["run", "--events-fd", "42", "--pass"])
+        .arg(&path)
+        .args([
+            "--pass-recheck-ms",
+            RECHECK_MS,
+            "--",
+            "sh",
+            "-c",
+            "printf 'ready\\n'; exec sleep 20",
+        ]);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let raw = w.as_raw_fd();
+    // SAFETY: descriptor w is open through spawn and dup2/fcntl are async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(raw, 42) < 0 || libc::fcntl(42, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("spawn");
+    drop(w);
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().expect("stdout"))
+        .read_line(&mut ready)
+        .expect("readiness");
+    assert_eq!(ready, "ready\n");
+    write_pass(
+        &path,
+        &contents.replace("revoked = false", "revoked = true"),
+    );
+    let out = child.wait_with_output().expect("exit");
+    assert_eq!(out.status.code(), Some(143), "{}", text(&out.stderr));
+    let records = BufReader::new(std::fs::File::from(r))
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(&l.expect("record")).expect("event"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| r["event"].as_str())
+            .collect::<Vec<_>>(),
+        [
+            Some("validated"),
+            Some("starting"),
+            Some("stopping"),
+            Some("terminal")
+        ]
+    );
+    assert_eq!(records[2]["details"]["reason"], "pass_withdrawn");
+    assert_eq!(records[3]["details"]["signal"], 15);
+}
+
+#[test]
+fn atomic_revocation_during_setup_prevents_release() {
+    use std::os::unix::fs::PermissionsExt as _;
+    require_sandbox!();
+    let dir = tmpdir("setup-revocation");
+    let contents = valid_pass(&[WEB]);
+    let pass = new_pass(&dir, &contents);
+    let wrapper = dir.join("nft");
+    let checkpoint = dir.join("readback");
+    let release = dir.join("resume");
+    let marker = dir.join("payload");
+    // Relay the real nft result untouched. Pause once, at the initial readback.
+    std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$1\" = --json ]; then\n : > \"$CHECKPOINT\"\n i=0; while [ ! -f \"$RESUME\" ] && [ \"$i\" -lt 500 ]; do sleep 0.01; i=$((i+1)); done\nfi\nexec nft \"$@\"\n").expect("wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("mode");
+    let child = Command::new(BIN)
+        .env("PLAYPEN_NFT", &wrapper)
+        .env("CHECKPOINT", &checkpoint)
+        .env("RESUME", &release)
+        .args(["run", "--pass"])
+        .arg(&pass)
+        .args(["--", "touch"])
+        .arg(&marker)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let end = Instant::now() + Duration::from_secs(5);
+    while !checkpoint.exists() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    write_pass(
+        &pass,
+        &contents.replace("revoked = false", "revoked = true"),
+    );
+    std::fs::write(release, []).expect("resume");
+    let out = child.wait_with_output().expect("supervisor");
+    assert!(checkpoint.exists(), "{}", text(&out.stderr));
+    assert!(!marker.exists());
+    assert!(
+        text(&out.stderr).contains("revoked"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(1));
+}
