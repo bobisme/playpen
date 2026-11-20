@@ -104,8 +104,10 @@ written as JSON to `--report FILE` (section 4.5).
 ## 3. Requirements
 
 - Linux with user namespaces: `user.max_user_namespaces` greater than 0,
-  and, where those settings exist, `kernel.unprivileged_userns_clone = 1`
-  and `kernel.apparmor_restrict_unprivileged_userns = 0`.
+  and, where that setting exists, `kernel.unprivileged_userns_clone = 1`.
+  With `kernel.apparmor_restrict_unprivileged_userns = 1`, the installed
+  Playpen binary needs an AppArmor profile granting `userns,` (see the
+  AppArmor section of DESIGN.md).
 - Kernel support for network, PID, mount and IPC namespaces, nftables
   with the `inet` family, dynamic sets with counters, and `reject`.
 - Landlock ABI 9 or later (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`), with

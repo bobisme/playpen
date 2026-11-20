@@ -257,10 +257,10 @@ terminal on stdin works.
 Some distributions (Ubuntu 24.04 and later, for example) set
 `kernel.apparmor_restrict_unprivileged_userns = 1`. There an unprivileged
 program can still create a user namespace, but it holds no capabilities in
-it unless an AppArmor profile allows it, so playpen's first privileged
-step (writing the uid map, a mount, bringing up `lo`) fails with "Operation
-not permitted". `doctor` reports the setting. When `run` fails before the
-command starts and the setting is 1, the message says so and what to do.
+it unless an AppArmor profile allows it. A privileged setup step can then
+fail with a permission error. `doctor` reports the global setting, including
+when a matching profile is loaded. When `run` fails during setup and the
+setting is 1, the error includes the AppArmor profile remedy.
 An administrator can allow playpen with a profile like this, saved as
 `/etc/apparmor.d/playpen` and loaded with `apparmor_parser -r
 /etc/apparmor.d/playpen` (adjust the path to the installed binary):
@@ -275,10 +275,35 @@ profile playpen /usr/local/bin/playpen flags=(unconfined) {
 }
 ```
 
-This is the pattern Ubuntu uses for other programs that need user
-namespaces. The alternative is setting the sysctl to 0, which lifts the
-restriction for every program. Neither was tested: the development machine
-has no AppArmor.
+The per-binary profile lets the administrator keep the global restriction.
+Qualify an installation with an ordinary account running
+`/usr/local/bin/playpen run --no-network -- /usr/bin/true` on a system with
+Landlock ABI 9 or later.
+
+On 2026-11-20, a networkless QEMU guest ran Ubuntu 24.04.5 LTS with kernel
+6.8.0-147-generic, AppArmor `4.0.1really4.0.1-0ubuntu0.24.04.9` and nftables
+`1.0.9-1ubuntu0.1`. The cloud disk, kernel and initramfs matched manifests
+signed by Canonical's cloud image key. [Canonical Noble cloud image,
+2026-10-17](https://cloud-images.ubuntu.com/noble/20261017/).
+
+In that guest `kernel.apparmor_restrict_unprivileged_userns` and
+`kernel.unprivileged_userns_clone` were both 1. The unprofiled launch
+returned 1 before exec after AppArmor denied access to
+`/proc/self/setgroups` with `EACCES`. The kernel audit identified a
+capability denial under `unprivileged_userns`, and Playpen printed the
+profile remedy. After loading the profile above, AppArmor listed
+`playpen (unconfined)`, and
+`run --no-network --without-landlock -- /usr/bin/true` returned 0 with
+`exec_and_exit` evidence. Both the original verifier (source `63b7925`)
+and the semantic nft verifier (source `2c8f342`) passed the profiled
+offline launch. The global AppArmor restriction stayed enabled.
+
+This guest has Landlock ABI 4 and no pasta, so the run used mount-only
+socket hiding and loopback. `doctor --format json` returned 1 before and
+after profile installation, reported the global AppArmor restriction and
+the other missing requirements, and skipped its namespace self-test.
+The successful offline launch is the evidence for the profile in this
+configuration.
 
 ## Passes (`--pass`)
 
