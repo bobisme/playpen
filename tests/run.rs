@@ -1216,3 +1216,131 @@ fn startup_evidence_guides_retry_after_refusal_and_child_exit() {
         assert_eq!(r["startup_evidence"], evidence);
     }
 }
+
+#[test]
+fn fail_on_drop_changes_wrapper_status_only_when_requested() {
+    require_sandbox!();
+    let dir = tmpdir("fail-on-drop");
+    for enabled in [false, true] {
+        let report = dir.join(if enabled {
+            "assert.json"
+        } else {
+            "default.json"
+        });
+        let mut args = vec![
+            "run",
+            "--allow",
+            "192.0.2.1:9101/tcp",
+            "--report",
+            report.to_str().unwrap_or(""),
+        ];
+        if enabled {
+            args.push("--fail-on-drop");
+        }
+        args.extend_from_slice(LO);
+        args.extend_from_slice(&[
+            "--",
+            BIN,
+            "probe",
+            "reach",
+            "--serve",
+            "192.0.2.1:9101/tcp",
+            "--serve",
+            "192.0.2.1:9102/tcp",
+            "--try",
+            "192.0.2.1:9101/tcp",
+            "--try",
+            "192.0.2.1:9102/tcp",
+        ]);
+        let out = run(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(i32::from(enabled)),
+            "{}",
+            text(&out.stderr)
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(report).unwrap_or_default())
+                .unwrap_or_default();
+        assert_eq!(json["exit_code"], 0);
+        assert_eq!(json["playpen_exit_status"], i32::from(enabled));
+        assert!(
+            json["dropped"]["destinations"]
+                .as_array()
+                .is_some_and(|d| d.iter().any(|x| x["address"] == "192.0.2.1"
+                    && x["port"] == 9102
+                    && x["protocol"] == "tcp"))
+        );
+        if enabled {
+            assert_eq!(json["drop_assertion"], "violated");
+        } else {
+            assert!(json.get("drop_assertion").is_none());
+        }
+    }
+}
+
+#[test]
+fn shareable_report_omits_private_refusal_inputs() {
+    let dir = tmpdir("shareable-refusal");
+    let report = dir.join("summary.json");
+    let out = run(&[
+        "run",
+        "--allow",
+        "private-invalid",
+        "--host",
+        "private-host=192.0.2.1",
+        "--expose",
+        "/private-path",
+        "--report",
+        report.to_str().unwrap_or(""),
+        "--shareable-report",
+        "--",
+        "private-command",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    let artifact = std::fs::read_to_string(report).unwrap_or_default();
+    assert!(!artifact.contains("private-"), "{artifact}");
+    let json: serde_json::Value = serde_json::from_str(&artifact).unwrap_or_default();
+    assert_eq!(json["outcome"], "refused");
+    assert!(json["dropped_packets"].is_null());
+}
+
+#[test]
+fn compare_reports_uses_endpoints_and_requires_complete_evidence() {
+    let dir = tmpdir("compare");
+    let old = dir.join("old.json");
+    let new = dir.join("new.json");
+    let base = serde_json::json!({"playpen_version":"0.1.0", "outcome":"ran", "allowed":["192.0.2.1:80/tcp"], "network":"pasta", "hosts":[], "exposed":[], "socket_guard":"landlock", "display":false, "dropped":{"packets":1,"destinations_truncated":false,"destinations":[{"address":"192.0.2.2","protocol":"tcp","port":80,"packets":1}]}});
+    let save = |path: &Path, v: &serde_json::Value| {
+        std::fs::write(path, v.to_string()).unwrap_or_else(|e| panic!("{e}"));
+    };
+    save(&old, &base);
+    let mut changed = base;
+    changed["dropped"]["packets"] = 2.into();
+    changed["dropped"]["destinations"][0]["packets"] = 2.into();
+    save(&new, &changed);
+    let args = [
+        "compare",
+        old.to_str().unwrap_or(""),
+        new.to_str().unwrap_or(""),
+        "--format",
+        "json",
+    ];
+    assert_eq!(run(&args).status.code(), Some(0));
+    changed["dropped"]["destinations"][0]["address"] = "192.0.2.3".into();
+    save(&new, &changed);
+    let out = run(&args);
+    assert_eq!(out.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    assert_eq!(result["new_denials"][0]["address"], "192.0.2.3");
+    changed["allowed"] = serde_json::json!(["192.0.2.4:80/tcp"]);
+    changed["dropped"]["destinations_truncated"] = true.into();
+    save(&new, &changed);
+    let out = run(&args);
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    assert_eq!(result["policy"], "changed");
+    assert_eq!(result["evidence"], "incomplete");
+    assert_eq!(result["no_longer_observed"], serde_json::json!([]));
+    save(&old, &serde_json::json!({"schema":"playpen-shareable-v1"}));
+    assert_eq!(run(&args).status.code(), Some(2));
+}

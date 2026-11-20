@@ -43,6 +43,13 @@ enum Format {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
+    /// Compare two full reports without executing either command.
+    Compare {
+        before: PathBuf,
+        after: PathBuf,
+        #[arg(long, value_enum, default_value = "text")]
+        format: Format,
+    },
     /// Run COMMAND with egress limited to a pass's destinations or the --allow ones.
     Run(RunArgs),
     /// Preview the validated run without starting helpers or writing a report.
@@ -177,9 +184,15 @@ struct RunArgs {
     /// Require the effective scope to match the digest from playpen plan.
     #[arg(long, value_name = "SHA256")]
     expect_plan: Option<hallpass::Digest>,
-    /// Summary format; run JSON requires --report.
+    /// Fail if any dropped packets were counted, or counters are unavailable.
+    #[arg(long)]
+    fail_on_drop: bool,
+    /// Summary format; json requires --report.
     #[arg(long, value_enum, default_value = "text")]
     format: Format,
+    /// Write only the shareable allowlisted fields to the report.
+    #[arg(long, requires = "report")]
+    shareable_report: bool,
     /// Write the JSON summary to FILE (for every outcome, refusals included).
     #[arg(long, value_name = "FILE")]
     report: Option<PathBuf>,
@@ -209,6 +222,11 @@ pub fn main() -> i32 {
     match cli.command {
         Cmd::Run(args) => run(&args),
         Cmd::Plan(args) => preview::print(&args),
+        Cmd::Compare {
+            before,
+            after,
+            format,
+        } => crate::compare::run(&before, &after, format == Format::Json),
         Cmd::Rules {
             allow,
             pass,
@@ -712,6 +730,7 @@ fn base_report(args: &RunArgs) -> Report {
         }),
         playpen_exit_status: EXIT_REFUSED,
         dropped: None,
+        drop_assertion: None,
         dropped_error: None,
         socket_guard: if args.without_landlock {
             "mounts_only"
@@ -733,9 +752,14 @@ fn new_session(args: &RunArgs) -> bool {
     args.new_session || sandbox::tiocsti_allowed()
 }
 
-fn write_report(file: Option<&mut File>, report: &Report) {
+fn write_report(file: Option<&mut File>, report: &Report, shareable: bool) {
     if let Some(f) = file {
-        let text = serde_json::to_string_pretty(report).unwrap_or_default();
+        let text = if shareable {
+            serde_json::to_string_pretty(&crate::report::ShareableReport::from(report))
+        } else {
+            serde_json::to_string_pretty(report)
+        }
+        .unwrap_or_default();
         if let Err(e) = f
             .write_all(text.as_bytes())
             .and_then(|()| f.write_all(b"\n"))
@@ -757,6 +781,9 @@ fn run(args: &RunArgs) -> i32 {
         return EXIT_REFUSED;
     }
     let mut report = base_report(args);
+    if args.fail_on_drop {
+        report.drop_assertion = Some(crate::report::DropAssertion::Unknown);
+    }
     let mut report_file = match &args.report {
         Some(p) => match File::create(p) {
             Ok(f) => Some(f),
@@ -781,7 +808,7 @@ fn run(args: &RunArgs) -> i32 {
                 eprintln!("playpen: nothing was run");
             }
             report.message = Some(e);
-            write_report(report_file.as_mut(), &report);
+            write_report(report_file.as_mut(), &report, args.shareable_report);
             return EXIT_REFUSED;
         }
     };
@@ -803,7 +830,7 @@ fn run(args: &RunArgs) -> i32 {
         }
         report.message = Some(msg);
         report.playpen_exit_status = EXIT_ERROR;
-        write_report(file, report);
+        write_report(file, report, args.shareable_report);
         EXIT_ERROR
     };
     let Some(nft) = crate::tools::nft() else {
@@ -899,12 +926,34 @@ fn run(args: &RunArgs) -> i32 {
             128 + s
         }
     };
-    report.playpen_exit_status = code;
     match result.drops {
         Ok(d) => report.dropped = Some(d),
         Err(e) => report.dropped_error = Some(e),
     }
+    let code = apply_drop_assertion(&mut report, code, args.fail_on_drop);
+    report.playpen_exit_status = code;
     eprint!("{}", text_summary(&report));
-    write_report(report_file.as_mut(), &report);
+    write_report(report_file.as_mut(), &report, args.shareable_report);
     code
+}
+
+pub(crate) fn apply_drop_assertion(report: &mut Report, code: i32, enabled: bool) -> i32 {
+    if !enabled {
+        return code;
+    }
+    let assertion = match &report.dropped {
+        Some(d) if d.packets > 0 => crate::report::DropAssertion::Violated,
+        Some(_) => crate::report::DropAssertion::Pass,
+        None => crate::report::DropAssertion::Unknown,
+    };
+    report.drop_assertion = Some(assertion);
+    if code == 0
+        && (assertion != crate::report::DropAssertion::Pass
+            || report.stopped_by_until
+            || report.stopped_by_pass)
+    {
+        1
+    } else {
+        code
+    }
 }

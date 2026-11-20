@@ -35,6 +35,7 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
     });
     Ok(json!({
         "schema": "playpen.plan.v1",
+        "fail_on_drop": args.fail_on_drop,
         "command": args.command.iter().map(|a| unix_string(a)).collect::<Vec<_>>(),
         "cwd": unix_string(cwd.as_os_str()), "pass": pass,
         "allowed": grants.iter().map(ToString::to_string).collect::<Vec<_>>(),

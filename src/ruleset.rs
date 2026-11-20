@@ -219,48 +219,89 @@ pub fn parse_counters(json: &str) -> Result<DropSummary, String> {
         .ok_or("nft JSON has no \"nftables\" array")?;
     let mut total = None;
     let mut dests = Vec::new();
+    let mut detail_uncertain = false;
+    let mut seen_sets = std::collections::HashSet::new();
+    let mut identities = std::collections::HashSet::new();
     for item in items {
         if let Some(c) = item.get("counter")
             && c.get("name").and_then(serde_json::Value::as_str) == Some("dropped")
         {
-            total = c.get("packets").and_then(serde_json::Value::as_u64);
+            if total.is_some() {
+                return Err("nft JSON has duplicate dropped counters".into());
+            }
+            total = Some(
+                c.get("packets")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or("invalid dropped counter")?,
+            );
         }
         if let Some(s) = item.get("set") {
             let name = s.get("name").and_then(serde_json::Value::as_str);
             if !matches!(name, Some("drop4" | "drop6")) {
                 continue;
             }
-            for elem in s
-                .get("elem")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(d) = parse_elem(elem) {
-                    dests.push(d);
+            if !seen_sets.insert(name.unwrap_or_default().to_owned()) {
+                detail_uncertain = true;
+            }
+            match s.get("elem") {
+                None => {} // nft omits elem for an empty set
+                Some(serde_json::Value::Array(elems)) => {
+                    for elem in elems {
+                        if let Some(d) = parse_elem(elem, name.unwrap_or_default()) {
+                            if !identities.insert((d.address.clone(), d.protocol.clone(), d.port)) {
+                                detail_uncertain = true;
+                            }
+                            dests.push(d);
+                        } else {
+                            detail_uncertain = true;
+                        }
+                    }
                 }
+                Some(_) => detail_uncertain = true,
             }
         }
     }
     let packets = total.ok_or("nft JSON has no \"dropped\" counter")?;
     dests.sort_by(|a, b| b.packets.cmp(&a.packets).then_with(|| a.cmp(b)));
-    let listed: u64 = dests.iter().map(|d| d.packets).sum();
+    let listed = dests
+        .iter()
+        .try_fold(0_u64, |sum, d| sum.checked_add(d.packets));
+    detail_uncertain |= seen_sets.len() != 2;
     Ok(DropSummary {
         packets,
-        destinations_truncated: listed < packets,
+        destinations_truncated: detail_uncertain || listed != Some(packets),
         destinations: dests,
     })
 }
 
-fn parse_elem(elem: &serde_json::Value) -> Option<DroppedDest> {
+fn parse_elem(elem: &serde_json::Value, family: &str) -> Option<DroppedDest> {
     let inner = elem.get("elem")?;
     let concat = inner.get("val")?.get("concat")?.as_array()?;
-    let address = concat.first()?.as_str()?.to_owned();
+    if concat.len() != 3 {
+        return None;
+    }
+    let address = concat
+        .first()?
+        .as_str()?
+        .parse::<std::net::IpAddr>()
+        .ok()?
+        .to_string();
+    let ip = address.parse::<std::net::IpAddr>().ok()?;
+    if (family == "drop4") != ip.is_ipv4() {
+        return None;
+    }
     // nft prints the protocol by name when it knows it, else as a number.
-    let protocol = match concat.get(1)? {
+    let raw_protocol = match concat.get(1)? {
         serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Number(n) => n.as_u64()?.to_string(),
         _ => return None,
+    };
+    let protocol = match raw_protocol.as_str() {
+        "tcp" | "6" => "tcp".to_owned(),
+        "udp" | "17" => "udp".to_owned(),
+        "icmp" | "1" => "icmp".to_owned(),
+        "ipv6-icmp" | "58" => "ipv6-icmp".to_owned(),
+        other => other.parse::<u8>().ok()?.to_string(),
     };
     let port = match (protocol.as_str(), concat.get(2)?) {
         ("tcp" | "udp", serde_json::Value::Number(n)) => {
@@ -269,6 +310,9 @@ fn parse_elem(elem: &serde_json::Value) -> Option<DroppedDest> {
         ("tcp" | "udp", serde_json::Value::String(s)) => s.parse().ok(),
         _ => None,
     };
+    if matches!(protocol.as_str(), "tcp" | "udp") && port.is_none() {
+        return None;
+    }
     let packets = inner.get("counter")?.get("packets")?.as_u64()?;
     Some(DroppedDest {
         address,
@@ -403,6 +447,30 @@ mod tests {
         assert_eq!(s.destinations[2].protocol, "icmp");
         assert_eq!(s.destinations[2].port, None);
         assert!(s.destinations_truncated);
+    }
+
+    #[test]
+    fn counter_completeness_is_conservative() {
+        fn snapshot(total: u64, elems: &str) -> DropSummary {
+            parse_counters(&format!(r#"{{"nftables":[{{"counter":{{"name":"dropped","packets":{total}}}}},{{"set":{{"name":"drop4","elem":[{elems}]}}}},{{"set":{{"name":"drop6"}}}}]}}"#)).unwrap_or_else(|e| panic!("{e}"))
+        }
+        let entry = r#"{"elem":{"val":{"concat":["192.0.2.1","tcp",80]},"counter":{"packets":3}}}"#;
+        assert!(!snapshot(0, "").destinations_truncated);
+        assert!(!snapshot(3, entry).destinations_truncated);
+        assert!(snapshot(2, entry).destinations_truncated);
+        assert!(snapshot(4, entry).destinations_truncated);
+        assert!(snapshot(3, "{}").destinations_truncated);
+        assert!(snapshot(3, &entry.replace("192.0.2.1", "2001:db8::1")).destinations_truncated);
+        assert!(snapshot(3, &entry.replace("80]", "80,1]")).destinations_truncated);
+        assert!(snapshot(3, &entry.replace("\"tcp\"", "256")).destinations_truncated);
+        assert!(snapshot(3, &entry.replace("\"tcp\"", "\"unknown\"")).destinations_truncated);
+        let alias = entry.replace("\"tcp\"", "6");
+        assert!(snapshot(6, &format!("{entry},{alias}")).destinations_truncated);
+
+        assert!(snapshot(6, &format!("{entry},{entry}")).destinations_truncated);
+        let max = entry.replace("\"packets\":3", &format!("\"packets\":{}", u64::MAX));
+        assert!(snapshot(u64::MAX, &format!("{max},{entry}")).destinations_truncated);
+        assert!(parse_counters(r#"{"nftables":[{"counter":{"name":"dropped","packets":0}},{"set":{"name":"drop4"}}]}"#).unwrap_or_default().destinations_truncated);
     }
 
     #[test]

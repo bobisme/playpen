@@ -33,6 +33,15 @@ pub enum StartupEvidence {
     Unknown,
 }
 
+/// Result of the optional counted-drop assertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropAssertion {
+    Pass,
+    Violated,
+    Unknown,
+}
+
 /// The JSON report. Field names are stable.
 #[derive(Debug, Clone, Serialize)]
 #[expect(
@@ -76,6 +85,9 @@ pub struct Report {
     pub playpen_exit_status: i32,
     /// Drop counters, when they could be read.
     pub dropped: Option<DropSummary>,
+    /// Result of --fail-on-drop, absent when not requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drop_assertion: Option<DropAssertion>,
     /// Why the drop counters could not be read.
     pub dropped_error: Option<String>,
     /// How host Unix sockets are kept from the command: `"landlock"`
@@ -91,6 +103,48 @@ pub struct Report {
     /// True when the command ran in its own session without a controlling
     /// terminal (`--new-session`, or a kernel that allows `TIOCSTI`).
     pub new_session: bool,
+}
+
+/// Explicit allowlist for reports intended to be shared.
+#[derive(Serialize)]
+pub struct ShareableReport {
+    schema: &'static str,
+    outcome: Outcome,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    playpen_exit_status: i32,
+    network: &'static str,
+    socket_guard: &'static str,
+    stopped_by_until: bool,
+    stopped_by_pass: bool,
+    dropped_packets: Option<u64>,
+    destinations_truncated: Option<bool>,
+    drop_assertion: Option<DropAssertion>,
+}
+
+impl From<&Report> for ShareableReport {
+    fn from(r: &Report) -> Self {
+        Self {
+            schema: "playpen-shareable-v1",
+            outcome: r.outcome,
+            exit_code: r.exit_code,
+            signal: r.signal,
+            playpen_exit_status: r.playpen_exit_status,
+            network: match r.network {
+                "pasta" => "pasta",
+                _ => "none",
+            },
+            socket_guard: match r.socket_guard {
+                "landlock" => "landlock",
+                _ => "mounts_only",
+            },
+            stopped_by_until: r.stopped_by_until,
+            stopped_by_pass: r.stopped_by_pass,
+            dropped_packets: r.dropped.as_ref().map(|d| d.packets),
+            destinations_truncated: r.dropped.as_ref().map(|d| d.destinations_truncated),
+            drop_assertion: r.drop_assertion,
+        }
+    }
 }
 
 /// The pass a run was held to. Everything but `file` is null when the pass
@@ -205,12 +259,95 @@ mod tests {
             pass: None,
             playpen_exit_status: 0,
             dropped: Some(DropSummary::default()),
+            drop_assertion: None,
             dropped_error: None,
             socket_guard: "landlock",
             exposed: vec![],
             display: false,
             new_session: false,
         }
+    }
+
+    #[test]
+    fn shareable_is_an_explicit_allowlist() {
+        let mut r = base();
+        r.command = vec!["private-command".into()];
+        r.hosts = vec!["private-host".into()];
+        r.message = Some("private-message".into());
+        r.exposed = vec!["private-path".into()];
+        r.allowed = vec!["private-destination".into()];
+        r.pass = Some(PassReport {
+            file: "private-pass".into(),
+            id: None,
+            name: None,
+            owner: Some("private-owner".into()),
+            digest: None,
+            valid_until: None,
+            labels: vec!["private-label".into()],
+        });
+        for outcome in [Outcome::Ran, Outcome::Refused, Outcome::Error] {
+            r.outcome = outcome;
+            let value = serde_json::to_value(ShareableReport::from(&r)).unwrap_or_default();
+            let serialized = value.to_string();
+            assert!(!serialized.contains("private-"), "{serialized}");
+            let keys: std::collections::BTreeSet<_> = value
+                .as_object()
+                .unwrap_or_else(|| panic!("not object"))
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys,
+                [
+                    "schema",
+                    "outcome",
+                    "exit_code",
+                    "signal",
+                    "playpen_exit_status",
+                    "network",
+                    "socket_guard",
+                    "stopped_by_until",
+                    "stopped_by_pass",
+                    "dropped_packets",
+                    "destinations_truncated",
+                    "drop_assertion"
+                ]
+                .into_iter()
+                .collect()
+            );
+            assert_eq!(value["dropped_packets"], 0);
+            r.dropped = None;
+            assert!(serde_json::to_value(ShareableReport::from(&r)).unwrap_or_default()["dropped_packets"].is_null());
+            r.dropped = Some(DropSummary::default());
+        }
+    }
+
+    #[test]
+    fn assertion_uses_total_and_preserves_child_status() {
+        let mut r = base();
+        assert_eq!(crate::cli::apply_drop_assertion(&mut r, 0, true), 0);
+        r.dropped = None;
+        assert_eq!(crate::cli::apply_drop_assertion(&mut r, 0, true), 1);
+        assert_eq!(r.drop_assertion, Some(DropAssertion::Unknown));
+        r.dropped = Some(DropSummary {
+            packets: 1,
+            destinations: vec![],
+            destinations_truncated: true,
+        });
+        assert_eq!(crate::cli::apply_drop_assertion(&mut r, 0, true), 1);
+        assert_eq!(r.drop_assertion, Some(DropAssertion::Violated));
+        assert_eq!(r.exit_code, Some(0));
+        assert_eq!(crate::cli::apply_drop_assertion(&mut r, 2, true), 2);
+        assert_eq!(crate::cli::apply_drop_assertion(&mut r, 0, false), 0);
+    }
+
+    #[test]
+    fn contradictory_counter_reaches_json_as_incomplete() {
+        let mut report = base();
+        report.dropped = Some(crate::ruleset::parse_counters(r#"{"nftables":[{"counter":{"name":"dropped","packets":2}},{"set":{"name":"drop4","elem":[{"elem":{"val":{"concat":["192.0.2.1","tcp",80]},"counter":{"packets":3}}}]}},{"set":{"name":"drop6"}}]}"#).unwrap_or_else(|e| panic!("{e}")));
+        let json = serde_json::to_value(report).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(json["dropped"]["packets"], 2);
+        assert_eq!(json["dropped"]["destinations_truncated"], true);
     }
 
     #[test]

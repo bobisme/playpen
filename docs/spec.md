@@ -744,8 +744,17 @@ Not guarded against, or known limits:
   user); playpen writes it last, through the file it opened at start;
 - supplementary groups of the caller still apply to file access inside;
 - per-destination drop lists hold 1024 destinations per address family;
-  the total count stays exact and `destinations_truncated` says when the
-  list is incomplete;
+  `destinations_truncated` is true when the list is incomplete or its
+  consistency cannot be established. A non-null `dropped.packets` is the
+  total counter observed in the dump; null means the snapshot was unavailable.
+  The nft JSON dump does not establish an atomic snapshot of the total and
+  individual set counters under concurrent traffic, so matching values alone
+  do not guarantee an exact breakdown at one instant. The netfilter
+  [internals documentation](https://wiki.nftables.org/wiki-nftables/index.php/Portal%3ADeveloperDocs/nftables_internals)
+  describes getters as non-batched and dumps as potentially resumed across
+  messages; its atomic generation guarantee concerns ruleset updates. It
+  does not specify an atomic cross-counter snapshot or a version range for
+  one, so no supported nft version is claimed to provide that guarantee;
 - a signal sent to playpen's whole process group reaches the command
   twice unless it runs in a new session (section 5);
 - SIGSTOP sent to playpen itself (not Ctrl-Z) stops the command only
@@ -770,3 +779,51 @@ related errors keep their own semantics. Denied requests must still be counted.
 Before enabling it, use namespace-local fixtures to demonstrate both families,
 a permitted reply, denial of an unlisted peer, and unchanged behavior for a
 pass without an echo grant.
+
+### Counted-drop assertion
+
+With `--fail-on-drop`, the report includes `drop_assertion`: `pass` for a
+known zero total, `violated` for a positive total even with partial detail,
+and `unknown` when counters are unavailable or the command did not start.
+For a child exit of zero, violated or unknown makes playpen exit 1. A nonzero
+child status is retained; signals retain their normal status, and a stop by
+expiry or pass revocation cannot become success. Refusal and setup failures
+retain their existing statuses. This counts dropped IP packets, not DNS
+misses, Unix sockets, or packets that never reached the ruleset. Without the
+option, the existing exit contract and JSON shape are unchanged.
+
+### Shareable reports
+
+`--shareable-report --report FILE` writes a separate `playpen-shareable-v1`
+JSON object directly. Its only fields are `schema`, `outcome`, `exit_code`,
+`signal`, `playpen_exit_status`, `network`, `socket_guard`, `stopped_by_until`,
+`stopped_by_pass`, `dropped_packets`, `destinations_truncated`, and
+`drop_assertion`. The two drop fields are null when unavailable; zero is a
+known zero. The stop booleans classify expiry and pass stops without copying
+free-text reasons. The normal full report remains the default and retains its
+existing compatibility contract. Future shareable fields require an explicit
+allowlist addition and a schema compatibility decision.
+
+```json
+{"schema":"playpen-shareable-v1","outcome":"ran","exit_code":0,"signal":null,"playpen_exit_status":0,"network":"pasta","socket_guard":"landlock","stopped_by_until":false,"stopped_by_pass":false,"dropped_packets":0,"destinations_truncated":false,"drop_assertion":null}
+```
+
+Child output and files created by the caller or child are separate from this
+report and may contain sensitive data. Aggregate counts and the occurrence of
+stops can themselves disclose information, including timing-related behavior.
+
+### Offline report comparison
+
+`playpen compare BEFORE AFTER [--format json]` reads full 0.1.0 reports as
+inert data (at most 1 MiB each). It compares effective grants, network, host
+mappings, exposed sockets, display and socket guard independently of observed
+blocked endpoint tuples. Packet counts do not themselves trigger changes.
+Policy differences are shown before the observations. A newly observed tuple
+requires a complete baseline; a no-longer-observed tuple requires a complete
+later report and does not mean it is allowed or fixed. Missing or partial
+counters, malformed detail, unstarted runs and unsupported/reduced schemas
+cannot establish equality. Exit 0 means comparable policy and complete
+observations with no new denials; 1 means new denials were observed; 2 means
+comparison is indeterminate, policy differs without a new denial, or input
+is invalid. When new denials and a policy change coexist, exit 1 reports the
+new denial and the output still marks the policy change.

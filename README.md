@@ -231,3 +231,12 @@ playpen does not guard against:
 ## License
 
 [MIT License](LICENSE).
+
+For CI, fail a successful command if it sends a counted denied packet:
+
+```sh
+playpen run --allow 192.0.2.1:443/tcp --fail-on-drop --report report.json -- ./check
+```
+
+Unavailable counters also fail the assertion. The report keeps the child
+status separately from playpen's exit status.
