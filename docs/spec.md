@@ -623,7 +623,7 @@ So by default:
 
 | Traffic | Default |
 |---|---|
-| IPv4 and IPv6 to unapproved destinations | dropped and counted (TCP connect fails with "No route to host", UDP send with "Operation not permitted") |
+| IPv4 and IPv6 to unapproved destinations | dropped and counted (TCP connect fails with "No route to host" over IPv4 and "Permission denied" over IPv6, UDP send with "Operation not permitted") |
 | ICMP and ICMPv6 (ping and others) | dropped and counted; cannot be approved |
 | DNS | none: no nameserver configured, `hosts: files` only, port 53 not approved unless you approve it |
 | the host's loopback | unreachable: pasta maps nothing to it and forwards no loopback ports |

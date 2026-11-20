@@ -27,7 +27,8 @@ configured, so its exit status is a reliable "up" signal.
 **`reject` before the drop policy.** The chain policy is drop, but the last
 rule rejects with `admin-prohibited`. Without it a blocked TCP connect hangs
 for minutes in SYN retries; with it the tool fails at once with "No route to
-host", which is clearer and makes test runs fast. The policy is still drop,
+host" (over IPv6: "Permission denied"), which is clearer and makes test
+runs fast. The policy is still drop,
 so anything that gets past the reject (nothing should) is dropped.
 
 **nix, not rustix.** playpen needs fork, unshare, setns, mount, signalfd,
@@ -403,7 +404,7 @@ matter for safety:
 | The broadcast address of an approved network (one packet, every host on it), and its network address | a network rule does not accept the network and all-ones address of any listed IPv4 network of /30 or broader; dropped and counted unless listed on its own. Same rule as hallpass | yes (`network_and_broadcast_addresses_of_a_listed_network_are_dropped`) |
 | IPv6 forgotten while IPv4 is filtered | `inet` family table covers both; an IPv4 approval never opens IPv6 | yes |
 | ICMP / ICMPv6 as a side channel | not approvable; only neighbour solicitation/advertisement with hop limit 255 (link-local by RFC 4861) pass; kernel MLD reports and router solicitations are dropped silently; ICMP errors for accepted flows pass as `related` | NDP needed for pasta works (IPv6 tests pass through pasta-configured namespaces); not tested separately |
-| pasta's gateway mapped to the host's loopback | `--map-host-loopback none`; and unless approved, the filter drops the gateway too | yes, end to end (`tests/gateway.rs`): playpen runs inside a throwaway network namespace whose only outside is a `dummy` interface, with gateway 192.0.2.1. With the gateway approved, a connection to it does not arrive at a listener on that namespace's wildcard address; with a pasta wrapper that drops the flag (the control) it does; unapproved, it is dropped and counted. The test reads the gateway pasta configured from `/proc/net/route` inside. Nothing can leave the machine: the dummy interface discards everything |
+| pasta's gateway mapped to the host's loopback | `--map-host-loopback none`; and unless approved, the filter drops the gateway too | yes, end to end (`tests/gateway.rs`): playpen runs inside a throwaway network namespace whose only outside is a `dummy` interface, with gateway 192.0.2.1. With the gateway approved, a connection to it does not arrive at a listener on that namespace's wildcard address; with a pasta wrapper that drops the flag (the control) it does; unapproved, it is dropped and counted. The test reads the gateway pasta configured from `/proc/net/route` inside. The same for IPv6, with gateway 2001:db8::1 and a listener on `[::]`. Nothing can leave the machine: the dummy interface discards everything |
 | pasta forwarding namespace loopback ports to the host (`-T auto`, its default) | `--tcp-ns none --udp-ns none`. The filter does **not** catch this: it accepts loopback inside the namespace, and pasta's sockets there are spliced to the host | yes: a host listener on 127.0.0.1 and ::1 below 32768 is not reached. Removing the flags makes the test fail (checked). Note: pasta's auto mode skips the ephemeral range, so a test on an ephemeral port proves nothing |
 | pasta forwarding host ports into the namespace | `--tcp-ports none --udp-ports none`; input chain drops new inbound connections anyway | flag unit-tested |
 | DNS forwarded by pasta | `--dns none --search none`, no `--dns-forward`; port 53 to the gateway is not approved | flag unit-tested |

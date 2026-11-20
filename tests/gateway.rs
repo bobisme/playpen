@@ -15,6 +15,9 @@
 //!
 //! A listener on the fake host's wildcard address shows whether a
 //! connection to the gateway arrived at "the host".
+//!
+//! The same is done for IPv6: the dummy interface also has `2001:db8::10/64`
+//! with gateway `2001:db8::1`, and a second listener waits on `[::]`.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -22,6 +25,8 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_playpen");
 const PORT: &str = "9555";
+/// The port of the IPv6 listener (the IPv4 one must not answer for it).
+const PORT6: &str = "9556";
 
 fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
@@ -79,29 +84,33 @@ fn skip_reason() -> Option<String> {
 /// the caller's uid again.
 const OUTER: &str = r#"#!/bin/sh
 set -e
-BIN="$1"; PORT="$2"; LOG="$3"; U="$4"; G="$5"; shift 5
+BIN="$1"; PORT="$2"; LOG="$3"; U="$4"; G="$5"; PORT6="$6"; shift 6
 ip link set lo up
 ip link add dummy0 type dummy
 ip addr add 192.0.2.10/24 dev dummy0
+ip -6 addr add 2001:db8::10/64 dev dummy0 nodad
 ip link set dummy0 up
 ip route add default via 192.0.2.1
+ip -6 route add default via 2001:db8::1 dev dummy0
 "$BIN" probe listen "0.0.0.0:$PORT/tcp" --ms 20000 >"$LOG" &
 L=$!
+"$BIN" probe listen "[::]:$PORT6/tcp" --ms 20000 >"$LOG.v6" &
+L6=$!
 n=0
-until grep -q listening "$LOG"; do n=$((n+1)); [ $n -lt 200 ] || exit 3; sleep 0.02; done
+until grep -q listening "$LOG" && grep -q listening "$LOG.v6"; do n=$((n+1)); [ $n -lt 200 ] || exit 3; sleep 0.02; done
 set +e
 unshare --user --map-user="$U" --map-group="$G" "$@"
 rc=$?
-# Let the listener log a connection that is still in its backlog.
+# Let the listeners log a connection that is still in their backlog.
 sleep 0.3
-kill $L
+kill $L $L6
 exit $rc
 "#;
 
 /// Inside the sandbox: show pasta's configuration, then try the gateway.
 const INNER: &str = r#"#!/bin/sh
-cat /proc/net/route
-exec "$1" probe reach --try "192.0.2.1:$2/tcp"
+cat /proc/net/route /proc/net/ipv6_route
+exec "$1" probe reach --try "192.0.2.1:$2/tcp" --try "[2001:db8::1]:$3/tcp"
 "#;
 
 /// A pasta that drops `--map-host-loopback none`, as if playpen forgot it.
@@ -120,10 +129,12 @@ struct Outcome {
     stderr: String,
     /// What the fake host's listener printed.
     listener: String,
+    /// What the fake host's IPv6 listener printed.
+    listener6: String,
     report: serde_json::Value,
 }
 
-fn run_in_fake_host(name: &str, allow: &str, pasta: Option<&Path>) -> Outcome {
+fn run_in_fake_host(name: &str, allow: &[&str], pasta: Option<&Path>) -> Outcome {
     let dir = tmpdir();
     let outer = write_script(&dir, "outer.sh", OUTER);
     let inner = write_script(&dir, "inner.sh", INNER);
@@ -138,11 +149,15 @@ fn run_in_fake_host(name: &str, allow: &str, pasta: Option<&Path>) -> Outcome {
         .args([BIN, PORT])
         .arg(&log)
         .args([&uid, &gid])
-        .args([BIN, "run", "--allow", allow, "--report"])
+        .args([PORT6, BIN, "run"]);
+    for a in allow {
+        cmd.args(["--allow", a]);
+    }
+    cmd.arg("--report")
         .arg(&rep)
         .args(["--", "sh"])
         .arg(&inner)
-        .args([BIN, PORT]);
+        .args([BIN, PORT, PORT6]);
     if let Some(p) = pasta {
         cmd.env("PLAYPEN_PASTA", p);
     }
@@ -151,13 +166,20 @@ fn run_in_fake_host(name: &str, allow: &str, pasta: Option<&Path>) -> Outcome {
         inside: text(&out.stdout),
         stderr: text(&out.stderr),
         listener: std::fs::read_to_string(&log).unwrap_or_default(),
+        listener6: std::fs::read_to_string(dir.join(format!("{name}.listener.v6")))
+            .unwrap_or_default(),
         report: serde_json::from_str(&std::fs::read_to_string(&rep).unwrap_or_default())
             .unwrap_or_default(),
     }
 }
 
-fn reached(o: &Outcome) -> bool {
-    o.inside.contains("\"reached\":true")
+/// Whether the probe inside reached `target`.
+fn reached(o: &Outcome, target: &str) -> bool {
+    o.inside
+        .lines()
+        .find(|l| l.contains(&format!("\"target\":\"{target}\"")))
+        .unwrap_or_else(|| panic!("no result for {target}: {} {}", o.inside, o.stderr))
+        .contains("\"reached\":true")
 }
 
 #[test]
@@ -166,10 +188,13 @@ fn the_gateway_is_not_the_host_loopback() {
         eprintln!("SKIPPED: {why}");
         return;
     }
-    let allow = format!("192.0.2.1:{PORT}/tcp");
+    let gw4 = format!("192.0.2.1:{PORT}/tcp");
+    let gw6 = format!("[2001:db8::1]:{PORT6}/tcp");
+    let allow = [gw4.as_str(), gw6.as_str()];
 
-    // 1. As playpen runs pasta. pasta set the gateway up as 192.0.2.1
-    //    (C0000201, stored little-endian in /proc/net/route).
+    // 1. As playpen runs pasta. pasta set the gateways up as 192.0.2.1
+    //    (C0000201, stored little-endian in /proc/net/route) and
+    //    2001:db8::1 (the default route in /proc/net/ipv6_route).
     let o = run_in_fake_host("real", &allow, None);
     assert!(
         o.inside.contains("010200C0"),
@@ -177,41 +202,76 @@ fn the_gateway_is_not_the_host_loopback() {
         o.inside,
         o.stderr
     );
-    assert!(o.inside.contains("\"target\""), "{} {}", o.inside, o.stderr);
-    assert!(!reached(&o), "the gateway was reached: {}", o.inside);
+    assert!(
+        o.inside
+            .lines()
+            .any(|l| l.starts_with("00000000000000000000000000000000 00 ")
+                && l.contains(" 20010db8000000000000000000000001 ")),
+        "pasta did not configure gateway 2001:db8::1: {} {}",
+        o.inside,
+        o.stderr
+    );
+    assert!(!reached(&o, &gw4), "the gateway was reached: {}", o.inside);
+    assert!(
+        !reached(&o, &gw6),
+        "the IPv6 gateway was reached: {}",
+        o.inside
+    );
     assert!(
         !o.listener.contains("accepted\":\""),
         "the fake host's listener got a connection: {}",
         o.listener
     );
+    assert!(
+        o.listener6.contains("listening") && !o.listener6.contains("accepted\":\""),
+        "the fake host's IPv6 listener got a connection: {}",
+        o.listener6
+    );
 
     // 2. The same with a pasta that maps the gateway to the host's
-    //    loopback: the connection now arrives at the fake host's
-    //    listener. This shows the check above would catch the mapping.
+    //    loopback: the connections now arrive at the fake host's
+    //    listeners. This shows the checks above would catch the mapping.
     let dir = tmpdir();
     let o = run_in_fake_host("mapped", &allow, Some(&fake_pasta(&dir)));
-    assert!(reached(&o), "control failed: {} {}", o.inside, o.stderr);
+    assert!(
+        reached(&o, &gw4) && reached(&o, &gw6),
+        "control failed: {} {}",
+        o.inside,
+        o.stderr
+    );
     assert!(
         o.listener.contains("accepted\":\"127.0.0.1"),
         "control failed: {}",
         o.listener
     );
+    assert!(
+        o.listener6.contains("accepted\":\"[::1]"),
+        "IPv6 control failed: {}",
+        o.listener6
+    );
 
     // 3. Not approved: dropped and counted by the ruleset, so it does not
     //    even reach pasta.
-    let o = run_in_fake_host("unapproved", &format!("192.0.2.99:{PORT}/tcp"), None);
-    assert!(!reached(&o), "{}", o.inside);
+    let other = format!("192.0.2.99:{PORT}/tcp");
+    let o = run_in_fake_host("unapproved", &[&other], None);
+    assert!(!reached(&o, &gw4) && !reached(&o, &gw6), "{}", o.inside);
+    // Rejected at once: "No route to host" for IPv4, "Permission denied"
+    // for IPv6 (how the kernel reports ICMPv6 administratively prohibited).
     assert!(o.inside.contains("No route to host"), "{}", o.inside);
+    assert!(o.inside.contains("Permission denied"), "{}", o.inside);
     assert!(!o.listener.contains("accepted\":\""), "{}", o.listener);
+    assert!(!o.listener6.contains("accepted\":\""), "{}", o.listener6);
     let dests = o.report["dropped"]["destinations"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    assert!(
-        dests.iter().any(|d| d["address"] == "192.0.2.1"
-            && d["protocol"] == "tcp"
-            && d["port"].as_u64() == PORT.parse().ok()),
-        "{}",
-        o.report
-    );
+    for (address, port) in [("192.0.2.1", PORT), ("2001:db8::1", PORT6)] {
+        assert!(
+            dests.iter().any(|d| d["address"] == address
+                && d["protocol"] == "tcp"
+                && d["port"].as_u64() == port.parse().ok()),
+            "{address}: {}",
+            o.report
+        );
+    }
 }

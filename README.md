@@ -115,7 +115,8 @@ the runtime directory is empty, and the session bus, `ssh-agent`, syslog
 and others are not reachable without `--expose`.
 
 If the tool tries to go somewhere else, the connection fails at once
-("No route to host" for TCP, "Operation not permitted" for UDP), and
+("No route to host" for TCP over IPv4, "Permission denied" for TCP over
+IPv6, "Operation not permitted" for UDP), and
 playpen says so loudly on exit:
 
 ```text
