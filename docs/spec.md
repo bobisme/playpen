@@ -341,9 +341,17 @@ SIGTSTP sent to playpen) stops every process in the sandbox, including
 those in other process groups or sessions, and then playpen itself, so the
 shell shows the job as stopped; `fg` or `bg` continues playpen, which
 continues exactly the processes it stopped. playpen does not stop for
-terminal input or output. SIGSTOP sent to playpen directly stops only
-playpen: the end time and the pass re-read are then enforced when it
-continues.
+terminal input or output.
+
+SIGSTOP sent to playpen directly cannot be caught, so playpen cannot ask
+for that freeze first. Instead playpen tells the sandbox's init every
+second that it is running. When init hears nothing for 5 seconds
+(`sandbox::SILENCE_LIMIT`: playpen is stopped, or stuck), it stops every
+process in the sandbox itself and prints `playpen itself has been stopped
+or stuck for 5 s ...; the command is paused until playpen continues`. When
+playpen is heard again, init continues the processes it stopped, and
+playpen enforces the end time and re-reads the pass at once. So the
+command runs at most 5 seconds without supervision.
 
 **`--report FILE`**. Write the JSON report to `FILE`, for every outcome,
 refusals by policy included. The file is created (truncated) before
@@ -562,7 +570,9 @@ in that group, gets its own copy from the kernel and P's as well: twice.
 P cannot tell the two cases apart.
 On SIGTSTP, P asks I to stop every
 process in the sandbox that is not stopped already, then stops itself; on
-SIGCONT it asks I to continue them. I reaps orphaned processes.
+SIGCONT it asks I to continue them. P sends I one byte every second; after
+5 seconds without any, I stops the sandbox's processes itself until the
+next one (section 4.1). I reaps orphaned processes.
 
 If any step before the command starts fails and
 `kernel.apparmor_restrict_unprivileged_userns` is 1, the message adds that
@@ -693,8 +703,9 @@ Not guarded against, or known limits:
   list is incomplete;
 - a signal sent to playpen's whole process group reaches the command
   twice unless it runs in a new session (section 5);
-- SIGSTOP sent to playpen itself (not Ctrl-Z) stops playpen but not the
-  command; the end time and the pass re-read wait until playpen continues;
+- SIGSTOP sent to playpen itself (not Ctrl-Z) stops the command only
+  after 5 seconds of silence (section 4.1); in that time the end time and
+  the pass re-read are not enforced;
 - the command can open the caller's other terminals (`/dev/pts/N`);
 - with `--pass`: a revocation or edit takes effect at the next re-read (up
   to 2 seconds) plus the grace; traffic in that time is still allowed. Who

@@ -193,10 +193,24 @@ the terminal for its own jobs; Ctrl-Z then suspends its foreground job, as
 usual. The test `ctrl_z_stops_the_whole_sandbox_and_fg_resumes_it` uses a
 child in its own session; with the freeze disabled, it fails (checked).
 
-What is left: SIGSTOP sent to playpen directly (`kill -STOP`), which
-cannot be caught, stops P without freezing the sandbox. While P is stopped
-like that, the end time and the pass re-read are not enforced; they are as
-soon as P continues. The filter itself is in the kernel and keeps working.
+**SIGSTOP sent to playpen directly** (`kill -STOP`) cannot be caught, so P
+cannot ask for the freeze first. A watchdog covers it: P sends I one byte a
+second on their pipe, and when I has heard nothing for 5 seconds
+(`SILENCE_LIMIT`) it freezes the sandbox the same way, says so on stderr,
+and repeats the freeze every second for anything a pass missed. The next
+byte from P thaws it, and P, running again, looks at the clock and the pass
+before anything else. This also covers a P that is stuck (a pass on a file
+system that hangs, a stderr nobody reads). Why a heartbeat and not a second
+timer in I: I would enforce the end time but not a revocation, and
+re-reading the pass in I would put a second copy of that judgement in the
+process that sits beside the command. Why 5 seconds and not 2: a freeze is
+visible to the command (SIGSTOP and SIGCONT interrupt some system calls,
+and a shell inside sees its jobs stop), so it must not happen because P was
+slow to be scheduled; 5 seconds is the size of the gap already accepted for
+a revocation (re-read plus grace). What is left is those 5 seconds, and the
+freeze's own limit: a process that forks faster than 20 passes over `/proc`
+can stay ahead of it until the next pass a second later. The filter itself
+is in the kernel and keeps working throughout.
 
 **New session where `TIOCSTI` works.** Where the kernel still lets an
 unprivileged process push input into its controlling terminal (kernels
@@ -407,6 +421,7 @@ matter for safety:
 | The display server typing into host windows | display sockets refused and hidden unless `--display` | yes |
 | Input pushed into the operator's terminal (`TIOCSTI`) | refused by the kernel (`legacy_tiocsti = 0`), else new session without a controlling terminal | yes (both modes; see the Unix sockets section for what that shows here) |
 | The command running on while playpen is suspended (Ctrl-Z), unchecked by the end time and the pass re-read | P freezes every process in the sandbox through I before it stops | yes, with a child outside the terminal's process group; the test fails without the freeze |
+| The command running on while playpen is stopped with SIGSTOP (which it cannot catch) or is stuck | I freezes the sandbox after 5 s without a byte from P, until P is heard again | yes (`sigstop_of_playpen_itself_freezes_the_command`: the end time passes while playpen is stopped; the command does not run on, and is stopped when playpen continues) |
 | ptrace of the privileged helper or of playpen | helpers non-dumpable; playpen and other host processes invisible in the PID namespace; Yama ptrace_scope 1 on this machine adds another layer | `/proc/1/mem` and `/proc/1/ns/user` denied |
 | A fake or broken `nft` | output structure verified after load | yes |
 | pasta not coming up | its exit status is checked; the command is not started | yes (fake pasta) |
@@ -433,9 +448,10 @@ matter for safety:
 - **Other terminals of the same user.** The command can open the user's
   other `/dev/pts/N` and write to them or read keystrokes from them. Not a
   network path.
-- **SIGSTOP to playpen itself.** Unlike Ctrl-Z it cannot be caught: P stops
-  without freezing the sandbox, and the end time and the pass re-read wait
-  until P continues. The kernel's filter keeps working.
+- **SIGSTOP to playpen itself.** Unlike Ctrl-Z it cannot be caught. The
+  sandbox is frozen by its init after 5 seconds without a sign of P; for
+  those 5 seconds the end time and the pass re-read are not enforced. The
+  kernel's filter keeps working.
 - **The approved destination.** If it is a proxy, a VPN endpoint or a
   jump host, traffic continues from there. playpen cannot see it.
 - **Volume and content.** No rate limits, no inspection.

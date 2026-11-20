@@ -30,6 +30,9 @@
 //! too, one byte each (see [`signal_byte`]): I is in P's process group, so
 //! a signal sent to the group, or to every playpen process, reaches I as
 //! well, and I could not tell that copy from one P sent it with `kill`.
+//! P also sends `b` every second. When I hears nothing from P for
+//! [`SILENCE_LIMIT`] (P was stopped with SIGSTOP, which it cannot catch,
+//! or is stuck), I freezes the sandbox by itself until P is heard again.
 
 use std::ffi::OsString;
 use std::fs;
@@ -336,6 +339,21 @@ const FREEZE: u8 = b'f';
 const THAW: u8 = b't';
 /// Byte P sends C: build the PID namespace and start the command.
 const GO: u8 = b'g';
+/// Byte P sends I every [`BEAT_INTERVAL`] while the command runs: P is
+/// running, so the end time and the pass are being watched.
+const BEAT: u8 = b'b';
+
+/// How often P tells I that it is running.
+const BEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long I lets the command run without a sign of P before it freezes
+/// the sandbox.
+///
+/// P is silent when it is stopped (SIGSTOP cannot be caught,
+/// so P cannot ask for the freeze as it does for Ctrl-Z) or stuck; nothing
+/// then enforces the end time or re-reads the pass. Several intervals, so
+/// a busy machine does not freeze the command by mistake.
+pub const SILENCE_LIMIT: Duration = Duration::from_secs(5);
 
 /// The byte P sends I to have it pass `sig` on to the command: 1 to 7, the
 /// signal's place in [`FORWARDED`]. `None` for any other signal.
@@ -716,9 +734,15 @@ fn parent(
     let mut killed = false;
     let mut stopped_by_pass: Option<String> = None;
     let mut next_recheck = watch.as_ref().map(|w| Instant::now() + w.interval);
+    let mut next_beat = Instant::now();
     while !st.eof {
         let now = Instant::now();
-        let mut wake = now + Duration::from_secs(10);
+        // Tell I that P is running and looking at the clock and the pass.
+        if now >= next_beat {
+            send_byte(&down_w, BEAT);
+            next_beat = now + BEAT_INTERVAL;
+        }
+        let mut wake = next_beat;
         if let (Some(w), Some(due)) = (watch.as_mut(), next_recheck)
             && term_sent_at.is_none()
         {
@@ -1109,12 +1133,31 @@ fn init_loop(
 ) -> Result<i32, String> {
     let mut frozen: Vec<Pid> = Vec::new();
     let mut p_open = true;
+    // When P was last heard, whether P asked for the freeze in force
+    // (Ctrl-Z), and whether I froze the sandbox because P went silent.
+    let mut heard = Instant::now();
+    let mut asked = false;
+    let mut silent = false;
     loop {
         let mut fds = vec![PollFd::new(sigfd.as_fd(), PollFlags::POLLIN)];
         if p_open {
             fds.push(PollFd::new(down_r.as_fd(), PollFlags::POLLIN));
         }
-        match poll(&mut fds, PollTimeout::NONE) {
+        // Wake when P has been silent too long; while frozen for that,
+        // every interval, to stop whatever a pass of the freeze missed.
+        // Not after Ctrl-Z: P asked for that freeze before it stopped.
+        let watching = p_open && !asked;
+        let timeout = if watching {
+            let left = if silent {
+                BEAT_INTERVAL
+            } else {
+                (heard + SILENCE_LIMIT).saturating_duration_since(Instant::now())
+            };
+            PollTimeout::from(u16::try_from(left.as_millis() + 1).unwrap_or(u16::MAX))
+        } else {
+            PollTimeout::NONE
+        };
+        match poll(&mut fds, timeout) {
             Ok(_) | Err(Errno::EINTR) => {}
             Err(e) => return Err(format!("poll failed: {e}")),
         }
@@ -1125,10 +1168,26 @@ fn init_loop(
             match read(down_r, &mut b) {
                 Ok(0) | Err(Errno::EBADF) => p_open = false,
                 Ok(n) => {
+                    // Any byte shows that P runs. The sandbox I froze for
+                    // P's silence continues, unless P itself asked for a
+                    // freeze that still holds.
+                    heard = Instant::now();
+                    if silent {
+                        silent = false;
+                        if !asked {
+                            thaw(&mut frozen);
+                        }
+                    }
                     for &byte in &b[..n] {
                         match byte {
-                            FREEZE => freeze(&mut frozen),
-                            THAW => thaw(&mut frozen),
+                            FREEZE => {
+                                asked = true;
+                                freeze(&mut frozen);
+                            }
+                            THAW => {
+                                asked = false;
+                                thaw(&mut frozen);
+                            }
                             _ => {
                                 if let Some(sig) = byte_signal(byte) {
                                     let _ = kill(target, sig);
@@ -1139,6 +1198,16 @@ fn init_loop(
                 }
                 Err(_) => {}
             }
+        }
+        if p_open && !asked && heard.elapsed() >= SILENCE_LIMIT {
+            if !silent {
+                silent = true;
+                eprintln!(
+                    "playpen: playpen itself has been stopped or stuck for {} s, so nothing enforces the end time or re-reads the pass; the command is paused until playpen continues (`fg`, or `kill -CONT` its process)",
+                    SILENCE_LIMIT.as_secs()
+                );
+            }
+            freeze(&mut frozen);
         }
         let info = match sigfd.read_signal() {
             Ok(Some(info)) => info,
@@ -1158,19 +1227,27 @@ fn init_loop(
             }
             continue;
         }
-        loop {
-            match waitpid(None::<Pid>, Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::Exited(pid, code)) if pid == child => {
-                    write_line(up_w, &format!("exit {code}"));
-                    return Ok(0);
-                }
-                Ok(WaitStatus::Signaled(pid, s, _)) if pid == child => {
-                    write_line(up_w, &format!("signal {}", s as i32));
-                    return Ok(0);
-                }
-                Ok(WaitStatus::StillAlive) | Err(_) => break,
-                Ok(_) => {}
+        if reap(child, up_w) {
+            return Ok(0);
+        }
+    }
+}
+
+/// Reaps every process that has ended. True when the command was among
+/// them; how it ended is then reported to P.
+fn reap(child: Pid, up_w: &OwnedFd) -> bool {
+    loop {
+        match waitpid(None::<Pid>, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(pid, code)) if pid == child => {
+                write_line(up_w, &format!("exit {code}"));
+                return true;
             }
+            Ok(WaitStatus::Signaled(pid, s, _)) if pid == child => {
+                write_line(up_w, &format!("signal {}", s as i32));
+                return true;
+            }
+            Ok(WaitStatus::StillAlive) | Err(_) => return false,
+            Ok(_) => {}
         }
     }
 }

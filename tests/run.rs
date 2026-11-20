@@ -546,6 +546,65 @@ fn until_kills_a_command_that_ignores_sigterm() {
     assert!(took < Duration::from_secs(10), "took {took:?}");
 }
 
+/// SIGSTOP sent to playpen itself cannot be caught, so playpen cannot
+/// freeze the sandbox first as it does for Ctrl-Z. The sandbox's init
+/// notices that playpen went silent and freezes the command, so it does not
+/// run on past the end time while nothing enforces it; when playpen
+/// continues, it stops the command as usual.
+#[test]
+fn sigstop_of_playpen_itself_freezes_the_command() {
+    require_sandbox!();
+    let dir = tmpdir("sigstop");
+    let ticks = dir.join("ticks");
+    let _ = std::fs::remove_file(&ticks);
+    let until = rfc3339_in(4);
+    let script = format!("while :; do echo t >> {}; sleep 0.1; done", ticks.display());
+    let mut child = playpen(&[
+        "run",
+        "--no-network",
+        "--until",
+        &until,
+        "--",
+        "sh",
+        "-c",
+        &script,
+    ])
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap_or_else(|e| panic!("{e}"));
+    let pid = child.id().to_string();
+    let kill = |sig: &str| {
+        let st = Command::new("kill").args([sig, &pid]).status();
+        assert!(st.is_ok_and(|s| s.success()), "kill {sig}");
+    };
+    let count = || std::fs::read_to_string(&ticks).map_or(0, |t| t.lines().count());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while count() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(count() > 0, "the command did not start");
+    kill("-STOP");
+    // Longer than the silence init tolerates, and past the end time.
+    std::thread::sleep(Duration::from_secs(7));
+    let frozen_at = count();
+    std::thread::sleep(Duration::from_secs(1));
+    let later = count();
+    kill("-CONT");
+    let status = child.wait().unwrap_or_else(|e| panic!("{e}"));
+    let mut err = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut err);
+    }
+    assert_eq!(
+        later, frozen_at,
+        "the command kept running while playpen was stopped: {err}"
+    );
+    assert!(err.contains("the approval ended at"), "{err}");
+    assert!(err.contains("paused"), "{err}");
+    assert_eq!(status.code(), Some(128 + 15), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn fake_tool(name: &str, script: &str) -> PathBuf {
     let dir = tmpdir(name);
     let path = dir.join("tool");
