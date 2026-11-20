@@ -26,8 +26,8 @@ If you used v0.1, these will be different:
 - **A new kernel requirement**: Landlock ABI 9. On older kernels `run`
   does not start; `--without-landlock` runs with the weaker mount-only
   hiding (section 4.1).
-- **Standard streams that are network sockets are refused** (UDP,
-  unconnected or listening TCP).
+- **Standard streams that are network sockets are refused** (UDP and
+  TCP, connected or not).
 - **Ctrl-Z stops the whole sandbox**, and `fg` resumes it. On kernels that
   still allow `TIOCSTI`, the command runs in its own session without a
   controlling terminal (section 4.1, `--new-session`).
@@ -145,10 +145,15 @@ changed: variables such as `DBUS_SESSION_BUS_ADDRESS` or `SSH_AUTH_SOCK`
 still name sockets the command cannot reach.
 
 Standard input, output or error that is a socket is checked first.
-Allowed: Unix sockets, and connected TCP sockets (they reach only their
-peer, which the caller chose). Refused (exit 2, `standard output is ...;
-nothing was run`): UDP and raw IP sockets (they can send to any address),
-unconnected or listening TCP sockets, and sockets of any other family.
+Allowed: Unix sockets. Refused (exit 2, `standard output is ...;
+nothing was run`): every IP socket, that is UDP and raw sockets (they can
+send to any address) and TCP sockets, listening, unconnected or connected
+(a connected one can be disconnected and connected again to any address);
+and sockets of any other family. With `--without-landlock` a Unix socket
+is allowed only when it is a connected stream or sequenced-packet socket
+or a listening one; any other could be connected to a Unix socket of the
+host. The message says to give the command a pipe, a file or a terminal
+instead (`| cat`, `< /dev/null`).
 
 **`--pass FILE`**. Take the approval from a hallpass pass:
 
@@ -489,7 +494,7 @@ Not part of the stable interface, hidden from `--help`:
 - `run --lo-addr ADDR` adds `ADDR` to the sandbox's `lo` before the
   ruleset is loaded. Used by tests and `doctor` to have destinations that
   exist only inside the sandbox.
-- `playpen probe reach|privs|resolve|unix|unix-send|unix-recv-fd|fds|tty|signals|listen` are the checks
+- `playpen probe reach|privs|resolve|unix|unix-send|unix-recv-fd|stdout-reconnect|fds|tty|signals|listen` are the checks
   run inside the sandbox by `doctor` and the tests (`unix` connects to Unix
   sockets and closes at once, writing nothing; `listen` reports
   connections to a TCP listener).

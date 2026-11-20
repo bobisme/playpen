@@ -173,7 +173,7 @@ playpen guards against:
 - side doors to the host's network: host daemons reached through Unix
   sockets anywhere in the file system (refused unless you `--expose`
   them), host abstract sockets, descriptors inherited from the caller, a
-  UDP or unconnected socket as standard input or output, host IPC and
+  network (TCP, UDP) socket as standard input or output, host IPC and
   shared memory, the display server (unless `--display`), and pushing
   input into your terminal for your shell to run later. Each is tested;
   DESIGN.md has the list, with what stays open.

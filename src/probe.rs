@@ -417,3 +417,57 @@ pub fn unix_recv_fd(path: &str, to: SocketAddr) -> Value {
         }
     }
 }
+
+/// `probe stdout-reconnect`: tries to point the socket on standard output
+/// somewhere else.
+///
+/// Dissolves the socket's association (`connect` with `AF_UNSPEC`), then
+/// connects it to `target` (`ADDR:PORT/tcp`, a Unix path, or `@NAME`) and
+/// writes a few bytes. The socket was made by the caller, in the host's
+/// network namespace, so where it can be pointed is outside the filter.
+/// Only for sockets and listeners the caller made for the test.
+#[must_use]
+pub fn stdout_reconnect(target: &str) -> Value {
+    let unspec = libc::sockaddr {
+        sa_family: libc::sa_family_t::try_from(libc::AF_UNSPEC).unwrap_or(0),
+        sa_data: [0; 14],
+    };
+    let len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr>()).unwrap_or(0);
+    // SAFETY: connect(2) reads `len` bytes of a live `sockaddr` on the
+    // stack; descriptor 1 is this process's standard output.
+    let rc = unsafe { libc::connect(1, &raw const unspec, len) };
+    let dissolved = if rc == 0 {
+        Ok(())
+    } else {
+        Err(Errno::last().to_string())
+    };
+    let connected = parse_target(target).map_or_else(
+        |_| {
+            unix_addr(target)
+                .and_then(|addr| connect(1, &addr))
+                .map_err(|e| e.to_string())
+        },
+        |t| {
+            match t.addr {
+                SocketAddr::V4(a) => connect(1, &nix::sys::socket::SockaddrIn::from(a)),
+                SocketAddr::V6(a) => connect(1, &nix::sys::socket::SockaddrIn6::from(a)),
+            }
+            .map_err(|e| e.to_string())
+        },
+    );
+    let wrote = connected.clone().and_then(|()| {
+        nix::sys::socket::send(
+            1,
+            b"playpen-probe",
+            nix::sys::socket::MsgFlags::MSG_NOSIGNAL,
+        )
+        .map(drop)
+        .map_err(|e| e.to_string())
+    });
+    json!({
+        "target": target,
+        "dissolved": outcome(dissolved),
+        "connected": outcome(connected),
+        "wrote": outcome(wrote),
+    })
+}

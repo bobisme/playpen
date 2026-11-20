@@ -47,7 +47,10 @@ fn text(b: &[u8]) -> String {
 // ------------------------------------------------ inherited descriptors
 
 /// Runs `cmd` with `extra` open, without close-on-exec, on descriptors
-/// 50, 51, ...
+/// 500, 501, ... (well above anything the test process itself has open,
+/// also with other tests running in parallel: a source descriptor that was
+/// itself in the target range would be overwritten or keep its
+/// close-on-exec flag).
 fn with_fds(cmd: &mut Command, extra: &[i32]) -> Output {
     let extra = extra.to_vec();
     // SAFETY: dup2 is async-signal-safe and touches only descriptors the
@@ -55,7 +58,7 @@ fn with_fds(cmd: &mut Command, extra: &[i32]) -> Output {
     unsafe {
         cmd.pre_exec(move || {
             for (i, fd) in extra.iter().enumerate() {
-                let target = 50 + i32::try_from(i).unwrap_or(0);
+                let target = 500 + i32::try_from(i).unwrap_or(0);
                 if libc::dup2(*fd, target) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -102,7 +105,7 @@ fn inherited_descriptors_do_not_reach_the_command() {
     // Without playpen the probe sees them: the test itself works.
     let direct = with_fds(Command::new(BIN).args(["probe", "fds"]), &extra);
     let seen = listed_fds(&text(&direct.stdout));
-    for n in 50..56 {
+    for n in 500..506 {
         assert!(seen.contains(&n), "fd {n} not inherited directly: {seen:?}");
     }
     let inside = with_fds(
@@ -141,11 +144,15 @@ fn stdio_sockets_that_reach_the_host_network_are_refused() {
     )
     .unwrap_or_else(|e| panic!("{e}"));
     let listening = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("{e}"));
+    let peer = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("{e}"));
+    let connected_tcp = TcpStream::connect(peer.local_addr().unwrap_or_else(|e| panic!("{e}")))
+        .unwrap_or_else(|e| panic!("{e}"));
     let cases: Vec<(OwnedFd, &str)> = vec![
         (OwnedFd::from(udp), "datagram"),
         (OwnedFd::from(connected_udp), "datagram"),
         (unconnected_tcp, "unconnected TCP"),
         (OwnedFd::from(listening), "listening TCP"),
+        (OwnedFd::from(connected_tcp), "connected TCP"),
     ];
     for (fd, expect) in cases {
         let out = run_with_stdout(fd, Stdio::null());
@@ -167,26 +174,128 @@ fn stdio_sockets_that_reach_the_host_network_are_refused() {
 }
 
 #[test]
-fn connected_tcp_and_unix_stdio_work() {
+fn connected_unix_stdio_works() {
     require_sandbox!();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("{e}"));
-    let client = TcpStream::connect(listener.local_addr().unwrap_or_else(|e| panic!("{e}")))
-        .unwrap_or_else(|e| panic!("{e}"));
-    let (mut server, _) = listener.accept().unwrap_or_else(|e| panic!("{e}"));
-    let out = run_with_stdout(OwnedFd::from(client), Stdio::null());
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-    let mut got = String::new();
-    server
-        .read_to_string(&mut got)
-        .unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(got, "hi\n");
-
     let (a, mut b) = UnixStream::pair().unwrap_or_else(|e| panic!("{e}"));
     let out = run_with_stdout(OwnedFd::from(a), Stdio::null());
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let mut got = String::new();
     b.read_to_string(&mut got).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(got, "hi\n");
+}
+
+/// Runs `probe stdout-reconnect TARGET` in a sandbox with `stdout` as its
+/// standard output; returns playpen's exit status and standard error.
+fn reconnect_stdout(extra: &[&str], stdout: OwnedFd, target: &str) -> (Option<i32>, String) {
+    let out = Command::new(BIN)
+        .args(["run", "--no-network"])
+        .args(extra)
+        .args(["--", BIN, "probe", "stdout-reconnect", target])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|e| panic!("{e}"));
+    (out.status.code(), text(&out.stderr))
+}
+
+/// A socket on standard output was made in the host's network namespace.
+/// The command must not be able to point it at another address: a
+/// connected TCP socket can be dissolved (`connect` with `AF_UNSPEC`) and
+/// connected again to any address the host can reach, past the filter.
+#[test]
+fn a_tcp_socket_on_stdout_cannot_be_pointed_elsewhere() {
+    require_sandbox!();
+    let peer = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("{e}"));
+    // A second service on the host's loopback, which no sandbox reaches.
+    let other = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("{e}"));
+    other
+        .set_nonblocking(true)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let target = format!(
+        "{}/tcp",
+        other.local_addr().unwrap_or_else(|e| panic!("{e}"))
+    );
+    let client = TcpStream::connect(peer.local_addr().unwrap_or_else(|e| panic!("{e}")))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let (code, err) = reconnect_stdout(&[], OwnedFd::from(client), &target);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        other.accept().is_err(),
+        "the command connected its standard output to another host service: {err}"
+    );
+    assert!(!err.contains("\"connected\":\"ALLOWED\""), "{err}");
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("standard output is"), "{err}");
+    assert!(err.contains("nothing was run"), "{err}");
+}
+
+/// A Unix socket on standard output that is not connected yet belongs to
+/// the host's network namespace too, and with it the host's abstract
+/// sockets (a display server, a session bus). The command must not be able
+/// to connect it to one: Landlock's scope refuses that; without Landlock
+/// such a socket is not let in.
+#[test]
+fn a_unix_socket_on_stdout_cannot_reach_host_abstract_sockets() {
+    use nix::sys::socket::{
+        AddressFamily, Backlog, SockFlag, SockType, UnixAddr, bind, listen, socket,
+    };
+    require_sandbox!();
+    let unix = |ty| {
+        socket(
+            AddressFamily::Unix,
+            ty,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let name = format!("playpen-test-stdout-{}", std::process::id());
+    let target = format!("@{name}");
+    let addr = UnixAddr::new_abstract(name.as_bytes()).unwrap_or_else(|e| panic!("{e}"));
+    let mut modes: Vec<&[&str]> = vec![&["--without-landlock"]];
+    if playpen::landlock::resolve_unix_supported() {
+        modes.push(&[]);
+    }
+    for ty in [SockType::Datagram, SockType::Stream] {
+        // A "host daemon" on an abstract address.
+        let daemon = unix(ty);
+        bind(daemon.as_raw_fd(), &addr).unwrap_or_else(|e| panic!("{e}"));
+        if ty == SockType::Stream {
+            listen(&daemon, Backlog::new(4).unwrap_or(Backlog::MAXCONN))
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        for mode in &modes {
+            let (code, err) = reconnect_stdout(mode, unix(ty), &target);
+            let arrived = if ty == SockType::Stream {
+                nix::sys::socket::accept(&daemon).is_ok()
+            } else {
+                let mut buf = [0u8; 32];
+                nix::sys::socket::recv(
+                    daemon.as_raw_fd(),
+                    &mut buf,
+                    nix::sys::socket::MsgFlags::empty(),
+                )
+                .is_ok()
+            };
+            assert!(
+                !arrived,
+                "{ty:?} {mode:?}: the command reached a host abstract socket: {err}"
+            );
+            assert!(
+                !err.contains("\"connected\":\"ALLOWED\""),
+                "{ty:?} {mode:?}: {err}"
+            );
+            if mode.is_empty() {
+                // Let in; Landlock refuses the connection.
+                assert_eq!(code, Some(0), "{ty:?}: {err}");
+            } else {
+                assert_eq!(code, Some(2), "{ty:?}: {err}");
+                assert!(err.contains("standard output is"), "{err}");
+                assert!(err.contains("nothing was run"), "{err}");
+            }
+        }
+    }
 }
 
 // ------------------------------------------------- pseudo-terminal

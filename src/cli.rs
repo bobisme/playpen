@@ -101,6 +101,9 @@ enum ProbeCmd {
     /// Take a descriptor passed over the Unix socket at PATH and send a
     /// datagram to ADDR:PORT through it.
     UnixRecvFd { path: String, to: String },
+    /// Try to point the socket on standard output at TARGET instead;
+    /// the result goes to standard error.
+    StdoutReconnect { target: String },
     /// List the open file descriptors.
     Fds,
     /// Try TIOCSTI on standard input and opening /dev/tty.
@@ -325,6 +328,10 @@ fn probe(what: ProbeCmd) -> i32 {
                 EXIT_ERROR
             }
         },
+        ProbeCmd::StdoutReconnect { target } => {
+            eprintln!("{}", crate::probe::stdout_reconnect(&target));
+            0
+        }
         ProbeCmd::Tty => {
             println!("{}", crate::probe::tty());
             0
@@ -537,7 +544,7 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
         );
     }
     let (exposed, display) = check_exposed(args)?;
-    sandbox::check_stdio()?;
+    sandbox::check_stdio(!args.without_landlock)?;
     Ok(Checked {
         approval,
         hosts,

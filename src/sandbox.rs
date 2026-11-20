@@ -274,15 +274,24 @@ fn blocked_set() -> SigSet {
 /// the command could reach the network outside the filter.
 ///
 /// They come from the caller, so they belong to the host's network
-/// namespace. Allowed: anything that is not a socket; Unix sockets (a connection or
-/// send to another one is refused by Landlock); connected TCP (it reaches
-/// only its peer, which the caller chose). Refused: datagram sockets (UDP
-/// can send to any address even when connected), unconnected or listening
-/// stream sockets, and every other address family.
+/// namespace, and stay there whatever the command does with them. Allowed:
+/// anything that is not a socket, and Unix sockets (connecting one, or
+/// sending by address, to a socket of the host is refused by Landlock, for
+/// pathname and abstract addresses alike). Refused: every IP socket.
+/// A UDP socket can send to any address even when connected; a TCP socket
+/// can be connected to any address, and a connected one too, because
+/// `connect` with `AF_UNSPEC` dissolves the connection first. Every other
+/// address family is refused as well.
+///
+/// Without Landlock (`landlock` false) nothing refuses those connections,
+/// and the host's abstract sockets, which the sandbox's own network
+/// namespace does not have, are reachable through a socket made outside.
+/// Then a Unix socket is let in only if it cannot be pointed anywhere: a
+/// connected stream or sequenced-packet socket, or a listening one.
 ///
 /// # Errors
 /// With a message saying which descriptor and what to do.
-pub fn check_stdio() -> Result<(), String> {
+pub fn check_stdio(landlock: bool) -> Result<(), String> {
     use nix::sys::socket::{SockaddrLike as _, SockaddrStorage, getpeername, getsockname};
     use nix::sys::socket::{getsockopt, sockopt};
     use std::os::fd::AsRawFd as _;
@@ -305,29 +314,36 @@ pub fn check_stdio() -> Result<(), String> {
         let family = getsockname::<SockaddrStorage>(raw)
             .ok()
             .and_then(|a| a.family());
+        let ty = getsockopt(&fd, sockopt::SockType).ok();
+        let listening = getsockopt(&fd, sockopt::AcceptConn).unwrap_or(false);
+        let connected = getpeername::<SockaddrStorage>(raw).is_ok();
         let what = match family {
-            Some(AddressFamily::Unix) => continue,
-            Some(AddressFamily::Inet | AddressFamily::Inet6) => {
-                let ty = getsockopt(&fd, sockopt::SockType).ok();
-                let listening = getsockopt(&fd, sockopt::AcceptConn).unwrap_or(true);
-                let connected = getpeername::<SockaddrStorage>(raw).is_ok();
-                match ty {
-                    Some(SockType::Stream) if connected && !listening => continue,
-                    Some(SockType::Stream) if listening => {
-                        "a listening TCP socket, through which anyone could connect to the command"
-                    }
-                    Some(SockType::Stream) => {
-                        "an unconnected TCP socket, which the command could connect to any address"
-                    }
-                    _ => {
-                        "a datagram or raw IP socket, through which the command could send to any address"
-                    }
+            Some(AddressFamily::Unix) => {
+                let fixed = listening
+                    || (connected && matches!(ty, Some(SockType::Stream | SockType::SeqPacket)));
+                if landlock || fixed {
+                    continue;
                 }
+                "a Unix socket that is not a connected stream, which (with --without-landlock) the command could connect to any Unix socket of the host, abstract ones included"
             }
-            _ => "a socket of a kind playpen does not let through (not Unix, not TCP)",
+            Some(AddressFamily::Inet | AddressFamily::Inet6) => match ty {
+                Some(SockType::Stream) if listening => {
+                    "a listening TCP socket, through which anyone could connect to the command"
+                }
+                Some(SockType::Stream) if connected => {
+                    "a connected TCP socket, which the command could disconnect and connect again to any address"
+                }
+                Some(SockType::Stream) => {
+                    "an unconnected TCP socket, which the command could connect to any address"
+                }
+                _ => {
+                    "a datagram or raw IP socket, through which the command could send to any address"
+                }
+            },
+            _ => "a socket of a kind playpen does not let through (not a Unix socket)",
         };
         return Err(format!(
-            "{name} is {what}, outside the filter: it belongs to the host's network. Give the command a pipe, a file or a terminal instead (for example add `| cat`)"
+            "{name} is {what}, outside the filter: it belongs to the host's network. Give the command a pipe, a file or a terminal instead (for example add `| cat`, or `< /dev/null`)"
         ));
     }
     Ok(())

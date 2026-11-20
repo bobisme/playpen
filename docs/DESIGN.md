@@ -75,7 +75,7 @@ one by one with `--expose`.
 | `sendmsg` to a pathname datagram socket by address (syslog, the journal) | yes, same as above | closed by Landlock (it checks `sendmsg` with an explicit address too) | `a_datagram_sent_by_address_to_a_host_socket_is_refused` (to a datagram socket the test owns: it arrives when sent from the host, not from inside) |
 | Sockets the command creates itself | stay inside | allowed (they are created in the command's own Landlock domain) | runtime directory, Python, and abstract sockets of its own |
 | Inherited descriptors above 2 | yes, if passed on | closed: marked close-on-exec before the sandbox starts | `inherited_descriptors_do_not_reach_the_command` (a file, Unix and TCP sockets, a UDP socket, a listener and a pipe) |
-| Standard input, output, error that are sockets | they are the caller's, in the host's network namespace | UDP, raw, unconnected or listening TCP and other families are refused; connected TCP (reaches only its peer) and Unix sockets are allowed | `stdio_sockets_that_reach_the_host_network_are_refused`, `connected_tcp_and_unix_stdio_work` |
+| Standard input, output, error that are sockets | they are the caller's, in the host's network namespace | every IP socket (UDP, raw, TCP in any state: a connected one can be dissolved and connected elsewhere) and other families are refused; Unix sockets are allowed (Landlock refuses connecting them to host sockets; without Landlock only a connected stream or a listener) | `stdio_sockets_that_reach_the_host_network_are_refused`, `a_tcp_socket_on_stdout_cannot_be_pointed_elsewhere`, `a_unix_socket_on_stdout_cannot_reach_host_abstract_sockets`, `connected_unix_stdio_works` |
 | Descriptors passed with `SCM_RIGHTS` | yes: the peer of an exposed socket or of a Unix socket on stdio can hand the command any descriptor, including a socket in the host's network namespace | open, by design: a peer exists only where the operator exposed one or chose it as stdio | `the_peer_of_an_exposed_socket_can_pass_a_host_network_socket` shows it: a UDP socket passed over an exposed socket sends to the host's loopback; not exposed, the connection is refused and nothing can be passed |
 | `/proc` of host processes | would expose their descriptors and namespaces | closed: PID namespace and a fresh `/proc`; host processes do not exist inside | `host_processes_are_not_visible_in_proc` |
 | System V IPC, POSIX message queues | would reach host processes that cooperate | closed: own IPC namespace, fresh `/dev/mqueue` | `host_ipc_and_shared_memory_are_not_reachable` (a host shared memory segment, a host message queue) |
@@ -167,12 +167,24 @@ paths, and programs fail to connect as they would with the daemon down.
 stderr; every other descriptor is closed at `exec`. A stream that is a
 socket came from the caller's network namespace, outside the filter: a UDP
 socket can send to any address (also when connected), an unconnected TCP
-socket can be connected anywhere, a listening one accepts anyone. Those
-are refused before anything runs. A connected TCP stream reaches only its
-peer, which the caller chose (`playpen ... | nc host port` is the caller's
-own decision), and a Unix socket is covered by Landlock; both are allowed.
-The protocol behind a stream socket is not checked (SCTP one-to-one
-sockets would pass).
+socket can be connected anywhere, a listening one accepts anyone. A
+connected TCP socket is no better: `connect` with an `AF_UNSPEC` address
+dissolves the connection, and the socket, still in the host's network
+namespace, can then be connected to any address the host reaches. (An
+earlier version let connected TCP through as "reaches only its peer"; a
+test now does the reconnect, to a second listener on the host's loopback.)
+So every IP socket is refused before anything runs; `playpen ... | nc host
+port` gives the command a pipe, and the connection stays the caller's.
+
+A Unix socket is let in. With Landlock, connecting it (or sending by
+address) to a pathname socket of the host is refused like any other, and
+to an abstract one by the abstract-socket scope. That scope is the only
+layer there: the socket was made outside, so the abstract names it sees
+are the host's, not the sandbox's. Without Landlock nothing refuses
+either, so `--without-landlock` lets in only a Unix socket that cannot be
+pointed anywhere: a connected stream or sequenced-packet socket, or a
+listening one. A datagram socket, connected or not, and an unconnected
+stream socket are refused in that mode.
 
 **Job control.** The command stays in the terminal's foreground process
 group, as without playpen, so Ctrl-C, Ctrl-\, resizes and reading from the
@@ -413,7 +425,7 @@ matter for safety:
 | Command changes the rules, adds addresses or links, opens raw/packet sockets, joins init's user namespace, reads init's memory | nested user namespace, no capabilities, init non-dumpable | yes, each one, for the command and for a grandchild; and the rules still block after the command ran `nft flush ruleset` |
 | Command joins the host's network namespace | it would need `CAP_SYS_ADMIN` in the host's user namespace; host processes are invisible (PID namespace, fresh `/proc`) | indirectly (no capabilities; `setns` to init's namespace denied) |
 | Inherited sockets from the caller (a host-namespace socket on fd 3+) | every descriptor above 2 is marked close-on-exec before the sandbox starts | yes (file, Unix, TCP, UDP, listener, pipe) |
-| Standard streams that are host-network sockets (UDP, unconnected or listening TCP, other families) | refused before anything runs | yes |
+| Standard streams that are host-network sockets (UDP, TCP in any state, other families; without Landlock also Unix sockets that can still be connected somewhere) | refused before anything runs | yes, with the reconnect attempted from inside |
 | Children and daemons escaping | PID namespace; init's exit kills them all | yes (a background job does not outlive the command) |
 | Host daemons reached over pathname Unix sockets (buses, service managers, container engines, agents, resolvers, syslog, browser automation, sync clients), anywhere in the file system | Landlock `RESOLVE_UNIX`: refused unless exposed; private runtime and X11/ICE/tmux directories; `--expose` brings a path back | yes: every socket under the runtime directory, `/run`, `/var/run`, `/tmp`, `/var/tmp`, `/dev/shm` and the home directory is unreachable; exposed ones are reachable, their siblings not |
 | The same on kernels without Landlock ABI 9 (`--without-landlock`) | mount layer, plus `/dev/null` over every socket under `/run`, `/tmp`, `/var/tmp` at start | yes for those places; the test also shows a home-directory socket stays reachable |
