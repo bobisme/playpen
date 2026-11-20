@@ -1,5 +1,7 @@
 //! Command-line interface.
 
+mod preview;
+
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write as _;
@@ -43,6 +45,8 @@ enum Format {
 enum Cmd {
     /// Run COMMAND with egress limited to a pass's destinations or the --allow ones.
     Run(RunArgs),
+    /// Preview the validated run without starting helpers or writing a report.
+    Plan(RunArgs),
     /// Print the nftables ruleset that would be loaded; sends and creates nothing.
     Rules {
         /// Approved destination: ADDR:PORT/PROTO, ADDR:FROM-TO/PROTO or NET/PREFIX:PORTS/PROTO.
@@ -170,7 +174,10 @@ struct RunArgs {
     /// cannot open /dev/tty.
     #[arg(long)]
     new_session: bool,
-    /// Summary format; json requires --report.
+    /// Require the effective scope to match the digest from playpen plan.
+    #[arg(long, value_name = "SHA256")]
+    expect_plan: Option<hallpass::Digest>,
+    /// Summary format; run JSON requires --report.
     #[arg(long, value_enum, default_value = "text")]
     format: Format,
     /// Write the JSON summary to FILE (for every outcome, refusals included).
@@ -201,6 +208,7 @@ pub fn main() -> i32 {
     };
     match cli.command {
         Cmd::Run(args) => run(&args),
+        Cmd::Plan(args) => preview::print(&args),
         Cmd::Rules {
             allow,
             pass,
@@ -364,6 +372,7 @@ fn probe(what: ProbeCmd) -> i32 {
 
 /// Validated run request.
 struct Checked {
+    new_session: bool,
     approval: Approval,
     hosts: Vec<HostEntry>,
     lo_addrs: Vec<IpAddr>,
@@ -538,14 +547,10 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
     for a in &args.lo_addr {
         lo_addrs.push(parse_literal_addr(a).map_err(|e| format!("--lo-addr {a:?}: {e}"))?);
     }
-    if args.format == Format::Json && args.report.is_none() {
-        return Err(
-            "--format json writes the summary to a file; give it with --report FILE".into(),
-        );
-    }
     let (exposed, display) = check_exposed(args)?;
     sandbox::check_stdio(!args.without_landlock)?;
     Ok(Checked {
+        new_session: new_session(args),
         approval,
         hosts,
         lo_addrs,
@@ -555,12 +560,21 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
     })
 }
 
-struct StderrEvents {
+struct StderrEvents<'a> {
+    args: &'a RunArgs,
     start_line: String,
     until: Option<String>,
 }
 
-impl Events for StderrEvents {
+impl Events for StderrEvents<'_> {
+    fn before_start(&mut self) -> Result<(), String> {
+        if self.args.expect_plan.is_some() {
+            let current = check(self.args)?;
+            preview::match_pin(self.args, &current)?;
+        }
+        Ok(())
+    }
+
     fn starting(&mut self) {
         eprintln!("{}", self.start_line);
     }
@@ -735,6 +749,12 @@ fn write_report(file: Option<&mut File>, report: &Report) {
     reason = "a linear sequence of steps, each mapping to a report field"
 )]
 fn run(args: &RunArgs) -> i32 {
+    if args.format == Format::Json && args.report.is_none() {
+        eprintln!(
+            "playpen: refused: --format json writes the summary to a file; give it with --report FILE"
+        );
+        return EXIT_REFUSED;
+    }
     let mut report = base_report(args);
     let mut report_file = match &args.report {
         Some(p) => match File::create(p) {
@@ -749,7 +769,10 @@ fn run(args: &RunArgs) -> i32 {
         },
         None => None,
     };
-    let checked = match check(args) {
+    let checked = match check(args).and_then(|c| {
+        preview::match_pin(args, &c)?;
+        Ok(c)
+    }) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("playpen: refused: {e}");
@@ -804,12 +827,14 @@ fn run(args: &RunArgs) -> i32 {
         .iter()
         .map(|p| p.display().to_string())
         .collect();
+    report.new_session = checked.new_session;
     let mut events = StderrEvents {
+        args,
         start_line: start_line(
             &checked,
             !args.no_network,
             !args.without_landlock,
-            new_session(args),
+            checked.new_session,
         ),
         until: report.until.clone(),
     };
@@ -821,7 +846,7 @@ fn run(args: &RunArgs) -> i32 {
         hide: args.hide.clone(),
         exposed: checked.exposed,
         landlock: !args.without_landlock,
-        new_session: new_session(args),
+        new_session: checked.new_session,
         command: args.command.clone(),
         nft,
         pasta,

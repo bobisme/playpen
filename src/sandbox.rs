@@ -160,6 +160,13 @@ impl std::fmt::Display for RunError {
 
 /// Things P reports while the command runs.
 pub trait Events {
+    /// Validate any caller-supplied scope pin immediately before releasing the child.
+    ///
+    /// # Errors
+    /// A changed or withdrawn scope prevents launch.
+    fn before_start(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     /// The sandbox is ready and the command is about to start.
     fn starting(&mut self);
     /// The approval ended; the command is being stopped.
@@ -737,6 +744,7 @@ fn parent(
             }
         }
     }
+    let withdrawn = withdrawn.or_else(|| events.before_start().err());
     if let Some(why) = withdrawn {
         drop(down_w);
         let _ = waitpid(child, None);

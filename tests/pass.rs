@@ -770,3 +770,46 @@ fn a_pass_that_limits_names_is_enforced_by_address_only_and_playpen_says_so() {
     let (_, out) = reach(&["--pass", s(&plain)], &["192.0.2.1:9101/tcp"]);
     assert!(!text(&out.stderr).contains("NOTE"));
 }
+
+#[test]
+fn preview_refuses_a_revoked_pass() {
+    let dir = tmpdir("preview-revoked");
+    let path = new_pass(&dir, &pass_text(&hours(-1), &hours(1), true, &[WEB]));
+    let result = Command::new(BIN)
+        .args(["plan", "--format", "json", "--pass"])
+        .arg(path)
+        .args(["--", "true"])
+        .output()
+        .expect("preview");
+    assert_eq!(result.status.code(), Some(2));
+    assert_eq!(result.stdout, [] as [u8; 0]);
+    assert!(text(&result.stderr).contains("revoked"));
+}
+
+#[test]
+fn pin_refuses_an_edit_even_when_grants_are_identical() {
+    let dir = tmpdir("pin-edited");
+    let contents = valid_pass(&[WEB]);
+    let path = new_pass(&dir, &contents);
+    let result = Command::new(BIN)
+        .args(["plan", "--format", "json", "--pass"])
+        .arg(&path)
+        .args(["--", "true"])
+        .output()
+        .expect("plan");
+    let value: serde_json::Value = serde_json::from_slice(&result.stdout).expect("plan JSON");
+    write_pass(&path, &format!("{contents}\n# edit\n"));
+    let out = Command::new(BIN)
+        .args([
+            "run",
+            "--expect-plan",
+            value["digest"].as_str().expect("digest"),
+            "--pass",
+        ])
+        .arg(path)
+        .args(["--", "true"])
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(text(&out.stderr).contains("differs from current scope"));
+}

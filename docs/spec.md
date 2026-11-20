@@ -411,6 +411,27 @@ holds its status), `"refused"` or `"not_started"` when nothing ran,
 `"error"` when playpen failed after starting it. Messages for the
 not-run cases always contain `nothing was run`.
 
+### Previewing a run
+
+`playpen plan --no-network -- printf hello` describes the command and its
+effective settings. Use `--format json` for the versioned `plan` object.
+For example, its `network` field is `"none"` for this invocation. Preview
+uses the same validation as run, reads the current pass and resolves socket
+exposures. It leaves the report path untouched. Availability of helpers,
+namespace setup and installation of the filter are determined at launch.
+Command arguments and paths use JSON strings for UTF-8 and an object with a
+`unix_bytes` array for other byte sequences. Grant order is canonical; host
+mapping and argument order are preserved.
+
+The top-level `digest` is SHA-256 of the compact JSON encoding of the v1
+plan (object keys in lexical order). Give it to `run --expect-plan DIGEST`
+to require the same effective settings, working directory, argument bytes,
+and original pass bytes. Playpen compares at validation and again before it
+releases the workload. Normal expiry and revocation checks apply throughout.
+The digest describes configuration. Program and filesystem contents, the
+environment inherited by the child, and later pass edits have their own
+lifetimes.
+
 ### 4.3 `playpen rules`
 
 ```text
@@ -693,6 +714,12 @@ server (unless `--display`) or the terminal's input queue.
 
 Not guarded against, or known limits:
 
+- host-specific non-IP transports, including AF_VSOCK. The nft table filters
+  IPv4 and IPv6, and Landlock separately guards pathname Unix sockets. Playpen
+  checks inherited descriptors but does not impose a family allowlist on new
+  sockets. VM socket isolation depends on the kernel, transport and namespace
+  mode. A missing VSOCK sysctl establishes no general isolation guarantee.
+  See the [kernel VSOCK namespace documentation](https://docs.kernel.org/admin-guide/sysctl/net.html#ns-mode);
 - kernel exploits; bugs in nftables, pasta or Landlock;
 - processes started outside playpen;
 - what the daemon behind an exposed socket (`--expose`, `--display`) does
@@ -724,4 +751,12 @@ DESIGN.md has the full list with the reasons.
 
 ## 9. Not yet built (planned)
 
-- **planned:** approving ICMP echo to specific addresses.
+ICMP echo approval is deferred. The CLI and the pinned Hallpass format
+represent TCP and UDP destinations with port ranges. Echo would need an
+explicit operation in both formats. A future approval would cover outbound
+echo requests to one literal IPv4 or IPv6 destination and corresponding
+replies. Other message types and existing rules for neighbour discovery and
+related errors keep their own semantics. Denied requests must still be counted.
+Before enabling it, use namespace-local fixtures to demonstrate both families,
+a permitted reply, denial of an unlisted peer, and unchanged behavior for a
+pass without an echo grant.

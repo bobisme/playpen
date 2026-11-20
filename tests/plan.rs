@@ -1,0 +1,70 @@
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt as _;
+use std::process::Command;
+
+use serde_json::Value;
+
+const BIN: &str = env!("CARGO_BIN_EXE_playpen");
+
+#[test]
+fn preview_is_deterministic_and_has_no_run_side_effects() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let marker = dir.join(format!("plan-child-{}", std::process::id()));
+    let report = dir.join(format!("plan-report-{}", std::process::id()));
+    let preview = |rules: &[&str]| {
+        let mut cmd = Command::new(BIN);
+        cmd.args(["plan", "--format", "json", "--report"])
+            .arg(&report);
+        for rule in rules {
+            cmd.args(["--allow", rule]);
+        }
+        let out = cmd
+            .args(["--", "touch"])
+            .arg(&marker)
+            .arg(OsStr::from_bytes(b"\xff"))
+            .output()
+            .expect("plan");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<Value>(&out.stdout).expect("plan JSON")
+    };
+    let a = "192.0.2.1:443/tcp";
+    let b = "[2001:db8::1]:53/udp";
+    let p = preview(&[a, b]);
+    assert_eq!(p, preview(&[b, a]));
+    assert_eq!(p["plan"]["command"][2]["unix_bytes"][0], 255);
+    assert!(!marker.exists());
+    assert!(!report.exists());
+    let refused = Command::new(BIN)
+        .args(["plan", "--allow", "invalid", "--", "true"])
+        .output()
+        .expect("refused plan");
+    assert_eq!(refused.status.code(), Some(2));
+}
+
+#[test]
+fn pin_is_bound_to_command_and_grants_before_start() {
+    let base = ["--allow", "192.0.2.1:443/tcp", "--", "true"];
+    let plan = Command::new(BIN)
+        .args(["plan", "--format", "json"])
+        .args(base)
+        .output()
+        .expect("plan");
+    let p: Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
+    let digest = p["digest"].as_str().expect("digest");
+    for changed in [
+        ["--allow", "192.0.2.1:444/tcp", "--", "true"],
+        ["--allow", "192.0.2.1:443/tcp", "--", "false"],
+    ] {
+        let result = Command::new(BIN)
+            .args(["run", "--expect-plan", digest])
+            .args(changed)
+            .output()
+            .expect("pinned run");
+        assert_eq!(result.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&result.stderr).contains("differs from current scope"));
+    }
+}

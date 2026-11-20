@@ -152,6 +152,18 @@ For scripts, `--report FILE` writes a JSON summary (for refusals too), and
 that exited with status 2 (`"ran"`, `exit_code: 2`) apart from playpen
 refusing to start it (`"refused"`).
 
+### Review a command before launch
+
+```sh
+playpen plan --no-network -- printf hello
+digest=$(playpen plan --format json --no-network -- printf hello | jq -er .digest)
+playpen run --expect-plan "$digest" --no-network -- printf hello
+```
+
+The digest binds the reviewed arguments and effective settings, including
+the pass bytes when present. The command reads executable and file contents
+at run time.
+
 ## Requirements
 
 - Linux with unprivileged user namespaces enabled (the default on most
@@ -168,6 +180,11 @@ refusing to start it (`"refused"`).
 Build with a stable Rust toolchain: `cargo build --release`. Run the tests
 with `cargo test`; they need the same requirements and send nothing to any
 other host.
+
+Rootless Podman workloads that require a nested mount setup or subordinate
+UID/GID mappings are outside the supported configuration. Playpen runs the
+command with no new privileges and applies Landlock by default. Use the
+guarded offline invocation above to check ordinary command support.
 
 ## Threat model
 
@@ -192,6 +209,9 @@ playpen guards against:
 
 playpen does not guard against:
 
+- non-IP transports provided by the host or hypervisor. In particular,
+  VM sockets (AF_VSOCK) have their own namespace rules and fall outside
+  playpen's IP filter and drop counts;
 - a kernel exploit, or a bug in nftables, pasta or Landlock;
 - processes started outside playpen;
 - whatever the daemon behind a socket you exposed does for the command;
