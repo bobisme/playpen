@@ -1,6 +1,6 @@
 # playpen
 
-![A lone cloaked figure faces a narrow stone causeway leading to the only illuminated gate in a vast wall.](docs/images/playpen.webp)
+![Seen from above, a cloaked lighthouse keeper directs a single beam across dark waves toward a lone sailing ship.](docs/images/shuttered-lantern.webp)
 
 playpen runs a command (a scanner, a proxy, a browser, a shell) so that its
 network traffic can reach only the literal addresses, ports and protocols you
