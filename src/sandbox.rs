@@ -478,7 +478,7 @@ fn run_sandbox(plan: &Plan, events: &mut dyn Events) -> Result<RunResult, RunErr
         gid: getgid(),
         parent: getpid(),
     };
-    let ruleset_text = ruleset::render(&plan.approval.rules);
+    let ruleset_text = ruleset::render_approval(&plan.approval);
     let files = SandboxFiles::build(plan);
 
     match fork_checked().map_err(not_started)? {
@@ -958,7 +958,7 @@ fn stage_c(
             .map_err(|e| format!("cannot add {addr} to lo: {e}"))?;
     }
     load_ruleset(&plan.nft, ruleset_text)?;
-    verify_ruleset(&plan.nft, plan.approval.rules.len())?;
+    verify_ruleset(&plan.nft, plan.approval.rules().len())?;
     write_line(up_w, "ready");
 
     let mut go = [0u8; 1];

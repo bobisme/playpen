@@ -5,6 +5,9 @@ edition = "2024"
 license = "MIT"
 description = "Run any command with its network egress limited to the literal addresses you approved"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }

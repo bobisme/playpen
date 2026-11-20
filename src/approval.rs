@@ -5,6 +5,7 @@
 //! pass (`--pass`, see [`crate::pass`]). Both sources produce the same typed
 //! values, and nothing downstream sees text a user typed.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -165,14 +166,7 @@ impl Net {
     /// rule as hallpass's `Network::is_network_or_broadcast`.
     #[must_use]
     pub fn edges(self) -> Option<[Ipv4Addr; 2]> {
-        match self.addr {
-            IpAddr::V4(a) if self.prefix <= 30 => {
-                let first = u32::from(a);
-                let host_bits = u32::MAX.checked_shr(u32::from(self.prefix)).unwrap_or(0);
-                Some([Ipv4Addr::from(first), Ipv4Addr::from(first | host_bits)])
-            }
-            _ => None,
-        }
+        ipv4_edges(self.addr, self.prefix)
     }
 
     /// Whether the two networks share at least one address.
@@ -256,6 +250,18 @@ fn mask_host_bits(addr: IpAddr, prefix: u8) -> IpAddr {
     }
 }
 
+// Used by both Playpen networks and already-validated Hallpass networks.
+pub(crate) fn ipv4_edges(addr: IpAddr, prefix: u8) -> Option<[Ipv4Addr; 2]> {
+    match addr {
+        IpAddr::V4(a) if prefix <= 30 => {
+            let first = u32::from(a);
+            let host_bits = u32::MAX.checked_shr(u32::from(prefix)).unwrap_or(0);
+            Some([a, Ipv4Addr::from(first | host_bits)])
+        }
+        _ => None,
+    }
+}
+
 /// One approved destination: a network, a port range and a protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AllowRule {
@@ -286,18 +292,23 @@ impl AllowRule {
 /// rule's own ports and protocol only.
 #[must_use]
 pub fn excluded_addrs(rules: &[AllowRule], rule: &AllowRule) -> Vec<Ipv4Addr> {
-    if rule.net.is_single() {
-        return Vec::new();
-    }
-    let mut out: Vec<Ipv4Addr> = rules
+    let edges: BTreeSet<_> = rules
         .iter()
         .filter_map(|r| r.net.edges())
         .flatten()
-        .filter(|a| rule.net.contains(IpAddr::V4(*a)))
         .collect();
-    out.sort_unstable();
-    out.dedup();
-    out
+    excluded_for(&edges, rule)
+}
+
+fn excluded_for(edges: &BTreeSet<Ipv4Addr>, rule: &AllowRule) -> Vec<Ipv4Addr> {
+    if rule.net.is_single() || rule.net.addr().is_ipv6() {
+        return Vec::new();
+    }
+    edges
+        .iter()
+        .copied()
+        .filter(|a| rule.net.contains(IpAddr::V4(*a)))
+        .collect()
 }
 
 impl fmt::Display for AllowRule {
@@ -544,12 +555,46 @@ impl EndsAt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Approval {
     /// Approved destinations. Empty means nothing may be reached.
-    pub rules: Vec<AllowRule>,
+    rules: Vec<AllowRule>,
     /// When the approval ends; `None` means no time limit was given.
     pub ends_at: Option<EndsAt>,
+    edge_addresses: BTreeSet<Ipv4Addr>,
 }
 
 impl Approval {
+    /// Approval from a complete list of literal allow rules.
+    #[must_use]
+    pub fn new(rules: Vec<AllowRule>, ends_at: Option<EndsAt>) -> Self {
+        let edge_addresses = rules
+            .iter()
+            .filter_map(|r| r.net.edges())
+            .flatten()
+            .collect();
+        Self::with_edge_scope(rules, ends_at, edge_addresses)
+    }
+
+    pub(crate) const fn with_edge_scope(
+        rules: Vec<AllowRule>,
+        ends_at: Option<EndsAt>,
+        edge_addresses: BTreeSet<Ipv4Addr>,
+    ) -> Self {
+        Self {
+            rules,
+            ends_at,
+            edge_addresses,
+        }
+    }
+
+    /// Rules in source order.
+    #[must_use]
+    pub fn rules(&self) -> &[AllowRule] {
+        &self.rules
+    }
+
+    pub(crate) fn exclusions(&self, rule: &AllowRule) -> Vec<Ipv4Addr> {
+        excluded_for(&self.edge_addresses, rule)
+    }
+
     /// Checks that the approval is still in force at `now`.
     ///
     /// # Errors
@@ -567,18 +612,28 @@ impl Approval {
         Ok(())
     }
 
-    /// Whether some rule lets traffic to `ip` through (any port, any
-    /// protocol): a rule for exactly this address, or a network rule that
-    /// holds it, unless it is the network or broadcast address of a listed
-    /// network (see [`excluded_addrs`]).
+    fn rule_covers_addr(&self, rule: &AllowRule, ip: IpAddr) -> bool {
+        rule.covers_addr(ip)
+            && (rule.net.is_single()
+                || match ip {
+                    IpAddr::V4(addr) => !self.edge_addresses.contains(&addr),
+                    IpAddr::V6(_) => true,
+                })
+    }
+
+    /// Whether some rule lets traffic to `ip` through on any port and protocol.
     #[must_use]
     pub fn covers_addr(&self, ip: IpAddr) -> bool {
-        self.rules.iter().any(|r| {
-            r.covers_addr(ip)
-                && !excluded_addrs(&self.rules, r)
-                    .iter()
-                    .any(|a| IpAddr::V4(*a) == ip)
-        })
+        self.rules.iter().any(|r| self.rule_covers_addr(r, ip))
+    }
+
+    /// Whether an explicit grant admits this destination tuple. The caller
+    /// handles sandbox exceptions such as established traffic and loopback.
+    #[must_use]
+    pub fn permits_packet(&self, ip: IpAddr, proto: Proto, port: u16) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.proto == proto && r.ports.contains(port) && self.rule_covers_addr(r, ip))
     }
 
     /// For an address inside a listed network that [`Self::covers_addr`]
@@ -739,10 +794,7 @@ mod tests {
     fn network_and_broadcast_addresses_are_not_covered() {
         let v4 = |s: &str| s.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::UNSPECIFIED);
         let ip = |s: &str| IpAddr::V4(v4(s));
-        let approval = |specs: &[&str]| Approval {
-            rules: specs.iter().map(|s| ok(s)).collect(),
-            ends_at: None,
-        };
+        let approval = |specs: &[&str]| Approval::new(specs.iter().map(|s| ok(s)).collect(), None);
         let none: [Ipv4Addr; 0] = [];
         let a = approval(&["198.51.100.0/24:80/tcp"]);
         assert!(a.covers_addr(ip("198.51.100.1")));
@@ -800,10 +852,7 @@ mod tests {
         let end = EndsAt::parse("2026-11-18T23:00:00+01:00");
         let Ok(end) = end else { panic!("should parse") };
         assert_eq!(end.to_rfc3339(), "2026-11-18T22:00:00Z");
-        let approval = Approval {
-            rules: vec![],
-            ends_at: Some(end),
-        };
+        let approval = Approval::new(vec![], Some(end));
         let before = time::macros::datetime!(2026-11-18 21:59:59 UTC);
         let at = time::macros::datetime!(2026-11-18 22:00:00 UTC);
         assert!(approval.check_active(before).is_ok());
@@ -811,10 +860,7 @@ mod tests {
             panic!("should be refused")
         };
         assert!(e.to_string().contains("nothing was run"));
-        let open = Approval {
-            rules: vec![],
-            ends_at: None,
-        };
+        let open = Approval::new(vec![], None);
         assert!(open.check_active(at).is_ok());
     }
 
@@ -861,3 +907,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(kani)]
+#[path = "approval_proofs.rs"]
+mod proofs;

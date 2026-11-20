@@ -243,36 +243,36 @@ fn rules(allow: &[String], pass_file: Option<&Path>, only: &[String], format: Fo
         eprintln!("playpen: refused: {e}");
         EXIT_REFUSED
     };
-    let mut parsed = Vec::new();
-    let mut from_pass = None;
-    if let Some(path) = pass_file {
+    let (approval, identity) = if let Some(path) = pass_file {
         if !allow.is_empty() {
             return refuse(PASS_AND_ALLOW);
         }
         match pass::load(path, only, OffsetDateTime::now_utc()) {
-            Ok(p) => {
-                parsed.clone_from(&p.approval.rules);
-                from_pass = Some(p);
-            }
+            Ok(p) => (p.approval, Some(p.identity)),
             Err(e) => return refuse(&e),
         }
-    } else if !only.is_empty() {
-        return refuse(ONLY_WITHOUT_PASS);
-    }
-    for spec in allow {
-        match parse_allow(spec) {
-            Ok(r) => parsed.push(r),
-            Err(e) => return refuse(&e.to_string()),
+    } else {
+        if !only.is_empty() {
+            return refuse(ONLY_WITHOUT_PASS);
         }
-    }
-    let text = crate::ruleset::render(&parsed);
+        let parsed = match allow
+            .iter()
+            .map(|spec| parse_allow(spec))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(parsed) => parsed,
+            Err(e) => return refuse(&e.to_string()),
+        };
+        (Approval::new(parsed, None), None)
+    };
+    let text = crate::ruleset::render_approval(&approval);
     match format {
         Format::Text => print!("{text}"),
         Format::Json => println!(
             "{}",
             serde_json::json!({
-                "allowed": parsed.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                "pass": from_pass.as_ref().map(|p| pass_report(&p.identity)),
+                "allowed": approval.rules().iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "pass": identity.as_ref().map(pass_report),
                 "ruleset": text,
             })
         ),
@@ -550,7 +550,7 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
             .map(EndsAt::parse)
             .transpose()
             .map_err(|e| e.to_string())?;
-        Approval { rules, ends_at }
+        Approval::new(rules, ends_at)
     };
     approval.check_active(now).map_err(|e| e.to_string())?;
     let mut hosts = Vec::new();
@@ -673,7 +673,7 @@ fn start_line_net(c: &Checked, network: bool) -> String {
         format!("no DNS, names {}", list.join(", "))
     };
     if network {
-        let list: Vec<String> = c.approval.rules.iter().map(ToString::to_string).collect();
+        let list: Vec<String> = c.approval.rules().iter().map(ToString::to_string).collect();
         let (under, hint) = c.from_pass.as_ref().map_or_else(Default::default, |p| {
             (
                 format!("under {}: ", pass::describe(&p.identity)),
@@ -814,7 +814,7 @@ fn run(args: &RunArgs) -> i32 {
     };
     report.allowed = checked
         .approval
-        .rules
+        .rules()
         .iter()
         .map(ToString::to_string)
         .collect();

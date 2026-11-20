@@ -190,7 +190,10 @@ instead (`| cat`, `< /dev/null`).
 
 **`--only LABEL`** (repeatable, needs `--pass`). Use only the destinations
 with these labels (in file order, whatever the order of the options). A
-label the pass does not have is refused, listing the labels it has.
+label the pass does not have is refused, listing the labels it has. Network
+and broadcast exclusions come from the complete pass. An unselected
+destination can exclude an address from a selected network rule. A
+single-address rule grants its own ports and protocol only when selected.
 `--only` without `--pass` is refused.
 
 **While the command runs, with `--pass`**, the supervisor re-reads the
@@ -207,7 +210,9 @@ whole PID namespace), and prints why, when the pass:
 - has a different `id` or `approval.owner` than at start;
 - no longer has a destination in use (by label), or a destination in use
   now converts to different allow rules (address, network, protocol or
-  ports changed, narrowed or widened).
+  ports changed, narrowed or widened);
+- adds a network or broadcast exclusion inside a network rule already in
+  use, including through an unselected destination.
 
 Any other edit (a raised or lowered ceiling, a later `valid_until`, a new
 destination, a changed `hostname`, `name`, `reference`, comment, or a
@@ -649,14 +654,28 @@ In this order:
    listed network of /30 or broader (`ip daddr NET ip daddr != { ... }`):
    they are not hosts, and a packet to the all-ones address may reach every
    host on the network. They fall through to 6 like any other unapproved
-   destination. An address listed on its own (`203.0.113.255:443/tcp`) is a
+   destination. For a pass, the listed networks used for these exclusions
+   include unselected destinations. An address listed on its own (`203.0.113.255:443/tcp`) is a
    host and is accepted on that rule's ports and protocol. /31 and /32 and
-   IPv6 networks have no such addresses. hallpass refuses the same
-   addresses (`network-or-broadcast`);
+   IPv6 networks have no such addresses. Hallpass also refuses an edge
+   address (`network-or-broadcast`) unless the full pass lists it as a
+   single host;
 6. everything else: added to a per-destination set with a counter
    (address, protocol, port; port 0 for protocols other than TCP and UDP),
    counted in the `dropped` counter, and rejected with ICMP
    administratively prohibited.
+
+The finite packet-scope regression builds 255 valid full passes from an
+eight-destination universe and checks all 6,305 nonempty full-pass/subset
+pairs. It exercises every address inside the fixture's IPv4 and native
+IPv6 networks, adjacent outside representatives, both transports, and
+port values 1–8, 441–447 and 65533–65535. These sample both sides of each
+port boundary and all intervening partitions. CLI omission of `--only`
+selects the full pass. The empty mathematical selection is checked as an
+empty approval. The comparison evaluates explicit grants at a fixed valid
+time. It excludes the fixed sandbox exceptions above and application
+fields such as host names and request budgets. IPv6 transition forms are
+outside this finite check.
 
 So by default:
 

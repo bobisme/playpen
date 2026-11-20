@@ -10,7 +10,7 @@ use std::net::IpAddr;
 
 use serde::Serialize;
 
-use crate::approval::{AllowRule, Proto, excluded_addrs};
+use crate::approval::{AllowRule, Approval, Proto};
 
 /// Name of the nftables table playpen loads.
 pub const TABLE: &str = "playpen";
@@ -25,10 +25,16 @@ pub const DROP_SET_SIZE: u32 = 1024;
 /// Everything else is counted (in total and per destination) and rejected,
 /// so a blocked connection fails at once instead of hanging. A rule for an
 /// IPv4 network does not accept the network and broadcast addresses of any
-/// listed network (see [`excluded_addrs`]); they are counted and rejected
+/// listed network (see [`Approval::covers_addr`]); they are counted and rejected
 /// like any other unapproved destination.
 #[must_use]
 pub fn render(rules: &[AllowRule]) -> String {
+    render_approval(&Approval::new(rules.to_vec(), None))
+}
+
+/// Renders an approval with the edge exclusions inherited from its source.
+#[must_use]
+pub fn render_approval(approval: &Approval) -> String {
     let mut out = String::new();
     // A table of our own; flush it first so a reload replaces it whole.
     let _ = writeln!(out, "table inet {TABLE} {{}}");
@@ -65,11 +71,11 @@ pub fn render(rules: &[AllowRule]) -> String {
         out,
         "\t\tip6 daddr ff02::/16 icmpv6 type {{ mld-listener-report, mld2-listener-report, nd-router-solicit }} drop"
     );
-    for rule in rules {
+    for rule in approval.rules() {
         let _ = writeln!(
             out,
             "\t\t{} accept",
-            match_expr(rule, &excluded_addrs(rules, rule))
+            match_expr(rule, &approval.exclusions(rule))
         );
     }
     let _ = writeln!(
@@ -325,8 +331,9 @@ fn parse_elem(elem: &serde_json::Value, family: &str) -> Option<DroppedDest> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approval::parse_allow;
+    use crate::approval::{Net, Ports, parse_allow};
     use proptest::prelude::*;
+    use std::net::Ipv4Addr;
 
     fn rules(specs: &[&str]) -> Vec<AllowRule> {
         specs
@@ -377,55 +384,127 @@ mod tests {
         }
     }
 
-    /// Every rendered allow line has exactly the fixed shape, whatever the
-    /// (valid) input.
-    fn allow_line_is_well_formed(line: &str) -> bool {
-        let mut words: Vec<&str> = line.trim().split(' ').collect();
-        // The optional exclusion of network and broadcast addresses:
-        // `ip daddr != { A, B, ... }` after the network.
-        if words.get(3..6) == Some(&["ip", "daddr", "!="]) {
-            let Some(close) = words.iter().position(|w| *w == "}") else {
-                return false;
-            };
-            let listed = words.get(7..close).unwrap_or_default();
-            let ok = words[0] == "ip"
-                && words[6] == "{"
-                && !listed.is_empty()
-                && listed.iter().enumerate().all(|(i, w)| {
-                    let last = i + 1 == listed.len();
-                    let addr = if last { Some(*w) } else { w.strip_suffix(',') };
-                    addr.is_some_and(|a| a.parse::<std::net::Ipv4Addr>().is_ok())
-                });
-            if !ok {
-                return false;
+    fn generated_rule() -> impl Strategy<Value = AllowRule> {
+        (
+            any::<bool>(),
+            any::<bool>(),
+            0_u8..6,
+            any::<u32>(),
+            1_u16..=u16::MAX,
+            1_u16..=u16::MAX,
+            any::<bool>(),
+        )
+            .prop_map(|(v6, udp, depth, bits, a, b, single_port)| {
+                let host_bits = [8, 7, 4, 2, 1, 0][usize::from(depth)];
+                let host = ((bits & 255) >> host_bits << host_bits).to_le_bytes()[0];
+                let (addr, prefix) = if v6 {
+                    (
+                        IpAddr::from((0x2001_0db8_u128 << 96 | u128::from(host)).to_be_bytes()),
+                        128 - host_bits,
+                    )
+                } else {
+                    (IpAddr::from([192, 0, 2, host]), 32 - host_bits)
+                };
+                AllowRule {
+                    net: Net::new(addr, prefix).expect("canonical documentation network"),
+                    ports: Ports::new(a.min(b), if single_port { a.min(b) } else { a.max(b) })
+                        .expect("ordered nonzero ports"),
+                    proto: if udp { Proto::Udp } else { Proto::Tcp },
+                }
+            })
+    }
+
+    fn ipv4_span(rule: &AllowRule) -> Option<(u32, u32)> {
+        let IpAddr::V4(addr) = rule.net.addr() else {
+            return None;
+        };
+        let start = u32::from(addr);
+        // All generated and deterministic IPv4 networks are within a /24.
+        Some((start, start + (1 << (32 - rule.net.prefix())) - 1))
+    }
+
+    fn expected_grant(rule: &AllowRule, rules: &[AllowRule]) -> String {
+        let (family, width) = match rule.net.addr() {
+            IpAddr::V4(_) => ("ip", 32),
+            IpAddr::V6(_) => ("ip6", 128),
+        };
+        let addr = rule.net.addr();
+        let prefix = rule.net.prefix();
+        let network = if prefix == width {
+            addr.to_string()
+        } else {
+            format!("{addr}/{prefix}")
+        };
+        let mut exclusion = String::new();
+        if let Some((start, end)) = ipv4_span(rule)
+            && start < end
+        {
+            let edges: std::collections::BTreeSet<_> = rules
+                .iter()
+                .filter_map(ipv4_span)
+                .filter(|(a, b)| b - a >= 3)
+                .flat_map(<[u32; 2]>::from)
+                .filter(|edge| (start..=end).contains(edge))
+                .collect();
+            let list: Vec<_> = edges
+                .into_iter()
+                .map(|ip| Ipv4Addr::from(ip).to_string())
+                .collect();
+            if !list.is_empty() {
+                exclusion = format!(" ip daddr != {{ {} }}", list.join(", "));
             }
-            words.drain(3..=close);
         }
-        words.len() == 6
-            && matches!(words[0], "ip" | "ip6")
-            && words[1] == "daddr"
-            && words[2]
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() || b".:/".contains(&b))
-            && matches!(words[3], "tcp" | "udp")
-            && words[4] == "dport"
-            && words[5].bytes().all(|b| b.is_ascii_digit() || b == b'-')
+        let proto = match rule.proto {
+            Proto::Tcp => "tcp",
+            Proto::Udp => "udp",
+        };
+        let first = rule.ports.first();
+        let last = rule.ports.last();
+        let port = if first == last {
+            first.to_string()
+        } else {
+            format!("{first}-{last}")
+        };
+        format!("\t\t{family} daddr {network}{exclusion} {proto} dport {port} accept")
+    }
+
+    fn check_rendered_grants(rules: &[AllowRule]) -> Result<(), TestCaseError> {
+        let actual = render(rules);
+        let baseline = render(&[]);
+        let insertion = baseline
+            .find("\t\tmeta nfproto ipv4")
+            .expect("output accounting marker");
+        let (before, after) = baseline.split_at(insertion);
+        let expected: String = rules
+            .iter()
+            .map(|rule| expected_grant(rule, rules) + "\n")
+            .collect();
+        prop_assert_eq!(
+            actual
+                .strip_prefix(before)
+                .and_then(|text| text.strip_suffix(after)),
+            Some(expected.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn renders_both_families_protocols_and_nested_networks() {
+        let rules = rules(&[
+            "192.0.2.0/24:1/tcp",
+            "192.0.2.8/30:2-3/udp",
+            "192.0.2.9:65535/tcp",
+            "[2001:db8::/120]:1/udp",
+            "[2001:db8::8/126]:2-3/tcp",
+            "[2001:db8::9]:65534-65535/udp",
+        ]);
+        check_rendered_grants(&rules).expect("both families, nesting, protocols and port shapes");
     }
 
     proptest! {
         #[test]
-        fn rendered_rules_have_a_fixed_shape(specs in proptest::collection::vec("[0-9a-f:./\\[\\]-]{1,24}/(tcp|udp)", 0..8)) {
-            let parsed: Vec<AllowRule> = specs.iter().filter_map(|s| parse_allow(s).ok()).collect();
-            let text = render(&parsed);
-            let fixed = render(&[]);
-            let fixed_lines: Vec<&str> = fixed.lines().collect();
-            let extra: Vec<&str> = text.lines().filter(|l| !fixed_lines.contains(l)).collect();
-            prop_assert_eq!(extra.len(), parsed.len());
-            for line in extra {
-                let body = line.trim().strip_suffix(" accept").unwrap_or("");
-                prop_assert!(allow_line_is_well_formed(body), "bad line {:?}", line);
-            }
-            prop_assert_eq!(text.matches(';').count(), 6);
+        fn rendered_rules_have_a_fixed_shape(rules in proptest::collection::vec(generated_rule(), 1..8)) {
+            check_rendered_grants(&rules)?;
         }
     }
 

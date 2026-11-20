@@ -147,10 +147,10 @@ mod tests {
 
     #[test]
     fn hosts_must_be_approved() {
-        let approval = Approval {
-            rules: vec![parse_allow("192.0.2.0/24:443/tcp").unwrap_or_else(|e| panic!("{e}"))],
-            ends_at: None,
-        };
+        let approval = Approval::new(
+            vec![parse_allow("192.0.2.0/24:443/tcp").unwrap_or_else(|e| panic!("{e}"))],
+            None,
+        );
         let ok = parse_host("a.test=192.0.2.10").unwrap_or_else(|e| panic!("{e}"));
         let bad = parse_host("b.test=198.51.100.1").unwrap_or_else(|e| panic!("{e}"));
         assert!(check_hosts(std::slice::from_ref(&ok), &approval).is_ok());

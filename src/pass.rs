@@ -12,14 +12,16 @@
 //! Ceilings are not used: playpen limits where packets go, not how many, so
 //! it never spends from the ledger.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hallpass::{Destination, Digest, Pass};
 use time::OffsetDateTime;
 
-use crate::approval::{AllowRule, Approval, EndsAt, Net, Ports, Proto};
+use crate::approval::{AllowRule, Approval, EndsAt, Net, Ports, Proto, ipv4_edges};
 
 /// How often the supervisor re-reads the pass while the command runs.
 pub const RECHECK_INTERVAL: Duration = Duration::from_secs(2);
@@ -89,10 +91,20 @@ pub struct FromPass {
 /// playpen cannot enforce.
 pub fn load(path: &Path, only: &[String], now: OffsetDateTime) -> Result<FromPass, String> {
     let loaded = hallpass::load(path).map_err(|e| load_error(path, &e))?;
-    let pass = &loaded.pass;
+    from_pass(path, &loaded.pass, loaded.digest, only, now)
+}
+
+fn from_pass(
+    path: &Path,
+    pass: &Pass,
+    digest: Digest,
+    only: &[String],
+    now: OffsetDateTime,
+) -> Result<FromPass, String> {
     pass.check_window(now, time::Duration::ZERO)
         .map_err(|r| format!("--pass {}: {}: {r}", path.display(), r.code.as_str()))?;
     let selected = select(pass, only)?;
+    let edge_addresses = pass_edges(pass);
     let mut rules = Vec::new();
     let mut in_use = Vec::new();
     let mut named = Vec::new();
@@ -126,7 +138,7 @@ pub fn load(path: &Path, only: &[String], now: OffsetDateTime) -> Result<FromPas
         id: pass.id.clone(),
         name: pass.name.clone(),
         owner: pass.approval.owner.clone(),
-        digest: loaded.digest,
+        digest,
         valid_until: pass.approval.valid_until,
         labels: selected.iter().map(|d| d.label.clone()).collect(),
     };
@@ -134,15 +146,17 @@ pub fn load(path: &Path, only: &[String], now: OffsetDateTime) -> Result<FromPas
         path: path.to_path_buf(),
         id: pass.id.clone(),
         owner: pass.approval.owner.clone(),
-        digest: loaded.digest,
+        digest,
         in_use,
+        edge_addresses: edge_addresses.clone(),
         interval: RECHECK_INTERVAL,
     };
     Ok(FromPass {
-        approval: Approval {
+        approval: Approval::with_edge_scope(
             rules,
-            ends_at: Some(EndsAt::from_time(pass.approval.valid_until)),
-        },
+            Some(EndsAt::from_time(pass.approval.valid_until)),
+            edge_addresses,
+        ),
         identity,
         named,
         name_limited,
@@ -177,6 +191,14 @@ fn select<'p>(pass: &'p Pass, only: &[String]) -> Result<Vec<&'p Destination>, S
         .iter()
         .filter(|d| only.is_empty() || only.contains(&d.label))
         .collect())
+}
+
+fn pass_edges(pass: &Pass) -> BTreeSet<Ipv4Addr> {
+    pass.destinations
+        .iter()
+        .filter_map(|d| ipv4_edges(d.network.addr(), d.network.prefix()))
+        .flatten()
+        .collect()
 }
 
 /// One allow rule per port range of the destination.
@@ -223,6 +245,7 @@ pub struct PassWatch {
     owner: String,
     digest: Digest,
     in_use: Vec<(String, Vec<AllowRule>)>,
+    edge_addresses: BTreeSet<Ipv4Addr>,
     /// How often to re-read.
     pub interval: Duration,
 }
@@ -273,6 +296,19 @@ impl PassWatch {
                     "the pass was edited and destination `{label}`, which this run uses, changed"
                 ));
             }
+        }
+        if let Some(edge) = pass_edges(pass)
+            .difference(&self.edge_addresses)
+            .find(|&&edge| {
+                self.in_use
+                    .iter()
+                    .flat_map(|(_, rules)| rules)
+                    .any(|rule| !rule.net.is_single() && rule.net.contains(edge.into()))
+            })
+        {
+            return Recheck::Stop(format!(
+                "the pass was edited and {edge} is now a network or broadcast address within a destination this run uses"
+            ));
         }
         self.digest = digest;
         Recheck::Edited(format!(
@@ -346,12 +382,14 @@ calls = 6
             .filter(|d| labels.contains(&d.label.as_str()))
             .map(|d| (d.label.clone(), rules_for(d).unwrap_or_default()))
             .collect();
+        let edge_addresses = pass_edges(&pass);
         PassWatch {
             path: PathBuf::from("unused"),
             id: pass.id,
             owner: pass.approval.owner,
             digest: Digest::of(text.as_bytes()),
             in_use,
+            edge_addresses,
             interval: RECHECK_INTERVAL,
         }
     }
@@ -476,3 +514,7 @@ calls = 6
         assert!(!d.contains("calls"), "{d}");
     }
 }
+
+#[cfg(test)]
+#[path = "pass_scope_tests.rs"]
+mod scope_tests;

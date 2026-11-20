@@ -17,7 +17,7 @@ fn unix_string(value: &OsStr) -> Value {
 pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> {
     let cwd =
         std::env::current_dir().map_err(|e| format!("cannot resolve working directory: {e}"))?;
-    let mut grants = checked.approval.rules.clone();
+    let mut grants = checked.approval.rules().to_vec();
     grants.sort();
     grants.dedup();
     let paths = |v: &[std::path::PathBuf]| {
