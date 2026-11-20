@@ -51,3 +51,6 @@
 1795191732488019	codex	itc:AQ		item.assign	bn-k86	{"action":"assign","agent":"codex"}	blake3:W2lhrzPrPzFBLJ2P1bwx5qnWwDcLC_RctzF9MxTkF3s
 1795191772883006	codex	itc:AQ		item.comment	bn-3lx	{"body":"Completed the Hallpass dependency and README link in bn-k86. The locked release build succeeds without a sibling Hallpass checkout."}	blake3:tTL4CwdXwa2awtqe3y4b6XNL9xxISr16nq2omrtpO7Q
 1795191788524701	codex	itc:AQ		item.move	bn-k86	{"reason":"Pinned the public Hallpass Git revision in Cargo, updated the lockfile and README, and verified a locked release build and 120 passing tests without a sibling checkout.","state":"done"}	blake3:_53WVIcTTiez-i19IltSohte4jmyT5bRnpvpoi6ix-E
+1795192086553014	codex	itc:AQ		item.move	bn-3lx	{"state":"doing"}	blake3:zAMqLU_kMg19pDiQ3pTWVJDbqq830BlNPdIo4igEKd0
+1795192086699726	codex	itc:AQ		item.assign	bn-3lx	{"action":"assign","agent":"codex"}	blake3:0aSlPLkF3EObajYAtQY1acc4WugV3yhVdIkx1geDQCc
+1795192182798346	codex	itc:AQ		item.move	bn-3lx	{"reason":"Adopted MIT at the owner’s request, documented revocation and the watchdog, and validated the locked release build and all 120 tests using the public Hallpass dependency.","state":"done"}	blake3:AHDewrmWizItr8benA_5WJoglFqbH1rTqapl0loiUBE

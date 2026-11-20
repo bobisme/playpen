@@ -2,21 +2,23 @@
 
 ![A faceless, cloaked figure kneels on cracked flagstones, pouring the last grains into a circle of salt.](docs/images/salt-circle.webp)
 
-playpen runs a command (a scanner, a proxy, a browser, a shell) so that its
-network traffic can reach only the literal addresses, ports and protocols you
-approved. Everything else is dropped and counted. It works without root on
-Linux.
+playpen runs a command and its children with a firewall that restricts
+outbound IP traffic to the addresses, ports and protocols you approve.
+It works without root on Linux and reports attempts to reach other
+destinations.
 
 It is a guard for tools that do not police themselves. A tool that follows
 a redirect, resolves a name to an unexpected address, or was configured
 with the wrong target cannot reach anywhere else.
 
-The approval normally comes from a [hallpass](https://github.com/bobisme/hallpass) pass: the
-owner's written permission as a file (owner, literal destinations, a time
-window, a revocation marker). playpen allows exactly the pass's
-destinations until the window ends, and stops the command if the pass is
-revoked while it runs. For a quick run you can give the destinations on the
-command line with `--allow` instead.
+A [Hallpass](https://github.com/bobisme/hallpass) file records the
+owner, approved destinations and time window. playpen loads those
+destinations into the firewall at startup. It checks the pass every
+2 seconds and starts shutting down the command when it detects revocation
+or the deadline passes. The command can still reach approved destinations
+during detection and shutdown. See [how a pass-backed run ends](#how-a-pass-backed-run-ends)
+for the timing, including what happens if playpen itself is paused.
+For a quick run, supply destinations directly with `--allow`.
 
 - [docs/spec.md](docs/spec.md): what playpen does, exactly: every command,
   option, exit code and report field. Start here.
@@ -26,7 +28,10 @@ command line with `--allow` instead.
 ## Two-minute example
 
 ```console
-$ cargo build --release
+$ git clone https://github.com/bobisme/playpen.git
+$ cd playpen
+$ cargo build --release --locked
+$ export PATH="$PWD/target/release:$PATH"
 $ ./target/release/playpen doctor
 ok   user namespaces: user.max_user_namespaces = 512098
 ok   unprivileged user namespaces: kernel.unprivileged_userns_clone = 1
@@ -74,16 +79,23 @@ expired or revoked. `--only LABEL` narrows the pass to some destinations;
 `--until` can end the run earlier than the window, never later. The pass's
 host names are never resolved for you; map them with `--host`.
 
-While the command runs, playpen re-reads the pass every 2 seconds. If the
-owner revokes it (`revoked = true`), the window ends, the file disappears
-or stops validating, or a destination in use is changed, playpen stops the
-command (SIGTERM, then SIGKILL after 3 seconds) and says why. Other edits
-(a raised ceiling, a later end) do not stop it, and do not apply to the
-running command either: the rules are fixed at start and never widened.
-playpen does not use the pass's ceilings; it limits where packets go, not
-how many.
+### How a pass-backed run ends
 
-The quick form, without a pass:
+If the owner sets `revoked = true`, playpen normally detects it at the
+next pass check, within 2 seconds. It sends the command `SIGTERM` and
+gives it 3 seconds to exit before killing the remaining sandbox. The same
+shutdown applies when the deadline passes, the file disappears or becomes
+invalid, or a destination in use changes. The original firewall stays in
+force throughout. Granting more destinations or extending the deadline
+only affects future runs.
+
+If the supervisor is stopped directly or gets stuck, it cannot check the
+pass or enforce the deadline. After 5 seconds without a heartbeat, a
+watchdog inside the sandbox starts freezing its processes. When the
+supervisor resumes, it checks the deadline and re-reads the pass if due.
+Time spent in system suspend counts toward the deadline.
+
+### Run with a command-line allow list
 
 ```console
 $ playpen run --allow 192.0.2.10:443/tcp \
@@ -192,10 +204,10 @@ playpen does not guard against:
   proxy is a way out to wherever that proxy goes);
 - what is sent: playpen limits where packets go, not how many or what they
   contain (so it does not enforce a pass's ceilings);
-- the few seconds between a pass being revoked and the command being
-  stopped (the next re-read, up to 2 s, plus the 3 s grace), and anyone who
-  can write the pass file.
+- traffic to approved destinations during the [revocation and shutdown
+  window](#how-a-pass-backed-run-ends), or someone who can restore the pass
+  file between checks.
 
 ## License
 
-MIT OR Apache-2.0.
+[MIT License](LICENSE).
