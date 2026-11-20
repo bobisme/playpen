@@ -631,9 +631,14 @@ impl Approval {
     /// handles sandbox exceptions such as established traffic and loopback.
     #[must_use]
     pub fn permits_packet(&self, ip: IpAddr, proto: Proto, port: u16) -> bool {
+        self.matching_grant(ip, proto, port).is_some()
+    }
+
+    /// The first explicit grant that permits the tuple after all address exclusions.
+    pub(crate) fn matching_grant(&self, ip: IpAddr, proto: Proto, port: u16) -> Option<&AllowRule> {
         self.rules
             .iter()
-            .any(|r| r.proto == proto && r.ports.contains(port) && self.rule_covers_addr(r, ip))
+            .find(|r| r.proto == proto && r.ports.contains(port) && self.rule_covers_addr(r, ip))
     }
 
     /// For an address inside a listed network that [`Self::covers_addr`]

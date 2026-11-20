@@ -1585,6 +1585,30 @@ fn policy_test_covers_edges_overlaps_ipv6_and_protocols() {
 }
 
 #[test]
+fn policy_mismatch_names_the_grant_that_actually_matched() {
+    let cases = tmpdir("mismatch-reason").join("cases.json");
+    std::fs::write(
+        &cases,
+        r#"[{"address":"192.0.2.0","port":80,"protocol":"tcp","expect":"deny"}]"#,
+    )
+    .expect("cases");
+    let out = run(&[
+        "policy-test",
+        cases.to_str().expect("path"),
+        "--allow",
+        "192.0.2.0/24:80/tcp",
+        "--allow",
+        "192.0.2.0:80/tcp",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stdout).contains("granted by 192.0.2.0:80/tcp"),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
 fn published_reviewed_offline_workflow_and_report_contract() {
     require_sandbox!();
     let dir = tmpdir("published-workflow");

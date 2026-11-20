@@ -1041,6 +1041,9 @@ pub(crate) fn apply_drop_assertion(report: &mut Report, code: i32, enabled: bool
     }
     let assertion = match &report.dropped {
         Some(d) if d.packets > 0 => crate::report::DropAssertion::Violated,
+        Some(d) if d.destinations.iter().any(|entry| entry.packets > 0) => {
+            crate::report::DropAssertion::Unknown
+        }
         Some(_) => crate::report::DropAssertion::Pass,
         None => crate::report::DropAssertion::Unknown,
     };

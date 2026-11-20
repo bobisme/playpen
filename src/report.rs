@@ -203,6 +203,9 @@ pub fn text_summary(r: &Report) -> String {
         (None, None) => {}
     }
     match (&r.dropped, &r.dropped_error) {
+        (Some(d), _) if d.packets == 0 && d.destinations_truncated => {
+            out.push_str("playpen: the drop counter reads zero, but the destination breakdown is incomplete or inconsistent\n");
+        }
         (Some(d), _) if d.packets == 0 => {
             out.push_str("playpen: no packets to unapproved destinations were dropped\n");
         }
@@ -226,7 +229,7 @@ pub fn text_summary(r: &Report) -> String {
                 );
             }
             if d.destinations_truncated {
-                out.push_str("playpen:   (more destinations than playpen could record)\n");
+                out.push_str("playpen:   (destination breakdown is incomplete or inconsistent)\n");
             }
             let _ = writeln!(
                 out,
@@ -356,6 +359,24 @@ mod tests {
         let json = serde_json::to_value(report).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(json["dropped"]["packets"], 2);
         assert_eq!(json["dropped"]["destinations_truncated"], true);
+    }
+
+    #[test]
+    fn contradictory_zero_cannot_pass_ci() {
+        let mut r = base();
+        r.dropped = Some(DropSummary {
+            packets: 0,
+            destinations_truncated: true,
+            destinations: vec![DroppedDest {
+                address: "192.0.2.1".into(),
+                protocol: "tcp".into(),
+                port: Some(80),
+                packets: 1,
+            }],
+        });
+        assert_eq!(crate::cli::apply_drop_assertion(&mut r, 0, true), 1);
+        assert_eq!(r.drop_assertion, Some(DropAssertion::Unknown));
+        assert!(!text_summary(&r).contains("no packets"));
     }
 
     #[test]

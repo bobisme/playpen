@@ -850,6 +850,9 @@ pass without an echo grant.
 
 ### Counted-drop assertion
 
+A zero total accompanied by positive per-destination packet counts makes the
+assertion indeterminate and the wrapper exits unsuccessfully.
+
 With `--fail-on-drop`, the report includes `drop_assertion`: `pass` for a
 known zero total, `violated` for a positive total even with partial detail,
 and `unknown` when counters are unavailable or the command did not start.

@@ -84,17 +84,20 @@ fn evaluate(args: &PolicyTestArgs) -> Result<bool, String> {
             "deny" => false,
             _ => return Err(format!("case {} has invalid expectation", index + 1)),
         };
-        let actual = policy.permits_packet(ip, proto, case.port);
+        let matched = policy.matching_grant(ip, proto, case.port);
+        let actual = matched.is_some();
         if actual != expected {
             failed = true;
-            let grant = policy
-                .rules()
-                .iter()
-                .find(|r| r.proto == proto && r.ports.contains(case.port) && r.net.contains(ip));
-            let reason = match grant {
-                Some(r) if actual => format!("granted by {r}"),
-                Some(r) => format!("excluded network/broadcast address in {r}"),
-                None => "no matching grant".into(),
+            let excluded = || {
+                policy
+                    .rules()
+                    .iter()
+                    .find(|r| r.proto == proto && r.ports.contains(case.port) && r.net.contains(ip))
+            };
+            let reason = match (matched, excluded()) {
+                (Some(r), _) => format!("granted by {r}"),
+                (_, Some(r)) => format!("excluded network/broadcast address in {r}"),
+                _ => "no matching grant".into(),
             };
             println!(
                 "{}: expected {}, got {} ({reason})",
