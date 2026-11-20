@@ -11,7 +11,7 @@ It is a guard for tools that do not police themselves. A tool that follows
 a redirect, resolves a name to an unexpected address, or was configured
 with the wrong target cannot reach anywhere else.
 
-The approval normally comes from a [hallpass](../hallpass) pass: the
+The approval normally comes from a [hallpass](https://github.com/bobisme/hallpass) pass: the
 owner's written permission as a file (owner, literal destinations, a time
 window, a revocation marker). playpen allows exactly the pass's
 destinations until the window ends, and stops the command if the pass is

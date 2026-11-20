@@ -210,6 +210,7 @@ dependencies = [
 [[package]]
 name = "hallpass"
 version = "0.1.0"
+source = "git+https://github.com/bobisme/hallpass?rev=05d657aaa214c42db2c4807e965e29080b76c43b#05d657aaa214c42db2c4807e965e29080b76c43b"
 dependencies = [
  "serde",
  "serde_json",

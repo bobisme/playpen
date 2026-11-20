@@ -13,7 +13,7 @@ unnecessary_wraps = "allow"
 
 [dependencies]
 # The pass loader and its checks; the library only (no clap of its own).
-hallpass = { path = "../hallpass", default-features = false }
+hallpass = { git = "https://github.com/bobisme/hallpass", rev = "05d657aaa214c42db2c4807e965e29080b76c43b", default-features = false }
 clap = { version = "4.6.8", features = ["derive"] }
 libc = "0.2.191"
 nix = { version = "0.32.0", features = ["sched", "mount", "signal", "process", "user", "socket", "fs", "poll", "mman", "uio", "net"] }
