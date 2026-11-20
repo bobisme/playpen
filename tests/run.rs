@@ -1229,15 +1229,6 @@ fn refusals_exit_2_and_run_nothing() {
         &[
             "run",
             "--allow",
-            "192.0.2.1:443/tcp",
-            "--format",
-            "json",
-            "--",
-            "true",
-        ],
-        &[
-            "run",
-            "--allow",
             "192.0.2.1:443/tcp; flush ruleset",
             "--",
             "true",
@@ -1814,4 +1805,35 @@ fn doctor_missing_nft_makes_both_modes_unavailable_and_probes_untested() {
                 .any(|check| check["name"] == "nft" && check["ok"] == false)
         }));
     }
+}
+
+#[test]
+fn json_run_uses_one_report_stream_and_preserves_child_exit_status() {
+    require_sandbox!();
+    let payload = "printf 'child-stdout'; printf 'child-stderr' >&2; exit 7";
+    let result = run(&["run", "--json", "--no-network", "--", "sh", "-c", payload]);
+    assert_eq!(result.status.code(), Some(7), "{}", text(&result.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).expect("one report");
+    assert_eq!(report["exit_code"], 7);
+    assert_eq!(report["startup_evidence"], "exec_and_exit");
+    assert!(text(&result.stderr).contains("child-stdoutchild-stderr"));
+
+    let file = tmpdir("json-routing").join("report.json");
+    let output = run(&[
+        "--format=json",
+        "run",
+        "--no-network",
+        "--report",
+        file.to_str().expect("path"),
+        "--",
+        "sh",
+        "-c",
+        payload,
+    ]);
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, b"child-stdout");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(file).expect("report")).expect("JSON");
+    assert_eq!(saved["exit_code"], 7);
+    assert!(saved["advice"].is_array());
 }

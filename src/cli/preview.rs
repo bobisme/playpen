@@ -70,29 +70,34 @@ pub(super) fn match_pin(args: &RunArgs, checked: &Checked) -> Result<(), String>
     Ok(())
 }
 
-pub(super) fn print(args: &RunArgs) -> i32 {
+pub(super) fn print(args: &RunArgs, format: Format) -> i32 {
     let scope = match check(args).and_then(|checked| {
         enforce_coverage(args, &checked)?;
         scope(args, &checked)
     }) {
         Ok(scope) => scope,
         Err(e) => {
-            eprintln!("playpen: refused: {e}");
-            return EXIT_REFUSED;
+            return super::discovery::error(
+                format,
+                "refused",
+                &format!("refused: {e}"),
+                EXIT_REFUSED,
+            );
         }
     };
     let at_launch = "Helper availability, namespace setup, live pass validity and installation of the firewall are checked at launch.";
     let digest = digest(&scope);
-    match args.format {
+    match format {
         Format::Json => println!(
             "{}",
-            json!({"plan":scope, "digest":digest.to_string(), "at_launch":at_launch})
+            json!({"advice":[], "plan":scope, "digest":digest.to_string(), "at_launch":at_launch})
         ),
-        Format::Text => {
+        Format::Text | Format::Pretty => {
+            let sep = if format == Format::Pretty { ": " } else { "  " };
             for (key, value) in scope.as_object().into_iter().flatten() {
-                println!("{key}: {value}");
+                println!("{key}{sep}{value}");
             }
-            println!("digest: {digest}");
+            println!("digest{sep}{digest}");
             println!("{at_launch}");
         }
     }

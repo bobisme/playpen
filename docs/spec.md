@@ -123,17 +123,23 @@ No setuid helper, no subuid/subgid ranges, no host setting changes.
 
 ## 4. Commands
 
-Every command accepts `--help`. A command-line usage error (unknown option,
-missing `COMMAND`) prints clap's message and exits 2.
+Every public command accepts `--help` and `--format text|pretty|json`.
+The global format may appear on either side of the command name and overrides
+`FORMAT`. With neither set, a terminal selects pretty output and a pipe selects
+text. Workload argv starts after `--`. `playpen help [COMMAND] --format json`
+describes the public command tree, argument requirements, examples and workflow.
+`playpen version --format json` returns the binary version. JSON objects include
+an `advice` array. In JSON mode a usage error produces an error object on stderr
+and exits 2.
 
 ### 4.1 `playpen run`
 
 ```text
 playpen run --pass FILE [--only LABEL]... [--host NAME=ADDR]...
-            [--until RFC3339] [SOCKETS] [--format text|json]
+            [--until RFC3339] [SOCKETS] [--format text|pretty|json]
             [--report FILE] -- COMMAND [ARGS...]
 playpen run [--allow SPEC]... [--host NAME=ADDR]... [--until RFC3339]
-            [--no-network] [SOCKETS] [--format text|json]
+            [--no-network] [SOCKETS] [--format text|pretty|json]
             [--report FILE] -- COMMAND [ARGS...]
 
 SOCKETS = [--expose PATH]... [--display] [--hide PATH]...
@@ -141,7 +147,7 @@ SOCKETS = [--expose PATH]... [--display] [--hide PATH]...
 ```
 
 Runs `COMMAND` (looked up on `PATH`) in the sandbox with the caller's
-environment, working directory, stdin, stdout and stderr. Every other file
+environment, working directory and standard streams (see the JSON output option below). Every other file
 descriptor the caller passed is closed at `exec`. The environment is not
 changed: variables such as `DBUS_SESSION_BUS_ADDRESS` or `SSH_AUTH_SOCK`
 still name sockets the command cannot reach.
@@ -374,10 +380,13 @@ Linux scheduling the sandbox init and delivering its stop signals.
 refusals by policy included. The file is created (truncated) before
 anything else; if that fails, playpen refuses.
 
-**`--format text|json`**. `json` requires `--report` (otherwise refused).
-The text summary is printed to stderr in both cases.
+**`--format text|pretty|json`**. With JSON and no report path, stdout carries
+one final JSON report. The workload’s stdout and stderr both stream to
+Playpen’s stderr alongside supervisor diagnostics. With `--report FILE`,
+the workload keeps its original stdout and stderr and the file receives the
+report in every format. Keep stdout and stderr separate when parsing JSON.
 
-Messages on stderr, all prefixed `playpen:`:
+The supervisor’s human-readable diagnostics on stderr include the following messages.
 
 - just before the command starts, one line: `allowing only SPECS until TIME
   (no DNS[, names NAME=ADDR, ...]); everything else is dropped`, with
@@ -485,8 +494,8 @@ lifetimes.
 ### 4.3 `playpen rules`
 
 ```text
-playpen rules [--allow SPEC]... [--format text|json]
-playpen rules --pass FILE [--only LABEL]... [--format text|json]
+playpen rules [--allow SPEC]... [--format text|pretty|json]
+playpen rules --pass FILE [--only LABEL]... [--format text|pretty|json]
 ```
 
 Prints the ruleset that `run` would load for these rules. Sends nothing,
@@ -502,7 +511,7 @@ unknown label are refused.
 ### 4.4 `playpen doctor`
 
 ```text
-playpen doctor [--mode offline|egress] [--format text|json]
+playpen doctor [--mode offline|egress] [--format text|pretty|json]
 ```
 
 `--mode egress` is the default and retains the full egress check. `--mode
@@ -551,17 +560,19 @@ The egress checks, without changing any host setting:
    Unix socket and an abstract Unix socket doctor creates on the host for
    the purpose.
 
-Each line says `ok` or `FAIL` and what is missing; unrun checks are marked
+Pretty output labels each check `ok` or `FAIL`. Text output places the check name first. Unrun checks are marked
 `untested`. Exit status 0 when the selected mode is demonstrated, 1
 otherwise. Existing JSON check objects retain `name`, `ok`, and `detail`.
 
 ### 4.4.1 `playpen qualify`
 
 ```text
-playpen qualify [--source TRUSTED_PATH] [--require SCENARIO]... [--format text|json]
+playpen qualify --list [--format text|pretty|json]
+playpen qualify [--source TRUSTED_PATH] [--require SCENARIO]... [--format text|pretty|json]
 ```
 
-Runs the listed native scenarios and records prerequisites and results. The
+`--list` prints the scenario catalog and prerequisites without executing checks.
+The default invocation runs the named native scenarios and records results. The
 scenario set covers offline command isolation and loopback, local privilege
 and Unix-socket guards, egress filtering, run-loopback behavior, hallpass
 egress, the private runtime-directory fixture, the gateway mapping test on its
@@ -612,7 +623,7 @@ executed. For a non-idempotent job, retry automatically only on an explicit
 `not_started` result. Older reports omit the field.
 
 
-Written by `run --report FILE`. Field names are stable.
+Written by `run --format json` or `run --report FILE`. Field names are stable.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -689,7 +700,7 @@ the report schema and the installed accept rules are unchanged.
 ### Shareable reports
 
 `--shareable-report --report FILE` writes a separate `playpen-shareable-v1`
-JSON object directly. Its only fields are `schema`, `outcome`, `exit_code`,
+JSON object directly. Its only fields are `advice` (always an empty array), `schema`, `outcome`, `exit_code`,
 `signal`, `playpen_exit_status`, `network`, `socket_guard`, `stopped_by_until`,
 `stopped_by_pass`, `dropped_packets`, `destinations_truncated`, and
 `drop_assertion`. The two drop fields are null when unavailable; zero is a
@@ -699,7 +710,7 @@ existing compatibility contract. Future shareable fields require an explicit
 allowlist addition and a schema compatibility decision.
 
 ```json
-{"schema":"playpen-shareable-v1","outcome":"ran","exit_code":0,"signal":null,"playpen_exit_status":0,"network":"pasta","socket_guard":"landlock","stopped_by_until":false,"stopped_by_pass":false,"dropped_packets":0,"destinations_truncated":false,"drop_assertion":null}
+{"advice":[],"schema":"playpen-shareable-v1","outcome":"ran","exit_code":0,"signal":null,"playpen_exit_status":0,"network":"pasta","socket_guard":"landlock","stopped_by_until":false,"stopped_by_pass":false,"dropped_packets":0,"destinations_truncated":false,"drop_assertion":null}
 ```
 
 Child output and files created by the caller or child are separate from this

@@ -1,4 +1,5 @@
 //! Offline comparison of bounded, historical full reports.
+use crate::cli::discovery::{self, Format};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -127,13 +128,23 @@ fn read(path: &Path) -> Result<Input, String> {
     })
 }
 
-pub fn run(before: &Path, after: &Path, json: bool) -> i32 {
-    let result = read(before).and_then(|a| read(after).map(|b| (a, b)));
+pub fn run_formatted(before: &Path, after: &Path, format: Format) -> i32 {
+    let result = read(before)
+        .map_err(|e| format!("{}: {e}", before.display()))
+        .and_then(|a| {
+            read(after)
+                .map(|b| (a, b))
+                .map_err(|e| format!("{}: {e}", after.display()))
+        });
     let (a, b) = match result {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("playpen: cannot compare reports: {e}");
-            return 2;
+            return discovery::error(
+                format,
+                "invalid-report",
+                &format!("cannot compare reports: {e}"),
+                2,
+            );
         }
     };
     let policy = if a.policy == b.policy {
@@ -162,11 +173,31 @@ pub fn run(before: &Path, after: &Path, json: bool) -> i32 {
         new_denials,
         no_longer_observed,
     };
-    if json {
+    if format == Format::Json {
+        let advice = if evidence == "incomplete" {
+            serde_json::json!([{"level":"warn","type":"incomplete-evidence","message":"Inspect both reports for missing or partial drop counters before drawing conclusions."}])
+        } else {
+            serde_json::json!([])
+        };
         println!(
             "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
+            serde_json::json!({"policy":result.policy,"evidence":result.evidence,"new_denials":result.new_denials,"no_longer_observed":result.no_longer_observed,"advice":advice})
         );
+    } else if format == Format::Text {
+        println!("policy  {}\nevidence  {}", result.policy, result.evidence);
+        for (kind, endpoints) in [
+            ("new", &result.new_denials),
+            ("no-longer-observed", &result.no_longer_observed),
+        ] {
+            for e in endpoints {
+                println!(
+                    "{kind}  {}  {}  {}",
+                    e.address,
+                    e.protocol,
+                    e.port.map_or_else(|| "-".into(), |p| p.to_string())
+                );
+            }
+        }
     } else {
         println!("policy: {}; evidence: {}", result.policy, result.evidence);
         for e in &result.new_denials {

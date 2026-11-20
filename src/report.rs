@@ -114,6 +114,8 @@ pub struct Report {
 /// Explicit allowlist for reports intended to be shared.
 #[derive(Serialize)]
 pub struct ShareableReport {
+    // An empty, fixed-size array cannot carry private diagnostic strings.
+    advice: [(); 0],
     schema: &'static str,
     outcome: Outcome,
     exit_code: Option<i32>,
@@ -131,6 +133,7 @@ pub struct ShareableReport {
 impl From<&Report> for ShareableReport {
     fn from(r: &Report) -> Self {
         Self {
+            advice: [],
             schema: "playpen-shareable-v1",
             outcome: r.outcome,
             exit_code: r.exit_code,
@@ -310,6 +313,7 @@ mod tests {
             assert_eq!(
                 keys,
                 [
+                    "advice",
                     "schema",
                     "outcome",
                     "exit_code",

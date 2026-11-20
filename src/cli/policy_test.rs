@@ -1,5 +1,5 @@
 //! Offline assertions about the outbound application tuple filter.
-use super::{EXIT_REFUSED, ONLY_WITHOUT_PASS, PASS_AND_ALLOW};
+use super::{EXIT_REFUSED, Format, ONLY_WITHOUT_PASS, PASS_AND_ALLOW, discovery};
 use crate::approval::{Approval, Proto, parse_allow, parse_literal_addr};
 use crate::pass;
 use clap::Args;
@@ -32,7 +32,7 @@ struct Case {
     expect: String,
 }
 
-fn evaluate(args: &PolicyTestArgs) -> Result<bool, String> {
+fn evaluate(args: &PolicyTestArgs, format: Format) -> Result<bool, String> {
     let policy = if let Some(path) = &args.pass {
         if !args.allow.is_empty() {
             return Err(PASS_AND_ALLOW.into());
@@ -66,6 +66,7 @@ fn evaluate(args: &PolicyTestArgs) -> Result<bool, String> {
         return Err("at least one case is required".into());
     }
     let mut failed = false;
+    let mut results = Vec::new();
     for (index, case) in cases.iter().enumerate() {
         let ip = parse_literal_addr(&case.address).map_err(|e| e.to_string())?;
         if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || case.port == 0 {
@@ -86,8 +87,9 @@ fn evaluate(args: &PolicyTestArgs) -> Result<bool, String> {
         };
         let matched = policy.matching_grant(ip, proto, case.port);
         let actual = matched.is_some();
-        if actual != expected {
-            failed = true;
+        let verdict = if actual { "allow" } else { "deny" };
+        failed |= actual != expected;
+        if format == Format::Json || actual != expected {
             let excluded = || {
                 policy
                     .rules()
@@ -99,23 +101,34 @@ fn evaluate(args: &PolicyTestArgs) -> Result<bool, String> {
                 (_, Some(r)) => format!("excluded network/broadcast address in {r}"),
                 _ => "no matching grant".into(),
             };
-            println!(
-                "{}: expected {}, got {} ({reason})",
-                case.name.as_deref().unwrap_or("unnamed"),
-                case.expect,
-                if actual { "allow" } else { "deny" }
-            );
+            if format == Format::Json {
+                results.push(serde_json::json!({"index":index + 1, "name":case.name, "address":ip, "port":case.port, "protocol":case.protocol, "expect":case.expect, "actual":verdict, "ok":actual == expected, "reason":reason}));
+            } else {
+                println!(
+                    "{}: expected {}, got {verdict} ({reason})",
+                    case.name.as_deref().unwrap_or("unnamed"),
+                    case.expect
+                );
+            }
         }
+    }
+    if format == Format::Json {
+        println!(
+            "{}",
+            serde_json::json!({"ok":!failed,"cases":results,"advice":[]})
+        );
     }
     Ok(failed)
 }
-pub(super) fn run(args: &PolicyTestArgs) -> i32 {
-    match evaluate(args) {
+pub(super) fn run(args: &PolicyTestArgs, format: Format) -> i32 {
+    match evaluate(args, format) {
         Ok(false) => 0,
         Ok(true) => 1,
-        Err(e) => {
-            eprintln!("playpen: invalid policy test: {e}");
-            EXIT_REFUSED
-        }
+        Err(e) => discovery::error(
+            format,
+            "invalid-policy-test",
+            &format!("invalid policy test: {e}"),
+            EXIT_REFUSED,
+        ),
     }
 }

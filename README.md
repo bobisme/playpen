@@ -160,10 +160,26 @@ $ playpen rules --pass engagement.pass.toml
 $ playpen rules --allow 192.0.2.10:443/tcp --allow '[2001:db8::10]:443/tcp'
 ```
 
-For scripts, `--report FILE` writes a JSON summary (for refusals too), and
-`--format json` requires it. The report's `outcome` field tells a command
+For scripts, `run --format json` writes the final report to stdout and sends
+workload output to stderr. Give `--report FILE` to keep workload stdout in
+a pipeline and save the JSON report, including refusals. The report's
+`outcome` field tells a command
 that exited with status 2 (`"ran"`, `exit_code: 2`) apart from playpen
 refusing to start it (`"refused"`).
+
+### Discover the CLI from an agent
+
+```sh
+playpen help --format json | jq -r '.commands[].name'
+playpen help run --format json | jq '{usage, examples, workflow}'
+playpen qualify --list --format json | jq -r '.scenarios[].id'
+```
+
+Every public command accepts `--format text|pretty|json` before or after the
+command name. An explicit flag overrides `FORMAT`. By default a terminal gets
+pretty output and a pipe gets text. JSON results are objects with an `advice`
+array. Invalid CLI syntax in JSON mode produces a structured error on stderr.
+Pass the workload and its flags after `--`.
 
 ### Review a command before launch
 

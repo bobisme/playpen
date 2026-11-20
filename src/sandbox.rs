@@ -431,7 +431,16 @@ pub fn tiocsti_allowed() -> bool {
 /// what the operator can do about it); [`RunError::Failed`] for trouble
 /// afterwards.
 pub fn run(plan: &Plan, events: &mut dyn Events) -> Result<RunResult, RunError> {
-    run_sandbox(plan, events).map_err(|e| match e {
+    run_with_output(plan, events, false)
+}
+
+/// Reserve stdout for the final report when requested by the CLI.
+pub(crate) fn run_with_output(
+    plan: &Plan,
+    events: &mut dyn Events,
+    stdout_report: bool,
+) -> Result<RunResult, RunError> {
+    run_sandbox(plan, events, stdout_report).map_err(|e| match e {
         RunError::NotStarted(m) => {
             RunError::NotStarted(with_apparmor_hint(m, apparmor_restricts()))
         }
@@ -461,7 +470,11 @@ pub fn with_apparmor_hint(message: String, restricted: bool) -> String {
     )
 }
 
-fn run_sandbox(plan: &Plan, events: &mut dyn Events) -> Result<RunResult, RunError> {
+fn run_sandbox(
+    plan: &Plan,
+    events: &mut dyn Events,
+    stdout_report: bool,
+) -> Result<RunResult, RunError> {
     let not_started = RunError::NotStarted;
     match thread_count() {
         Ok(1) => {}
@@ -504,6 +517,13 @@ fn run_sandbox(plan: &Plan, events: &mut dyn Events) -> Result<RunResult, RunErr
             drop(up_r);
             drop(down_w);
             drop(sigfd);
+            if stdout_report && let Err(e) = nix::unistd::dup2_stdout(std::io::stderr()) {
+                write_line(
+                    &up_w,
+                    &format!("fail cannot route workload stdout to stderr: {e}"),
+                );
+                exit_now(1);
+            }
             let code = match stage_c(plan, &ids, &ruleset_text, &files, &up_w, &down_r) {
                 Ok(()) => 0,
                 Err(msg) => {

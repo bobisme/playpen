@@ -5,6 +5,7 @@
 //! documentation addresses added to the sandbox's own `lo`, so no packet can
 //! leave the machine even if something were wrong.
 
+use crate::cli::discovery::Format;
 use std::path::Path;
 use std::process::Command;
 
@@ -143,7 +144,7 @@ fn tool_check(name: &'static str, found: Option<&Path>, hint: &str) -> Check {
 fn self_run(run_args: &[&str], probe: &[&str]) -> Result<String, String> {
     let me = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
     let out = Command::new(&me)
-        .arg("run")
+        .args(["run", "--format", "text"])
         .args(run_args)
         .arg("--")
         .arg(&me)
@@ -183,7 +184,7 @@ fn self_command(run_args: &[&str], command: &[&str]) -> Check {
         }
     };
     let out = Command::new(&me)
-        .arg("run")
+        .args(["run", "--format", "text"])
         .args(run_args)
         .arg("--")
         .arg(executable)
@@ -465,6 +466,10 @@ fn sockets_check() -> Check {
 /// Runs every check and prints the result. Returns the exit status.
 #[must_use]
 pub fn run(mode: Mode, json: bool) -> i32 {
+    run_formatted(mode, if json { Format::Json } else { Format::Pretty })
+}
+
+pub(crate) fn run_formatted(mode: Mode, format: Format) -> i32 {
     let mut checks = Vec::new();
     userns_checks(&mut checks);
     let nft = crate::tools::nft();
@@ -546,7 +551,7 @@ pub fn run(mode: Mode, json: bool) -> i32 {
 
     let ok = checks.iter().all(|c| c.ok);
     let capability = capability(mode, prereqs_ok, prereq_detail, &probes);
-    print_result(mode, ok, &capability, &checks, &probes, json);
+    print_result(mode, ok, &capability, &checks, &probes, format);
     i32::from(!ok)
 }
 
@@ -590,9 +595,9 @@ fn print_result(
     capability: &Capability,
     checks: &[Check],
     probes: &[ProbeResult],
-    json: bool,
+    format: Format,
 ) {
-    if json {
+    if format == Format::Json {
         println!(
             "{}",
             serde_json::json!({
@@ -600,9 +605,22 @@ fn print_result(
                 "mode": mode,
                 "capability": capability,
                 "probes": probes,
-                "checks": checks,
+                "checks": checks, "advice": [],
             })
         );
+    } else if format == Format::Text {
+        println!("{}  {}", mode.name(), capability.status);
+        for c in checks {
+            println!(
+                "{}  {}  {}",
+                c.name,
+                if c.ok { "ok" } else { "failed" },
+                c.detail
+            );
+        }
+        for p in probes.iter().filter(|p| p.status == "untested") {
+            println!("{}  untested  {}", p.name, p.detail);
+        }
     } else {
         for c in checks {
             println!(

@@ -1,5 +1,6 @@
 //! Command-line interface.
 
+pub(crate) mod discovery;
 mod event_pipe;
 mod policy_test;
 mod preview;
@@ -12,7 +13,8 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
+use discovery::Format;
 use time::OffsetDateTime;
 
 use crate::approval::{Approval, EndsAt, parse_allow, parse_literal_addr};
@@ -32,34 +34,36 @@ pub const EXIT_ERROR: i32 = 1;
 
 /// Run a command with its network egress limited to approved literal addresses.
 #[derive(Debug, Parser)]
-#[command(name = "playpen", version, about)]
+#[command(name = "playpen", version, about, disable_help_subcommand = true, after_help = discovery::ROOT)]
 struct Cli {
+    /// Output format. Defaults to FORMAT, then pretty on a terminal or text in a pipe.
+    #[arg(long, global = true, value_enum)]
+    format: Option<Format>,
+    #[arg(long, global = true, hide = true, conflicts_with = "format")]
+    json: bool,
+    /// Disable color in CLI output.
+    #[arg(long, global = true)]
+    no_color: bool,
     #[command(subcommand)]
-    command: Cmd,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Format {
-    Text,
-    Json,
+    command: Option<Cmd>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Test expected packet decisions without loading a firewall.
+    #[command(display_order = 5, after_help = discovery::POLICY)]
     PolicyTest(policy_test::PolicyTestArgs),
     /// Compare two full reports without executing either command.
-    Compare {
-        before: PathBuf,
-        after: PathBuf,
-        #[arg(long, value_enum, default_value = "text")]
-        format: Format,
-    },
+    #[command(display_order = 6, after_help = discovery::COMPARE)]
+    Compare { before: PathBuf, after: PathBuf },
     /// Run COMMAND with egress limited to a pass's destinations or the --allow ones.
+    #[command(display_order = 3, after_help = discovery::RUN)]
     Run(RunArgs),
     /// Preview the validated run without starting helpers or writing a report.
+    #[command(display_order = 2, after_help = discovery::PLAN)]
     Plan(RunArgs),
     /// Print the nftables ruleset that would be loaded; sends and creates nothing.
+    #[command(display_order = 4, after_help = discovery::RULES)]
     Rules {
         /// Approved destination: ADDR:PORT/PROTO, ADDR:FROM-TO/PROTO or NET/PREFIX:PORTS/PROTO.
         #[arg(long = "allow", value_name = "SPEC")]
@@ -70,31 +74,33 @@ enum Cmd {
         /// With --pass: only the destination with this label. Repeatable.
         #[arg(long = "only", value_name = "LABEL")]
         only: Vec<String>,
-        /// Output format.
-        #[arg(long, value_enum, default_value = "text")]
-        format: Format,
     },
     /// Check that this machine can run playpen, and say exactly what is missing.
+    #[command(display_order = 1, after_help = discovery::DOCTOR)]
     Doctor {
         /// Capability to demonstrate (offline avoids the pasta dependency).
         #[arg(long, value_enum, default_value = "egress")]
         mode: crate::doctor::Mode,
-        /// Output format.
-        #[arg(long, value_enum, default_value = "text")]
-        format: Format,
     },
     /// Run native sandbox qualification scenarios and report what executed.
+    #[command(display_order = 7, after_help = discovery::QUALIFY)]
     Qualify {
+        /// List scenario IDs and prerequisites without executing any probes or tests.
+        #[arg(long, conflicts_with_all = ["source", "required"])]
+        list: bool,
         /// Explicit trusted source tree for integration-test scenarios.
         #[arg(long, value_name = "PATH")]
         source: Option<PathBuf>,
         /// A scenario that this qualification job requires to execute.
         #[arg(long = "require", value_name = "SCENARIO")]
         required: Vec<String>,
-        /// Output format.
-        #[arg(long, value_enum, default_value = "text")]
-        format: Format,
     },
+    /// Show usage, examples and the suggested workflow for a public command.
+    #[command(display_order = 8, after_help = discovery::HELP)]
+    Help { command: Option<String> },
+    /// Print the installed Playpen version.
+    #[command(display_order = 9, after_help = discovery::VERSION)]
+    Version,
     /// Checks run inside the sandbox by doctor and the tests.
     #[command(hide = true)]
     Probe {
@@ -159,78 +165,87 @@ enum ProbeCmd {
     reason = "independent command-line switches"
 )]
 struct RunArgs {
-    /// A hallpass pass: allow exactly its destinations until its approval
-    /// window end, and stop the command if it is revoked or edited.
+    /// Load a Hallpass approval. Stop on expiry, revocation, or withdrawal of a selected grant.
     /// Cannot be combined with --allow.
-    #[arg(long, value_name = "FILE")]
+    #[arg(help_heading = "Network policy", long, value_name = "FILE")]
     pass: Option<PathBuf>,
     /// With --pass: use only the destination with this label. Repeatable.
-    #[arg(long = "only", value_name = "LABEL")]
+    #[arg(help_heading = "Network policy", long = "only", value_name = "LABEL")]
     only: Vec<String>,
     /// Approved destination: ADDR:PORT/PROTO, ADDR:FROM-TO/PROTO or
     /// NET/PREFIX:PORTS/PROTO; IPv6 in brackets. Repeatable.
-    #[arg(long = "allow", value_name = "SPEC")]
+    #[arg(help_heading = "Network policy", long = "allow", value_name = "SPEC")]
     allow: Vec<String>,
     /// Make NAME resolve to ADDR inside the sandbox (ADDR must be approved). Repeatable.
-    #[arg(long = "host", value_name = "NAME=ADDR")]
+    #[arg(
+        help_heading = "Network policy",
+        long = "host",
+        value_name = "NAME=ADDR"
+    )]
     host: Vec<String>,
     /// When the approval ends (RFC 3339 with offset); the command is stopped
     /// then. With --pass it can only be earlier than the pass's window end.
-    #[arg(long, value_name = "RFC3339")]
+    #[arg(help_heading = "Network policy", long, value_name = "RFC3339")]
     until: Option<String>,
-    /// No network at all: only loopback inside the sandbox.
-    #[arg(long)]
+    /// Allow only private loopback. No DNS or external network.
+    #[arg(help_heading = "Network policy", long)]
     no_network: bool,
     /// Serve one literal HTTP fixture on private loopback in offline mode.
-    #[arg(long, requires = "no_network", value_name = "JSON")]
+    #[arg(
+        help_heading = "Launch and reporting",
+        long,
+        requires = "no_network",
+        value_name = "FILE"
+    )]
     fixture: Option<PathBuf>,
     /// Also hide this host path from the command (sockets/files: bound to
     /// /dev/null; directories: an empty read-only tmpfs). Repeatable.
-    #[arg(long = "hide", value_name = "PATH")]
+    #[arg(help_heading = "Host access", long = "hide", value_name = "PATH")]
     hide: Vec<PathBuf>,
     /// Let the command reach this host socket, or every socket below this
     /// directory. Host Unix sockets are unreachable otherwise. Repeatable.
-    #[arg(long = "expose", value_name = "PATH")]
+    #[arg(help_heading = "Host access", long = "expose", value_name = "PATH")]
     expose: Vec<PathBuf>,
     /// Let graphical programs reach the display: expose the Wayland and X11
     /// sockets the environment names, and the X authority file. An X11
     /// server lets any client type into other windows; off by default.
-    #[arg(long)]
+    #[arg(help_heading = "Host access", long)]
     display: bool,
     /// Run on a kernel without Landlock ABI 9: hide host sockets by mounts
     /// only (under /run, /tmp, /var/tmp and the runtime directory). Sockets
     /// elsewhere, and ones created after the start, stay reachable.
-    #[arg(long)]
+    #[arg(help_heading = "Host access", long)]
     without_landlock: bool,
     /// Run the command in a new session with no controlling terminal, so
     /// it cannot type into the caller's terminal. Automatic on kernels that
     /// allow TIOCSTI; then Ctrl-C still reaches the command, but programs
     /// cannot open /dev/tty.
-    #[arg(long)]
+    #[arg(help_heading = "Host access", long)]
     new_session: bool,
     /// Write lifecycle JSON lines to an inherited pipe above stderr.
-    #[arg(long, value_name = "FD")]
+    #[arg(help_heading = "Launch and reporting", long, value_name = "FD")]
     events_fd: Option<i32>,
     /// Refuse pass terms that require an external enforcer.
-    #[arg(long)]
+    #[arg(help_heading = "Network policy", long)]
     require_enforced: bool,
     /// Require the effective scope to match the digest from playpen plan.
-    #[arg(long, value_name = "SHA256")]
+    #[arg(help_heading = "Launch and reporting", long, value_name = "SHA256")]
     expect_plan: Option<hallpass::Digest>,
     /// Fail if any dropped packets were counted, or counters are unavailable.
-    #[arg(long)]
+    #[arg(help_heading = "Launch and reporting", long)]
     fail_on_drop: bool,
     /// Include bounded first-match grant packet counts in the private report.
-    #[arg(long, requires = "report", conflicts_with = "shareable_report")]
+    #[arg(
+        help_heading = "Launch and reporting",
+        long,
+        conflicts_with = "shareable_report"
+    )]
     report_grant_use: bool,
-    /// Summary format; json requires --report.
-    #[arg(long, value_enum, default_value = "text")]
-    format: Format,
     /// Write only the shareable allowlisted fields to the report.
-    #[arg(long, requires = "report")]
+    #[arg(help_heading = "Launch and reporting", long)]
     shareable_report: bool,
     /// Write the JSON summary to FILE (for every outcome, refusals included).
-    #[arg(long, value_name = "FILE")]
+    #[arg(help_heading = "Launch and reporting", long, value_name = "FILE")]
     report: Option<PathBuf>,
     /// Test aid: add ADDR to the sandbox's lo before the ruleset loads.
     #[arg(long = "lo-addr", hide = true, value_name = "ADDR")]
@@ -247,44 +262,48 @@ struct RunArgs {
 /// Entry point; returns the process exit status.
 #[must_use]
 pub fn main() -> i32 {
-    let cli = match Cli::try_parse() {
-        Ok(c) => c,
-        Err(e) => {
-            let code = if e.use_stderr() { EXIT_REFUSED } else { 0 };
-            let _ = e.print();
-            return code;
+    let argv: Vec<_> = std::env::args_os().collect();
+    let cli = match discovery::parse(&argv) {
+        Ok(cli) => cli,
+        Err(status) => return status,
+    };
+    // Internal subprocess protocols have a fixed wire format of their own.
+    if let Some(Cmd::Probe { what }) = cli.command {
+        return probe(what);
+    }
+    let format = match Format::resolve(cli.format, cli.json) {
+        Ok(format) => format,
+        Err(message) => {
+            return discovery::error(Format::Text, "invalid-format", &message, EXIT_REFUSED);
         }
     };
-    match cli.command {
-        Cmd::Run(args) => run(&args),
-        Cmd::PolicyTest(args) => policy_test::run(&args),
-        Cmd::Plan(args) => preview::print(&args),
-        Cmd::Compare {
-            before,
-            after,
-            format,
-        } => crate::compare::run(&before, &after, format == Format::Json),
-        Cmd::Rules {
-            allow,
-            pass,
-            only,
-            format,
-        } => rules(&allow, pass.as_deref(), &only, format),
-        Cmd::Doctor { mode, format } => crate::doctor::run(mode, format == Format::Json),
+    cli.command.map_or_else(
+        || discovery::help(None, format),
+        |cmd| dispatch(cmd, format),
+    )
+}
+
+fn dispatch(cmd: Cmd, format: Format) -> i32 {
+    match cmd {
+        Cmd::Help { command } => discovery::help(command.as_deref(), format),
+        Cmd::Version => discovery::version(format),
+        Cmd::Run(args) => run(&args, format),
+        Cmd::PolicyTest(args) => policy_test::run(&args, format),
+        Cmd::Plan(args) => preview::print(&args, format),
+        Cmd::Compare { before, after } => crate::compare::run_formatted(&before, &after, format),
+        Cmd::Rules { allow, pass, only } => rules(&allow, pass.as_deref(), &only, format),
+        Cmd::Doctor { mode } => crate::doctor::run_formatted(mode, format),
+        Cmd::Qualify { list: true, .. } => crate::qualification::list(format),
         Cmd::Qualify {
-            source,
-            required,
-            format,
-        } => crate::qualification::run(&required, source.as_deref(), format == Format::Json),
+            source, required, ..
+        } => crate::qualification::run_formatted(&required, source.as_deref(), format),
         Cmd::Probe { what } => probe(what),
     }
 }
 
 fn rules(allow: &[String], pass_file: Option<&Path>, only: &[String], format: Format) -> i32 {
-    let refuse = |e: &str| {
-        eprintln!("playpen: refused: {e}");
-        EXIT_REFUSED
-    };
+    let refuse =
+        |e: &str| discovery::error(format, "refused", &format!("refused: {e}"), EXIT_REFUSED);
     let (approval, identity) = if let Some(path) = pass_file {
         if !allow.is_empty() {
             return refuse(PASS_AND_ALLOW);
@@ -309,13 +328,13 @@ fn rules(allow: &[String], pass_file: Option<&Path>, only: &[String], format: Fo
     };
     let text = crate::ruleset::render_approval(&approval);
     match format {
-        Format::Text => print!("{text}"),
+        Format::Text | Format::Pretty => print!("{text}"),
         Format::Json => println!(
             "{}",
             serde_json::json!({
                 "allowed": approval.rules().iter().map(ToString::to_string).collect::<Vec<_>>(),
                 "pass": identity.as_ref().map(pass_report),
-                "ruleset": text,
+                "ruleset": text, "advice": [],
             })
         ),
     }
@@ -829,43 +848,73 @@ fn new_session(args: &RunArgs) -> bool {
     args.new_session || sandbox::tiocsti_allowed()
 }
 
-fn write_report(file: Option<&mut File>, report: &Report, shareable: bool) {
-    if let Some(f) = file {
-        let text = if shareable {
-            serde_json::to_string_pretty(&crate::report::ShareableReport::from(report))
+fn write_report(
+    file: Option<&mut File>,
+    report: &Report,
+    shareable: bool,
+    stdout_report: bool,
+) -> std::io::Result<()> {
+    let mut sink: Box<dyn std::io::Write + '_> = match file {
+        Some(file) => Box::new(file),
+        None if stdout_report => Box::new(std::io::stdout().lock()),
+        None => return Ok(()),
+    };
+    if shareable {
+        serde_json::to_writer_pretty(&mut sink, &crate::report::ShareableReport::from(report))?;
+    } else {
+        let mut value = serde_json::to_value(report)?;
+        value["advice"] = if report.startup_evidence == StartupEvidence::Unknown {
+            serde_json::json!([{"level":"warn","type":"uncertain-startup","message":"Check for side effects before retrying this command."}])
         } else {
-            serde_json::to_string_pretty(report)
-        }
-        .unwrap_or_default();
-        if let Err(e) = f
-            .write_all(text.as_bytes())
-            .and_then(|()| f.write_all(b"\n"))
-        {
-            eprintln!("playpen: could not write the report: {e}");
-        }
+            serde_json::json!([])
+        };
+        serde_json::to_writer_pretty(&mut sink, &value)?;
     }
+    sink.write_all(b"\n")?;
+    sink.flush()
 }
 
 #[expect(
     clippy::too_many_lines,
     reason = "a linear sequence of steps, each mapping to a report field"
 )]
-fn run(args: &RunArgs) -> i32 {
+fn run(args: &RunArgs, format: Format) -> i32 {
+    let stdout_report = format == Format::Json && args.report.is_none();
+    if (args.shareable_report || args.report_grant_use) && args.report.is_none() && !stdout_report {
+        return discovery::error(
+            format,
+            "missing-report",
+            "choose --report FILE or --format json for this report option; nothing was run",
+            EXIT_REFUSED,
+        );
+    }
     let pipe = match EventPipe::open(args.events_fd) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("playpen: refused: {e}");
-            return EXIT_REFUSED;
+            return discovery::error(
+                format,
+                "invalid-events-fd",
+                &format!("refused: {e}; nothing was run"),
+                EXIT_REFUSED,
+            );
         }
     };
     let mut report = base_report(args);
-    if args.format == Format::Json && args.report.is_none() {
-        eprintln!(
-            "playpen: refused: --format json writes the summary to a file; give it with --report FILE"
-        );
-        pipe.terminal(&report);
-        return EXIT_REFUSED;
-    }
+    let finish = |file: Option<&mut File>, report: &mut Report| {
+        if let Err(e) = write_report(file, report, args.shareable_report, stdout_report) {
+            if report.playpen_exit_status == 0 {
+                report.playpen_exit_status = EXIT_ERROR;
+            }
+            discovery::error(
+                format,
+                "report-write-failed",
+                &format!("could not write the final report: {e}"),
+                report.playpen_exit_status,
+            );
+        }
+        pipe.terminal(report);
+        report.playpen_exit_status
+    };
     if args.fail_on_drop {
         report.drop_assertion = Some(crate::report::DropAssertion::Unknown);
     }
@@ -873,12 +922,12 @@ fn run(args: &RunArgs) -> i32 {
         Some(p) => match File::create(p) {
             Ok(f) => Some(f),
             Err(e) => {
-                eprintln!(
-                    "playpen: refused: cannot create the report file {}: {e}; nothing was run",
+                let message = format!(
+                    "refused: cannot create the report file {}: {e}; nothing was run",
                     p.display()
                 );
                 pipe.terminal(&report);
-                return EXIT_REFUSED;
+                return discovery::error(format, "report-unwritable", &message, EXIT_REFUSED);
             }
         },
         None => None,
@@ -894,18 +943,14 @@ fn run(args: &RunArgs) -> i32 {
                 eprintln!("playpen: nothing was run");
             }
             report.message = Some(e);
-            write_report(report_file.as_mut(), &report, args.shareable_report);
-            pipe.terminal(&report);
-            return EXIT_REFUSED;
+            return finish(report_file.as_mut(), &mut report);
         }
     };
     report.enforcement_coverage = checked.from_pass.as_ref().map(|p| p.coverage.clone());
     if let Err(e) = enforce_coverage(args, &checked) {
         eprintln!("playpen: refused: {e}; nothing was run");
         report.message = Some(e);
-        pipe.terminal(&report);
-        write_report(report_file.as_mut(), &report, args.shareable_report);
-        return EXIT_REFUSED;
+        return finish(report_file.as_mut(), &mut report);
     }
     pipe.send("validated", &serde_json::Value::Null);
     report.allowed = checked
@@ -934,9 +979,7 @@ fn run(args: &RunArgs) -> i32 {
         }
         report.message = Some(msg);
         report.playpen_exit_status = EXIT_ERROR;
-        pipe.terminal(report);
-        write_report(file, report, args.shareable_report);
-        EXIT_ERROR
+        finish(file, report)
     };
     let Some(nft) = crate::tools::nft() else {
         return fail(
@@ -1000,7 +1043,7 @@ fn run(args: &RunArgs) -> i32 {
         pasta,
         watch: checked.from_pass.map(|p| p.watch),
     };
-    let result = match sandbox::run(&plan, &mut events) {
+    let result = match sandbox::run_with_output(&plan, &mut events, stdout_report) {
         Ok(r) => r,
         Err(e @ RunError::NotStarted(_)) => {
             return fail(
@@ -1056,10 +1099,8 @@ fn run(args: &RunArgs) -> i32 {
     }
     let code = apply_drop_assertion(&mut report, code, args.fail_on_drop);
     report.playpen_exit_status = code;
-    pipe.terminal(&report);
     eprint!("{}", text_summary(&report));
-    write_report(report_file.as_mut(), &report, args.shareable_report);
-    code
+    finish(report_file.as_mut(), &mut report)
 }
 
 pub(crate) fn apply_drop_assertion(report: &mut Report, code: i32, enabled: bool) -> i32 {

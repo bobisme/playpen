@@ -1,5 +1,6 @@
 //! Opt-in, machine-readable qualification of native sandbox scenarios.
 
+use crate::cli::discovery::{self, Format};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -186,6 +187,7 @@ fn integration_test(source: Option<&Path>, suite: &str, test: &str) -> (&'static
     };
     let manifest = source.join("Cargo.toml");
     let output = Command::new("cargo")
+        .env_remove("FORMAT")
         .args(["test", "--locked", "--offline", "--manifest-path"])
         .arg(&manifest)
         .args(["--test", suite, test, "--", "--exact", "--nocapture"])
@@ -318,18 +320,51 @@ fn probe_result(report: Result<&Value, &String>, name: &str) -> (&'static str, S
     }
 }
 
+pub(crate) fn list(format: Format) -> i32 {
+    let mut scenarios = Vec::new();
+    for scenario in SCENARIOS {
+        let source = match scenario.check {
+            ScenarioCheck::DoctorProbe(_) => "installed_binary",
+            ScenarioCheck::IntegrationTest { .. } => "source_tree",
+        };
+        if format == Format::Json {
+            scenarios.push(serde_json::json!({"id":scenario.id,"mode":scenario.mode,"evidence":source,"prerequisites":scenario.prerequisites}));
+        } else {
+            println!(
+                "{}  {}  {}  {}",
+                scenario.id,
+                scenario.mode,
+                source,
+                scenario.prerequisites.join(", ")
+            );
+        }
+    }
+    if format == Format::Json {
+        println!("{}", serde_json::json!({"scenarios":scenarios,"advice":[]}));
+    }
+    0
+}
+
 /// Runs all scenarios, marking required scenarios and failing if one could not
 /// execute. Assertions that ran and failed always make the qualification fail.
 #[must_use]
 pub fn run(required: &[String], source: Option<&Path>, json: bool) -> i32 {
+    run_formatted(
+        required,
+        source,
+        if json { Format::Json } else { Format::Pretty },
+    )
+}
+
+pub(crate) fn run_formatted(required: &[String], source: Option<&Path>, format: Format) -> i32 {
     let unknown: Vec<&str> = required
         .iter()
         .filter(|id| !SCENARIOS.iter().any(|scenario| scenario.id == id.as_str()))
         .map(String::as_str)
         .collect();
     if !unknown.is_empty() {
-        eprintln!(
-            "playpen: unknown qualification scenario(s): {}; available: {}",
+        let message = format!(
+            "unknown qualification scenario(s): {}; available: {}",
             unknown.join(", "),
             SCENARIOS
                 .iter()
@@ -337,14 +372,18 @@ pub fn run(required: &[String], source: Option<&Path>, json: bool) -> i32 {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        return 2;
+        return discovery::error(format, "unknown-scenario", &message, 2);
     }
 
     let source = match source.map(validate_source).transpose() {
         Ok(source) => source,
         Err(e) => {
-            eprintln!("playpen: invalid --source: {e}");
-            return 2;
+            return discovery::error(
+                format,
+                "invalid-source",
+                &format!("invalid --source: {e}"),
+                2,
+            );
         }
     };
     let source_str = source.as_ref().map(|path| path.display().to_string());
@@ -396,11 +435,23 @@ pub fn run(required: &[String], source: Option<&Path>, json: bool) -> i32 {
     let ok = results_ok(&scenarios);
     let qualification = Qualification { ok, scenarios };
 
-    if json {
+    print_qualification(&qualification, format);
+    i32::from(!qualification.ok)
+}
+
+fn print_qualification(qualification: &Qualification, format: Format) {
+    if format == Format::Json {
         println!(
             "{}",
-            serde_json::to_string(&qualification).unwrap_or_default()
+            serde_json::json!({"ok":qualification.ok,"scenarios":qualification.scenarios,"advice":[]})
         );
+    } else if format == Format::Text {
+        for scenario in &qualification.scenarios {
+            println!(
+                "{}  {}  {}  {}",
+                scenario.id, scenario.status, scenario.evidence, scenario.detail
+            );
+        }
     } else {
         for scenario in &qualification.scenarios {
             println!(
@@ -421,7 +472,6 @@ pub fn run(required: &[String], source: Option<&Path>, json: bool) -> i32 {
             }
         );
     }
-    i32::from(!qualification.ok)
 }
 
 #[cfg(test)]
