@@ -664,13 +664,17 @@ fn fake_tool(name: &str, script: &str) -> PathBuf {
 }
 
 fn assert_not_started_with(env: (&str, &Path), expect: &str) {
+    assert_not_started_with_allow(env, expect, "192.0.2.1:443/tcp");
+}
+
+fn assert_not_started_with_allow(env: (&str, &Path), expect: &str, allow: &str) {
     let dir = tmpdir("not-started");
     let marker = dir.join(format!("ran-{}", expect.len()));
     let _ = std::fs::remove_file(&marker);
     let out = playpen(&[
         "run",
         "--allow",
-        "192.0.2.1:443/tcp",
+        allow,
         "--",
         "touch",
         marker.to_str().unwrap_or(""),
@@ -690,7 +694,7 @@ fn failing_nft_load_starts_nothing() {
     require_sandbox!();
     let nft = fake_tool(
         "nft-fail",
-        "#!/bin/sh\necho 'simulated failure' >&2\nexit 1\n",
+        "#!/bin/sh\ncat >/dev/null\necho 'simulated failure' >&2\nexit 1\n",
     );
     assert_not_started_with(("PLAYPEN_NFT", &nft), "nft refused the ruleset");
 }
@@ -703,6 +707,37 @@ fn nft_that_loads_nothing_is_caught_by_verification() {
         "#!/bin/sh\ncat >/dev/null\necho '{\"nftables\": []}'\nexit 0\n",
     );
     assert_not_started_with(("PLAYPEN_NFT", &nft), "not the one playpen built");
+}
+
+#[test]
+fn narrower_nft_readback_refuses_to_start_workload() {
+    require_sandbox!();
+    let nft = ["/usr/bin", "/usr/sbin", "/bin", "/sbin"]
+        .into_iter()
+        .map(|dir| Path::new(dir).join("nft"))
+        .find(|path| path.is_file())
+        .expect("native nft");
+    // The load is passed through unchanged. Change only an inclusive port
+    // endpoint in the readback so it still carries the same number of rules.
+    let adapter = fake_tool(
+        "nft-narrower-readback",
+        &format!(
+            "#!/bin/sh\n\
+        if [ \"$1\" = --json ]; then\n\
+            output=$('{}' \"$@\") || exit \"$?\"\n\
+            printf '%s\\n' \"$output\" | sed 's/8002/8001/g'\n\
+        else\n\
+            exec '{}' \"$@\"\n\
+        fi\n",
+            nft.display(),
+            nft.display()
+        ),
+    );
+    assert_not_started_with_allow(
+        ("PLAYPEN_NFT", &adapter),
+        "the loaded ruleset is not the one playpen built: output rule 6 differs",
+        "192.0.2.1:8000-8002/tcp",
+    );
 }
 
 #[test]
@@ -1343,6 +1378,156 @@ fn compare_reports_uses_endpoints_and_requires_complete_evidence() {
     assert_eq!(result["no_longer_observed"], serde_json::json!([]));
     save(&old, &serde_json::json!({"schema":"playpen-shareable-v1"}));
     assert_eq!(run(&args).status.code(), Some(2));
+}
+
+#[test]
+fn grant_use_reports_first_match_without_changing_admissions() {
+    require_sandbox!();
+    let dir = tmpdir("grant-use");
+    let report_path = dir.join("report.json");
+    let policy = [
+        "--allow",
+        "192.0.2.1:9101/tcp",
+        "--allow",
+        "192.0.2.1:9102/tcp",
+        "--allow",
+        "192.0.2.1:9101/tcp",
+        "--allow",
+        "192.0.2.0/30:9101-9102/tcp",
+    ];
+    let workload = [
+        "--",
+        BIN,
+        "probe",
+        "reach",
+        "--serve",
+        "192.0.2.1:9101/tcp",
+        "--try",
+        "192.0.2.1:9101/tcp",
+        "--try",
+        "192.0.2.1:9103/tcp",
+    ];
+    let run_report = |include: bool| {
+        let mut args = vec![
+            "run",
+            "--report",
+            report_path.to_str().expect("UTF-8 test directory"),
+        ];
+        if include {
+            args.push("--report-grant-use");
+        }
+        args.extend_from_slice(&policy);
+        args.extend_from_slice(LO);
+        args.extend_from_slice(&workload);
+        let out = run(&args);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report_path).expect("read report"))
+                .expect("report JSON");
+        (parse_reach(&text(&out.stdout)), report)
+    };
+    let (baseline, quiet) = run_report(false);
+    let (observed, report) = run_report(true);
+    assert_eq!(baseline, observed);
+    assert!(reached(&observed, "192.0.2.1:9101/tcp"));
+    assert!(!reached(&observed, "192.0.2.1:9103/tcp"));
+    assert_eq!(report["dropped"]["packets"], quiet["dropped"]["packets"]);
+    assert!(report["dropped"]["packets"].as_u64().is_some_and(|p| p > 0));
+    assert!(quiet.get("grant_use").is_none());
+    let grants = report["grant_use"]["grants"]
+        .as_array()
+        .expect("grant observations");
+    assert_eq!(grants.len(), 4);
+    assert_eq!(grants[0]["id"], "grant_1");
+    assert_eq!(grants[0]["rule"], "192.0.2.1:9101/tcp");
+    assert!(grants[0]["label"].is_null());
+    assert_eq!(grants[0]["state"], "observed");
+    assert!(grants[0]["packets"].as_u64().is_some_and(|p| p > 0));
+    assert_eq!(grants[1]["state"], "no_observed_match");
+    assert_eq!(grants[1]["packets"], 0);
+    for ambiguous in &grants[2..] {
+        assert_eq!(ambiguous["state"], "shadowed_or_ambiguous");
+        assert_eq!(ambiguous["packets"], 0);
+    }
+}
+
+#[test]
+fn missing_grant_use_counters_are_independent_of_drop_evidence() {
+    require_sandbox!();
+    let nft = ["/usr/bin", "/usr/sbin", "/bin", "/sbin"]
+        .into_iter()
+        .map(|dir| Path::new(dir).join("nft"))
+        .find(|path| path.is_file())
+        .expect("native nft");
+    let dir = tmpdir("grant-counter-missing");
+    let state = dir.join("read");
+    let report = dir.join("report.json");
+    let tool = fake_tool(
+        "nft-grant-counter-missing",
+        &format!(
+            "#!/bin/sh\n\
+        if [ \"$1\" != --json ]; then exec '{}' \"$@\"; fi\n\
+        output=$('{}' \"$@\") || exit \"$?\"\n\
+        if [ -f '{}' ]; then\n\
+            printf '%s\\n' \"$output\" | sed 's/\"grant_1\"/\"unavailable\"/g'\n\
+        else\n\
+            touch '{}' || exit \"$?\"\n\
+            printf '%s\\n' \"$output\"\n\
+        fi\n",
+            nft.display(),
+            nft.display(),
+            state.display(),
+            state.display()
+        ),
+    );
+    let out = playpen(&[
+        "run",
+        "--allow",
+        "192.0.2.1:9101/tcp",
+        "--allow",
+        "192.0.2.1:9102/tcp",
+        "--report-grant-use",
+        "--report",
+        report.to_str().expect("UTF-8 test directory"),
+        "--",
+        "/usr/bin/true",
+    ])
+    .env("PLAYPEN_NFT", tool)
+    .output()
+    .expect("run local workload");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report).expect("read report")).expect("report JSON");
+    assert_eq!(report["grant_use"]["grants"][0]["state"], "unavailable");
+    assert!(report["grant_use"]["grants"][0]["packets"].is_null());
+    assert_eq!(
+        report["grant_use"]["grants"][1]["state"],
+        "no_observed_match"
+    );
+    assert_eq!(report["grant_use"]["grants"][1]["packets"], 0);
+    assert_eq!(report["dropped"]["packets"], 0);
+}
+
+#[test]
+fn no_network_grant_use_is_empty() {
+    require_sandbox!();
+    let report = tmpdir("grant-no-network").join("report.json");
+    let out = run(&[
+        "run",
+        "--no-network",
+        "--report-grant-use",
+        "--report",
+        report.to_str().expect("UTF-8 test directory"),
+        "--",
+        "/usr/bin/true",
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report).expect("read report")).expect("report JSON");
+    assert_eq!(
+        report["grant_use"],
+        serde_json::json!({"grants":[],"truncated":false})
+    );
 }
 
 #[test]

@@ -88,6 +88,9 @@ pub struct Report {
     pub playpen_exit_status: i32,
     /// Drop counters, when they could be read.
     pub dropped: Option<DropSummary>,
+    /// Optional observations for explicit accept rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant_use: Option<crate::grant_use::GrantUse>,
     /// Result of --fail-on-drop, absent when not requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drop_assertion: Option<DropAssertion>,
@@ -263,6 +266,7 @@ mod tests {
             pass: None,
             playpen_exit_status: 0,
             dropped: Some(DropSummary::default()),
+            grant_use: None,
             drop_assertion: None,
             dropped_error: None,
             socket_guard: "landlock",

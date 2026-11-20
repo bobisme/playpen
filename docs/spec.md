@@ -586,11 +586,17 @@ Each step either succeeds or stops the run with a message that ends
    maps). It brings `lo` up through netlink and adds any `--lo-addr`.
 5. **C: load the ruleset** by running `nft -f -` with the ruleset on
    stdin. A non-zero exit stops the run.
-6. **C: verify the ruleset**: `nft --json list table inet playpen` must show
-   the output, input and forward chains on their hooks with policy drop,
-   and the output chain must hold exactly the expected number of rules.
-   Only then does C report "ready". Until this point the namespace has only
-   `lo`.
+6. **C: verify the ruleset.** Compare `nft --json list table inet playpen`
+   with the approved policy. The comparator checks the table family, the
+   filter hooks, priorities and drop policies, ordered matches and verdicts
+   in all chains, and the drop-accounting declarations and rules. Supported
+   schema-1 expressions cover connection state, interfaces, IP addresses
+   and prefixes, IPv6 hop limits and ICMP types, transport ports and ranges,
+   set additions, counters and verdicts. Handles and changing counter values
+   are ignored. Unknown material expressions stop setup. Only then does C
+   report "ready". Until this point the namespace has only `lo`. Playpen
+   relies on the kernel and the configured nft binary to report the installed
+   table faithfully.
 7. **P: attach pasta** (unless `--no-network`) to C's namespaces with the
    options in section 6.3, and wait for it to exit 0 (it daemonizes after
    configuring the namespace). Failure stops the run. P checks the end time
@@ -835,6 +841,36 @@ expiry or pass revocation cannot become success. Refusal and setup failures
 retain their existing statuses. This counts dropped IP packets, not DNS
 misses, Unix sockets, or packets that never reached the ruleset. Without the
 option, the existing exit contract and JSON shape are unchanged.
+
+### Grant use in private reports
+
+Use `--report-grant-use --report FILE` to include `grant_use` in a
+successful run's private JSON report. Playpen adds a packet counter before
+the accept verdict of each of the first 256 explicit grant rules. Startup
+verification checks the counter names and their positions, and the teardown
+readback supplies both grant and drop counts. The report contains an ordered
+`grants` array and a `truncated` flag when later rules went uninstrumented.
+Each row has a one-based ID (`grant_1` and so on) stable for the same ordered
+policy, the canonical rule including port range, the source pass label or
+null for `--allow`, a `packets` count, and a `state`.
+
+- `observed` means at least one packet reached this grant rule. A failed
+  connection can still produce a counted packet.
+- `no_observed_match` means the rule's counter was zero.
+- `shadowed_or_ambiguous` means the counter was zero and an earlier rule's
+  address and port ranges overlap on the same protocol. Rule order decides
+  which explicit accept sees each packet. The overlap check conservatively
+  ignores individual address exclusions.
+- `unavailable` means the counter could not be read for this rule. Its
+  `packets` field is null.
+
+Established and related traffic and fixed sandbox exceptions match before
+explicit grants. These counters measure packets that reached each explicit
+accept rule. They do not measure connections or total bytes exchanged.
+A quiet observation alone does not establish that a future run will need
+less permission. A `--no-network` report has an empty grant list. Grant
+telemetry cannot be combined with `--shareable-report`. Without the option,
+the report schema and the installed accept rules are unchanged.
 
 ### Shareable reports
 

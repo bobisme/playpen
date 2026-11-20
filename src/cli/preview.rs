@@ -35,7 +35,10 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
     });
     Ok(json!({
         "schema": "playpen.plan.v1",
-        "fail_on_drop": args.fail_on_drop, "require_enforced": args.require_enforced,
+        "fail_on_drop": args.fail_on_drop,
+        "instrumented_grants": args.report_grant_use.then(|| checked.approval.rules().iter()
+            .take(crate::grant_use::counter_count(&checked.approval, true))
+            .map(ToString::to_string).collect::<Vec<_>>()), "require_enforced": args.require_enforced,
         "command": args.command.iter().map(|a| unix_string(a)).collect::<Vec<_>>(),
         "cwd": unix_string(cwd.as_os_str()), "pass": pass,
         "allowed": grants.iter().map(ToString::to_string).collect::<Vec<_>>(),

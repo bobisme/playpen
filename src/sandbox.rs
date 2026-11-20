@@ -91,6 +91,8 @@ pub struct Plan {
     pub hosts: Vec<HostEntry>,
     /// Whether to attach pasta (false for `--no-network`).
     pub network: bool,
+    /// Number of grants instrumented for first-match packet counts.
+    pub grant_counters: usize,
     /// Addresses to add to `lo` before the ruleset loads (test aid).
     pub lo_addrs: Vec<IpAddr>,
     /// Extra paths to hide from the command (`--hide`).
@@ -118,6 +120,14 @@ pub struct Plan {
     pub watch: Option<PassWatch>,
 }
 
+impl Plan {
+    fn grant_counter_count(&self) -> usize {
+        self.grant_counters
+            .min(self.approval.rules().len())
+            .min(crate::grant_use::LIMIT)
+    }
+}
+
 /// How the command ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandStatus {
@@ -138,6 +148,8 @@ pub struct RunResult {
     pub stopped_by_pass: Option<String>,
     /// The drop counters, or why they could not be read.
     pub drops: Result<DropSummary, String>,
+    /// Observed per-grant packet counts in instrumentation order.
+    pub grant_packets: Vec<Option<u64>>,
 }
 
 /// Why the command did not run, or what went wrong after it started.
@@ -480,7 +492,8 @@ fn run_sandbox(plan: &Plan, events: &mut dyn Events) -> Result<RunResult, RunErr
         gid: getgid(),
         parent: getpid(),
     };
-    let ruleset_text = ruleset::render_approval(&plan.approval);
+    let grant_counters = plan.grant_counter_count();
+    let ruleset_text = ruleset::render_instrumented(&plan.approval, grant_counters);
     let files = SandboxFiles::build(plan);
 
     match fork_checked().map_err(not_started)? {
@@ -575,6 +588,7 @@ struct ParentState {
     started: bool,
     status: Option<CommandStatus>,
     drops: Option<Result<DropSummary, String>>,
+    grant_packets: Vec<Option<u64>>,
     ready: bool,
     eof: bool,
 }
@@ -602,6 +616,7 @@ impl ParentState {
                 );
             }
             "dropserr" => self.drops = Some(Err(rest.to_owned())),
+            "grants" => self.grant_packets = serde_json::from_str(rest).unwrap_or_default(),
             _ => {}
         }
     }
@@ -887,6 +902,7 @@ fn parent(
         drops: st
             .drops
             .unwrap_or_else(|| Err("the drop counters were not reported".into())),
+        grant_packets: st.grant_packets,
     })
 }
 
@@ -987,7 +1003,8 @@ fn stage_c(
             .map_err(|e| format!("cannot add {addr} to lo: {e}"))?;
     }
     load_ruleset(&plan.nft, ruleset_text)?;
-    verify_ruleset(&plan.nft, plan.approval.rules().len())?;
+    let grant_counters = plan.grant_counter_count();
+    verify_ruleset(&plan.nft, &plan.approval, grant_counters)?;
     write_line(up_w, "ready");
 
     let mut go = [0u8; 1];
@@ -1017,13 +1034,7 @@ fn stage_c(
             let _ = waitpid(child, None);
         }
     }
-    match read_counters(&plan.nft) {
-        Ok(summary) => {
-            let json = serde_json::to_string(&summary).unwrap_or_default();
-            write_line(up_w, &format!("drops {json}"));
-        }
-        Err(e) => write_line(up_w, &format!("dropserr {e}")),
-    }
+    report_counters(&plan.nft, grant_counters, up_w);
     Ok(())
 }
 
@@ -1074,15 +1085,32 @@ fn list_table(nft: &Path) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|_| "nft printed non-UTF-8 output".into())
 }
 
-fn verify_ruleset(nft: &Path, allow_count: usize) -> Result<(), String> {
+fn verify_ruleset(nft: &Path, approval: &Approval, grant_counters: usize) -> Result<(), String> {
     let json = list_table(nft).map_err(|e| format!("cannot verify the ruleset: {e}"))?;
-    ruleset::verify_loaded(&json, allow_count)
+    crate::nft_readback::verify_instrumented(&json, approval, grant_counters)
         .map_err(|e| format!("the loaded ruleset is not the one playpen built: {e}"))
 }
 
-fn read_counters(nft: &Path) -> Result<DropSummary, String> {
-    let json = list_table(nft)?;
-    ruleset::parse_counters(&json)
+fn report_counters(nft: &Path, grant_counters: usize, up: &OwnedFd) {
+    let snapshot = list_table(nft);
+    match snapshot
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|json| ruleset::parse_counters(json))
+    {
+        Ok(summary) => {
+            let json = serde_json::to_string(&summary).unwrap_or_default();
+            write_line(up, &format!("drops {json}"));
+        }
+        Err(e) => write_line(up, &format!("dropserr {e}")),
+    }
+    if grant_counters != 0
+        && let Ok(snapshot) = snapshot
+    {
+        let counters = crate::grant_use::read_packets(&snapshot, grant_counters);
+        let json = serde_json::to_string(&counters).unwrap_or_default();
+        write_line(up, &format!("grants {json}"));
+    }
 }
 
 // ---------------------------------------------------------------- S ----
@@ -1960,6 +1988,7 @@ mod tests {
             started: false,
             status: None,
             drops: None,
+            grant_packets: Vec::new(),
             ready: false,
             eof: false,
         };

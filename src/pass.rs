@@ -102,6 +102,18 @@ pub struct FromPass {
     pub watch: PassWatch,
 }
 
+impl FromPass {
+    /// Source label for each converted rule, in the same order as approval.
+    pub(crate) fn rule_labels(&self) -> Vec<String> {
+        self.watch
+            .in_use
+            .iter()
+            .flat_map(|(label, rules)| std::iter::repeat_n(label.clone(), rules.len()))
+            .take(crate::grant_use::LIMIT)
+            .collect()
+    }
+}
+
 /// Loads the pass at `path` and checks it at `now`.
 ///
 /// `only` narrows the destinations to these labels (empty: all of them).

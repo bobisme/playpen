@@ -1073,3 +1073,33 @@ fn broad_ipv6_pass_prefix_is_refused_but_narrow_native_prefix_works() {
     let out = run(&["plan", "--pass", s(&pass), "--", "true"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
 }
+
+#[test]
+fn grant_use_preserves_pass_labels_for_each_port_range() {
+    require_sandbox!();
+    let dir = tmpdir("grant-provenance");
+    let pass = new_pass(&dir, &valid_pass(&[WEB, SIP]));
+    let report_path = dir.join("grant-use.json");
+    let out = run(&[
+        "run",
+        "--pass",
+        s(&pass),
+        "--only",
+        "web",
+        "--report-grant-use",
+        "--report",
+        s(&report_path),
+        "--",
+        "/usr/bin/true",
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let report = report(&report_path);
+    let rows = report["grant_use"]["grants"]
+        .as_array()
+        .expect("reported grant use");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["label"], "web");
+    assert_eq!(rows[0]["rule"], "192.0.2.1:9101/tcp");
+    assert_eq!(rows[1]["label"], "web");
+    assert_eq!(rows[1]["rule"], "192.0.2.1:9103-9104/tcp");
+}

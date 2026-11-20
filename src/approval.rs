@@ -170,7 +170,7 @@ impl Net {
     }
 
     /// Whether the two networks share at least one address.
-    fn overlaps(self, other: Self) -> bool {
+    pub(crate) fn overlaps(self, other: Self) -> bool {
         let shorter = self.prefix.min(other.prefix);
         match (self.addr, other.addr) {
             (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_)) => {

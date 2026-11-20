@@ -383,11 +383,18 @@ matter for safety:
    only `lo`. The ruleset is loaded and verified first; pasta is attached
    only afterwards. There is no moment at which a route out exists without
    the filter.
-2. **The verification does not trust nft's exit status alone.** After the
-   load, playpen lists the table as JSON and checks the three base chains,
-   their hooks and drop policies, and the number of rules in the output
-   chain. A broken or fake `nft` that exits 0 without loading is caught
-   (tested with a fake `nft` that does exactly that).
+2. **Read back the installed policy.** After loading, Playpen compares
+   the JSON for its table with the typed approval before reporting ready.
+   It checks table family, chain hooks, priorities and policies, ordered rule
+   expressions and verdicts, and the accounting sets and counter. It
+   normalizes the supported numeric and symbolic spellings and ignores
+   handles, counter values and runtime set elements. Unknown material
+   objects or expressions fail closed. A real-load test adapter reports a
+   narrower port range while preserving the rule count and confirms that
+   the workload never starts. This check trusts Linux and the selected
+   `nft` executable (including a `PLAYPEN_NFT` override) to return the
+   installed table. The workload cannot choose that executable after
+   setup.
 3. **The process holding the capabilities never runs user code** and is
    made non-dumpable before any user code exists. It stays dumpable only
    until pasta has attached, because pasta (running as the same user,

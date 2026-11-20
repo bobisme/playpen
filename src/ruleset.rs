@@ -11,6 +11,7 @@ use std::net::IpAddr;
 use serde::Serialize;
 
 use crate::approval::{AllowRule, Approval, Proto};
+pub use crate::nft_readback::verify_policy;
 
 /// Name of the nftables table playpen loads.
 pub const TABLE: &str = "playpen";
@@ -35,6 +36,10 @@ pub fn render(rules: &[AllowRule]) -> String {
 /// Renders an approval with the edge exclusions inherited from its source.
 #[must_use]
 pub fn render_approval(approval: &Approval) -> String {
+    render_instrumented(approval, 0)
+}
+
+pub(crate) fn render_instrumented(approval: &Approval, grant_counters: usize) -> String {
     let mut out = String::new();
     // A table of our own; flush it first so a reload replaces it whole.
     let _ = writeln!(out, "table inet {TABLE} {{}}");
@@ -42,6 +47,13 @@ pub fn render_approval(approval: &Approval) -> String {
     let _ = writeln!(out, "table inet {TABLE} {{");
     let _ = writeln!(out, "\tcounter dropped {{");
     let _ = writeln!(out, "\t}}");
+    for index in 0..grant_counters {
+        let _ = writeln!(
+            out,
+            "\tcounter {} {{}}",
+            crate::grant_use::counter_name(index)
+        );
+    }
     for (name, ty) in [("drop4", "ipv4_addr"), ("drop6", "ipv6_addr")] {
         let _ = writeln!(out, "\tset {name} {{");
         let _ = writeln!(out, "\t\ttype {ty} . inet_proto . inet_service");
@@ -71,12 +83,17 @@ pub fn render_approval(approval: &Approval) -> String {
         out,
         "\t\tip6 daddr ff02::/16 icmpv6 type {{ mld-listener-report, mld2-listener-report, nd-router-solicit }} drop"
     );
-    for rule in approval.rules() {
-        let _ = writeln!(
-            out,
-            "\t\t{} accept",
-            match_expr(rule, &approval.exclusions(rule))
-        );
+    for (index, rule) in approval.rules().iter().enumerate() {
+        let matches = match_expr(rule, &approval.exclusions(rule));
+        let _ = write!(out, "\t\t{matches}");
+        if index < grant_counters {
+            let _ = write!(
+                out,
+                " counter name {}",
+                crate::grant_use::counter_name(index)
+            );
+        }
+        let _ = writeln!(out, " accept");
     }
     let _ = writeln!(
         out,
@@ -138,52 +155,6 @@ fn match_expr(rule: &AllowRule, excluded: &[std::net::Ipv4Addr]) -> String {
         "{family} daddr {}{except} {proto} dport {}",
         rule.net, rule.ports
     )
-}
-
-/// Rules in the output chain for `allow_count` approved destinations.
-#[must_use]
-pub const fn output_rule_count(allow_count: usize) -> usize {
-    // established, two loopback, NDP, silent MLD/RS drop, the approved
-    // rules, four set updates, the counter, the reject.
-    5 + allow_count + 6
-}
-
-/// Checks `nft --json list table inet playpen` against what we loaded: the
-/// three base chains exist on the right hooks with policy drop, and the
-/// output chain holds the expected number of rules.
-///
-/// # Errors
-/// Says which part does not match.
-pub fn verify_loaded(json: &str, allow_count: usize) -> Result<(), String> {
-    let value: serde_json::Value = serde_json::from_str(json)
-        .map_err(|e| format!("nft printed JSON that does not parse: {e}"))?;
-    let items = value
-        .get("nftables")
-        .and_then(serde_json::Value::as_array)
-        .ok_or("nft JSON has no \"nftables\" array")?;
-    for hook in ["output", "input", "forward"] {
-        let found = items.iter().filter_map(|i| i.get("chain")).any(|c| {
-            let s = |k: &str| c.get(k).and_then(serde_json::Value::as_str);
-            s("family") == Some("inet")
-                && s("table") == Some(TABLE)
-                && s("name") == Some(hook)
-                && s("hook") == Some(hook)
-                && s("policy") == Some("drop")
-        });
-        if !found {
-            return Err(format!("no {hook} chain with policy drop"));
-        }
-    }
-    let rules = items
-        .iter()
-        .filter_map(|i| i.get("rule"))
-        .filter(|r| r.get("chain").and_then(serde_json::Value::as_str) == Some("output"))
-        .count();
-    let want = output_rule_count(allow_count);
-    if rules != want {
-        return Err(format!("output chain has {rules} rules, expected {want}"));
-    }
-    Ok(())
 }
 
 /// One dropped destination with its packet count.

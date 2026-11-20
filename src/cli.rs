@@ -198,6 +198,9 @@ struct RunArgs {
     /// Fail if any dropped packets were counted, or counters are unavailable.
     #[arg(long)]
     fail_on_drop: bool,
+    /// Include bounded first-match grant packet counts in the private report.
+    #[arg(long, requires = "report", conflicts_with = "shareable_report")]
+    report_grant_use: bool,
     /// Summary format; json requires --report.
     #[arg(long, value_enum, default_value = "text")]
     format: Format,
@@ -766,6 +769,7 @@ fn base_report(args: &RunArgs) -> Report {
         }),
         playpen_exit_status: EXIT_REFUSED,
         dropped: None,
+        grant_use: None,
         drop_assertion: None,
         dropped_error: None,
         socket_guard: if args.without_landlock {
@@ -926,10 +930,20 @@ fn run(args: &RunArgs) -> i32 {
         ),
         until: report.until.clone(),
     };
+    let grant_labels = if args.report_grant_use {
+        checked
+            .from_pass
+            .as_ref()
+            .map_or_else(Vec::new, pass::FromPass::rule_labels)
+    } else {
+        Vec::new()
+    };
+    let grant_counters = crate::grant_use::counter_count(&checked.approval, args.report_grant_use);
     let plan = Plan {
         approval: checked.approval,
         hosts: checked.hosts,
         network: !args.no_network,
+        grant_counters,
         lo_addrs: checked.lo_addrs,
         hide: args.hide.clone(),
         exposed: checked.exposed,
@@ -983,6 +997,13 @@ fn run(args: &RunArgs) -> i32 {
             128 + s
         }
     };
+    if args.report_grant_use {
+        report.grant_use = Some(crate::grant_use::GrantUse::summarize(
+            plan.approval.rules(),
+            &grant_labels,
+            &result.grant_packets,
+        ));
+    }
     match result.drops {
         Ok(d) => report.dropped = Some(d),
         Err(e) => report.dropped_error = Some(e),
