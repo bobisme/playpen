@@ -98,6 +98,9 @@ enum ProbeCmd {
     },
     /// Send one datagram by address to a Unix datagram socket.
     UnixSend { path: String },
+    /// Take a descriptor passed over the Unix socket at PATH and send a
+    /// datagram to ADDR:PORT through it.
+    UnixRecvFd { path: String, to: String },
     /// List the open file descriptors.
     Fds,
     /// Try TIOCSTI on standard input and opening /dev/tty.
@@ -312,6 +315,16 @@ fn probe(what: ProbeCmd) -> i32 {
             println!("{}", crate::probe::unix_send(&path));
             0
         }
+        ProbeCmd::UnixRecvFd { path, to } => match to.parse() {
+            Ok(to) => {
+                println!("{}", crate::probe::unix_recv_fd(&path, to));
+                0
+            }
+            Err(e) => {
+                eprintln!("probe: {to:?}: {e}");
+                EXIT_ERROR
+            }
+        },
         ProbeCmd::Tty => {
             println!("{}", crate::probe::tty());
             0

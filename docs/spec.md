@@ -489,7 +489,7 @@ Not part of the stable interface, hidden from `--help`:
 - `run --lo-addr ADDR` adds `ADDR` to the sandbox's `lo` before the
   ruleset is loaded. Used by tests and `doctor` to have destinations that
   exist only inside the sandbox.
-- `playpen probe reach|privs|resolve|unix|unix-send|fds|tty|signals|listen` are the checks
+- `playpen probe reach|privs|resolve|unix|unix-send|unix-recv-fd|fds|tty|signals|listen` are the checks
   run inside the sandbox by `doctor` and the tests (`unix` connects to Unix
   sockets and closes at once, writing nothing; `listen` reports
   connections to a TCP listener).

@@ -340,6 +340,81 @@ fn expose_lets_exactly_the_named_socket_or_directory_through() {
     }
 }
 
+/// What DESIGN.md lists as open by design: the peer of a socket the
+/// operator exposed can pass the command a descriptor (`SCM_RIGHTS`), and a
+/// socket passed that way belongs to the host's network, outside the
+/// filter. Shown with a UDP socket of the test's own and a receiver on the
+/// host's loopback; nothing leaves the machine. Without `--expose` the
+/// command cannot connect, so nothing can be passed.
+#[test]
+fn the_peer_of_an_exposed_socket_can_pass_a_host_network_socket() {
+    use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+    use std::os::fd::AsRawFd as _;
+    require_sandbox!();
+    if !landlock_ok() {
+        eprintln!("SKIPPED: no Landlock ABI 9");
+        return;
+    }
+    let dir = tmpdir("scm");
+    let path = dir.join("giver.sock");
+    let _ = std::fs::remove_file(&path);
+    let giver = UnixListener::bind(&path).unwrap_or_else(|e| panic!("{e}"));
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("{e}"));
+    receiver
+        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let to = receiver
+        .local_addr()
+        .unwrap_or_else(|e| panic!("{e}"))
+        .to_string();
+    // The "daemon": gives every client a UDP socket of the host's network.
+    std::thread::spawn(move || {
+        for conn in giver.incoming().flatten() {
+            let Ok(gift) = std::net::UdpSocket::bind("127.0.0.1:0") else {
+                continue;
+            };
+            let fds = [gift.as_raw_fd()];
+            let _ = sendmsg::<()>(
+                conn.as_raw_fd(),
+                &[std::io::IoSlice::new(b"x")],
+                &[ControlMessage::ScmRights(&fds)],
+                MsgFlags::empty(),
+                None,
+            );
+        }
+    });
+    let p = path.display().to_string();
+    let arrived = |receiver: &std::net::UdpSocket| {
+        let mut buf = [0u8; 64];
+        receiver
+            .recv_from(&mut buf)
+            .is_ok_and(|(n, _)| &buf[..n] == b"playpen-probe")
+    };
+    let probe = [BIN, "probe", "unix-recv-fd", p.as_str(), to.as_str()];
+
+    // Not exposed: no connection, no descriptor, nothing arrives; and the
+    // sandbox itself cannot send to the host's loopback.
+    let out = sandbox(&[], &probe);
+    let line = text(&out.stdout);
+    assert!(line.contains("\"received\":false"), "{line}");
+    assert!(line.contains("Permission denied"), "{line}");
+    assert!(!arrived(&receiver));
+
+    // Exposed: the start line names the socket, the descriptor crosses,
+    // and a datagram sent through it arrives on the host's loopback.
+    let out = sandbox(&["--expose", &p], &probe);
+    let line = text(&out.stdout);
+    let err = text(&out.stderr);
+    assert!(err.contains(&format!("exposed: {p}")), "{err}");
+    assert!(line.contains("\"received\":true"), "{line} {err}");
+    assert!(line.contains("\"sent\":\"ALLOWED\""), "{line}");
+    assert!(
+        arrived(&receiver),
+        "the passed socket did not reach the host's loopback: {line}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_datagram_sent_by_address_to_a_host_socket_is_refused() {
     require_sandbox!();
@@ -442,6 +517,160 @@ fn display_exposes_the_wayland_socket_and_is_off_by_default() {
         "{}",
         text(&none.stderr)
     );
+}
+
+/// A private, headless X server for a test: `Xvnc` on a display number it
+/// picks itself, Unix sockets only (no TCP for X, none for VNC), with a
+/// cookie clients must present.
+struct XServer {
+    child: std::process::Child,
+    display: String,
+    authority: PathBuf,
+}
+
+impl XServer {
+    /// `None` when `Xvnc` is not installed or does not come up.
+    fn start(dir: &Path) -> Option<Self> {
+        use std::io::{BufRead as _, Read as _};
+        // An authority file whose one entry matches every display
+        // (family "wild", no address, no number).
+        let mut cookie = [0u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut cookie))
+            .ok()?;
+        let mut entry = vec![0xff, 0xff];
+        for field in [&b""[..], b"", b"MIT-MAGIC-COOKIE-1", &cookie] {
+            entry.extend_from_slice(&u16::try_from(field.len()).ok()?.to_be_bytes());
+            entry.extend_from_slice(field);
+        }
+        // In the runtime directory, which is private inside the sandbox,
+        // so the file is only there if playpen brings it back.
+        let home = Some(runtime_dir()).filter(|d| d.is_dir());
+        let authority = home
+            .as_deref()
+            .unwrap_or(dir)
+            .join(format!("playpen-test-xauth-{}", std::process::id()));
+        std::fs::write(&authority, entry).ok()?;
+        let mut child = Command::new("Xvnc")
+            .args(["-displayfd", "1", "-nolisten", "tcp", "-rfbport", "-1"])
+            .arg("-rfbunixpath")
+            .arg(dir.join("vnc.sock"))
+            .args(["-SecurityTypes", "None", "-auth"])
+            .arg(&authority)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut number = String::new();
+        let _ = std::io::BufReader::new(child.stdout.take()?).read_line(&mut number);
+        let mut server = Self {
+            child,
+            display: format!(":{}", number.trim()),
+            authority,
+        };
+        if number.trim().is_empty() || number.trim().bytes().any(|b| !b.is_ascii_digit()) {
+            server.display.clear();
+            return None;
+        }
+        Some(server)
+    }
+
+    /// Runs an X client that connects, authenticates and asks one question.
+    fn client(&self, playpen: Option<&[&str]>, authority: Option<&Path>) -> Output {
+        let mut cmd = Command::new(if playpen.is_some() { BIN } else { "xdotool" });
+        if let Some(extra) = playpen {
+            cmd.args(["run", "--no-network"])
+                .args(extra)
+                .args(["--", "xdotool"]);
+        }
+        cmd.arg("getdisplaygeometry")
+            .env("DISPLAY", &self.display)
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("XAUTHORITY")
+            .stdin(Stdio::null());
+        if let Some(a) = authority {
+            cmd.env("XAUTHORITY", a);
+        }
+        cmd.output().unwrap_or_else(|e| panic!("{e}"))
+    }
+}
+
+impl Drop for XServer {
+    fn drop(&mut self) {
+        // SIGTERM, so the server removes its socket and lock file in /tmp.
+        let _ = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.authority);
+    }
+}
+
+/// `--display` with a real X server and a real client: the socket in
+/// `/tmp/.X11-unix` is bound back over the private directory, the client
+/// falls back to it from the abstract socket (which the sandbox's network
+/// namespace does not have), and the authority file is there to read.
+#[test]
+fn display_works_with_a_real_x_server_and_is_off_by_default() {
+    require_sandbox!();
+    let on_path = |tool: &str| {
+        ["/usr/bin", "/usr/local/bin", "/bin"]
+            .iter()
+            .any(|d| Path::new(d).join(tool).exists())
+    };
+    if !on_path("Xvnc") || !on_path("xdotool") {
+        eprintln!("SKIPPED: Xvnc and xdotool are not both installed");
+        return;
+    }
+    let dir = tmpdir("xserver");
+    let Some(x) = XServer::start(&dir) else {
+        eprintln!("SKIPPED: Xvnc did not start");
+        return;
+    };
+    let auth = Some(x.authority.as_path());
+    let socket = format!("/tmp/.X11-unix/X{}", &x.display[1..]);
+    // The server and the client work, and the server insists on the cookie.
+    let direct = x.client(None, auth);
+    assert_eq!(direct.status.code(), Some(0), "{}", text(&direct.stderr));
+    let geometry = text(&direct.stdout);
+    assert_eq!(x.client(None, None).status.code(), Some(1));
+
+    let mut modes: Vec<Vec<&str>> = vec![vec!["--without-landlock"]];
+    if landlock_ok() {
+        modes.push(vec![]);
+    }
+    for mode in modes {
+        // Off by default: the client cannot reach the server.
+        let off = x.client(Some(&mode), auth);
+        assert_eq!(off.status.code(), Some(1), "{}", text(&off.stderr));
+        assert!(!text(&off.stderr).contains("display exposed"));
+        // With --display: the same answer as outside.
+        let mut extra = mode.clone();
+        extra.push("--display");
+        let on = x.client(Some(&extra), auth);
+        let err = text(&on.stderr);
+        assert_eq!(on.status.code(), Some(0), "{err}");
+        assert_eq!(text(&on.stdout), geometry, "{err}");
+        assert!(
+            err.contains(&format!(
+                "display exposed: {socket}, {}",
+                x.authority.display()
+            )),
+            "{err}"
+        );
+        // The socket alone is not enough: the server still wants the
+        // cookie, as outside.
+        let no_cookie = x.client(Some(&extra), None);
+        assert_eq!(
+            no_cookie.status.code(),
+            Some(1),
+            "{}",
+            text(&no_cookie.stderr)
+        );
+    }
+    drop(x);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

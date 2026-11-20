@@ -363,3 +363,57 @@ pub fn signals() -> Result<Value, String> {
         }
     }
 }
+
+/// `probe unix-recv-fd`: takes a descriptor passed over a Unix socket.
+///
+/// Connects to the Unix stream socket at `path`, takes one descriptor the
+/// peer passes (`SCM_RIGHTS`), and sends one datagram to `to` through it.
+/// Shows what the peer of a reachable socket can hand the command. Only
+/// for sockets the caller made for the test.
+#[must_use]
+pub fn unix_recv_fd(path: &str, to: SocketAddr) -> Value {
+    use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
+    use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
+    let received = (|| -> Result<OwnedFd, String> {
+        let addr = unix_addr(path).map_err(|e| e.to_string())?;
+        let sock = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        connect(sock.as_raw_fd(), &addr).map_err(|e| format!("connect: {e}"))?;
+        let mut byte = [0u8; 1];
+        let mut iov = [std::io::IoSliceMut::new(&mut byte)];
+        let mut space = nix::cmsg_space!([RawFd; 1]);
+        let msg = recvmsg::<()>(
+            sock.as_raw_fd(),
+            &mut iov,
+            Some(&mut space),
+            MsgFlags::MSG_CMSG_CLOEXEC,
+        )
+        .map_err(|e| format!("recvmsg: {e}"))?;
+        let fd = msg
+            .cmsgs()
+            .map_err(|e| e.to_string())?
+            .find_map(|c| match c {
+                ControlMessageOwned::ScmRights(fds) => fds.first().copied(),
+                _ => None,
+            })
+            .ok_or("the peer passed no descriptor")?;
+        // SAFETY: the kernel just installed this descriptor for us with
+        // the message; nothing else owns it.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    })();
+    match received {
+        Err(e) => json!({"path": path, "received": false, "error": e}),
+        Ok(fd) => {
+            let sent = UdpSocket::from(fd)
+                .send_to(b"playpen-probe", to)
+                .map(drop)
+                .map_err(|e| e.to_string());
+            json!({"path": path, "received": true, "sent": outcome(sent)})
+        }
+    }
+}
