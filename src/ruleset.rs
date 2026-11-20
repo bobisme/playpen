@@ -10,7 +10,7 @@ use std::net::IpAddr;
 
 use serde::Serialize;
 
-use crate::approval::{AllowRule, Proto};
+use crate::approval::{AllowRule, Proto, excluded_addrs};
 
 /// Name of the nftables table playpen loads.
 pub const TABLE: &str = "playpen";
@@ -23,7 +23,10 @@ pub const DROP_SET_SIZE: u32 = 1024;
 /// established and related traffic, loopback destinations on `lo`, the
 /// kernel's own IPv6 neighbour discovery, and the approved destinations.
 /// Everything else is counted (in total and per destination) and rejected,
-/// so a blocked connection fails at once instead of hanging.
+/// so a blocked connection fails at once instead of hanging. A rule for an
+/// IPv4 network does not accept the network and broadcast addresses of any
+/// listed network (see [`excluded_addrs`]); they are counted and rejected
+/// like any other unapproved destination.
 #[must_use]
 pub fn render(rules: &[AllowRule]) -> String {
     let mut out = String::new();
@@ -63,7 +66,11 @@ pub fn render(rules: &[AllowRule]) -> String {
         "\t\tip6 daddr ff02::/16 icmpv6 type {{ mld-listener-report, mld2-listener-report, nd-router-solicit }} drop"
     );
     for rule in rules {
-        let _ = writeln!(out, "\t\t{} accept", match_expr(rule));
+        let _ = writeln!(
+            out,
+            "\t\t{} accept",
+            match_expr(rule, &excluded_addrs(rules, rule))
+        );
     }
     let _ = writeln!(
         out,
@@ -106,7 +113,7 @@ pub fn render(rules: &[AllowRule]) -> String {
     out
 }
 
-fn match_expr(rule: &AllowRule) -> String {
+fn match_expr(rule: &AllowRule, excluded: &[std::net::Ipv4Addr]) -> String {
     let family = match rule.net.addr() {
         IpAddr::V4(_) => "ip",
         IpAddr::V6(_) => "ip6",
@@ -115,7 +122,16 @@ fn match_expr(rule: &AllowRule) -> String {
         Proto::Tcp => "tcp",
         Proto::Udp => "udp",
     };
-    format!("{family} daddr {} {proto} dport {}", rule.net, rule.ports)
+    let except = if excluded.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = excluded.iter().map(ToString::to_string).collect();
+        format!(" {family} daddr != {{ {} }}", list.join(", "))
+    };
+    format!(
+        "{family} daddr {}{except} {proto} dport {}",
+        rule.net, rule.ports
+    )
 }
 
 /// Rules in the output chain for `allow_count` approved destinations.
@@ -284,7 +300,9 @@ mod tests {
             "[2001:db8:1::/48]:1-1024/tcp",
         ]));
         assert!(text.contains("\t\tip daddr 192.0.2.1 tcp dport 443 accept\n"));
-        assert!(text.contains("\t\tip daddr 198.51.100.0/24 udp dport 5060-5070 accept\n"));
+        assert!(text.contains(
+            "\t\tip daddr 198.51.100.0/24 ip daddr != { 198.51.100.0, 198.51.100.255 } udp dport 5060-5070 accept\n"
+        ));
         assert!(text.contains("\t\tip6 daddr 2001:db8::1 udp dport 53 accept\n"));
         assert!(text.contains("\t\tip6 daddr 2001:db8:1::/48 tcp dport 1-1024 accept\n"));
         assert_eq!(text.matches("policy drop;").count(), 3);
@@ -318,7 +336,27 @@ mod tests {
     /// Every rendered allow line has exactly the fixed shape, whatever the
     /// (valid) input.
     fn allow_line_is_well_formed(line: &str) -> bool {
-        let words: Vec<&str> = line.trim().split(' ').collect();
+        let mut words: Vec<&str> = line.trim().split(' ').collect();
+        // The optional exclusion of network and broadcast addresses:
+        // `ip daddr != { A, B, ... }` after the network.
+        if words.get(3..6) == Some(&["ip", "daddr", "!="]) {
+            let Some(close) = words.iter().position(|w| *w == "}") else {
+                return false;
+            };
+            let listed = words.get(7..close).unwrap_or_default();
+            let ok = words[0] == "ip"
+                && words[6] == "{"
+                && !listed.is_empty()
+                && listed.iter().enumerate().all(|(i, w)| {
+                    let last = i + 1 == listed.len();
+                    let addr = if last { Some(*w) } else { w.strip_suffix(',') };
+                    addr.is_some_and(|a| a.parse::<std::net::Ipv4Addr>().is_ok())
+                });
+            if !ok {
+                return false;
+            }
+            words.drain(3..=close);
+        }
         words.len() == 6
             && matches!(words[0], "ip" | "ip6")
             && words[1] == "daddr"

@@ -66,8 +66,11 @@ pub fn check_hosts(hosts: &[HostEntry], approval: &Approval) -> Result<(), SpecE
     for h in hosts {
         if !approval.covers_addr(h.addr) {
             return Err(SpecError::from_message(format!(
-                "--host {}={}: {} is not covered by any --allow, so the name would lead nowhere; approve the address first",
-                h.name, h.addr, h.addr
+                "--host {}={}: {} is not covered by any --allow, so the name would lead nowhere; approve the address first{}",
+                h.name,
+                h.addr,
+                h.addr,
+                approval.edge_hint(h.addr)
             )));
         }
     }

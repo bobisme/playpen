@@ -417,11 +417,12 @@ fn check_pass_hosts(hosts: &[HostEntry], from_pass: &FromPass) -> Result<(), Str
     for h in hosts {
         if !from_pass.approval.covers_addr(h.addr) {
             return Err(format!(
-                "--host {}={}: {} is not in any destination of the pass in use ({}), for any port, so the name would lead to an address nobody approved; map the name to an address the pass lists{}",
+                "--host {}={}: {} is not in any destination of the pass in use ({}), for any port, so the name would lead to an address nobody approved; map the name to an address the pass lists{}{}",
                 h.name,
                 h.addr,
                 h.addr,
                 from_pass.identity.labels.join(", "),
+                from_pass.approval.edge_hint(h.addr),
                 hostname_hint(&from_pass.named, &[])
             ));
         }

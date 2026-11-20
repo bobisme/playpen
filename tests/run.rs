@@ -206,6 +206,89 @@ fn ipv4_approval_does_not_open_ipv6_and_networks_work() {
     assert!(!reached(&r, "[2001:db8::1]:9401/tcp"));
 }
 
+/// The network and broadcast addresses of a listed IPv4 network are not
+/// hosts (hallpass refuses them too): dropped and counted, unless listed
+/// on their own. The addresses exist only on the sandbox's `lo`.
+#[test]
+fn network_and_broadcast_addresses_of_a_listed_network_are_dropped() {
+    require_sandbox!();
+    let dir = tmpdir("edges");
+    let report = dir.join("report.json");
+    let targets = [
+        "198.51.100.0:9411/tcp",
+        "198.51.100.7:9411/tcp",
+        "198.51.100.255:9411/tcp",
+        "198.51.100.255:9412/udp",
+        "203.0.113.255:9411/tcp",
+        "203.0.113.255:9412/tcp",
+    ];
+    let mut args = vec![
+        "run",
+        "--allow",
+        "198.51.100.0/24:9411/tcp",
+        "--allow",
+        "198.51.100.0/24:9412/udp",
+        // Listed on its own, the last address of a network is a host.
+        "--allow",
+        "203.0.113.0/24:9411-9412/tcp",
+        "--allow",
+        "203.0.113.255:9411/tcp",
+        "--report",
+        report.to_str().unwrap_or(""),
+    ];
+    for a in [
+        "198.51.100.0",
+        "198.51.100.7",
+        "198.51.100.255",
+        "203.0.113.255",
+    ] {
+        args.extend_from_slice(&["--lo-addr", a]);
+    }
+    args.extend_from_slice(&["--", BIN, "probe", "reach"]);
+    for t in targets {
+        args.extend_from_slice(&["--serve", t]);
+    }
+    for t in targets {
+        args.extend_from_slice(&["--try", t]);
+    }
+    let out = run(&args);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let r = parse_reach(&text(&out.stdout));
+    assert!(reached(&r, "198.51.100.7:9411/tcp"));
+    assert!(!reached(&r, "198.51.100.0:9411/tcp"));
+    assert!(!reached(&r, "198.51.100.255:9411/tcp"));
+    assert!(!reached(&r, "198.51.100.255:9412/udp"));
+    assert!(reached(&r, "203.0.113.255:9411/tcp"));
+    // Only on the ports of its own rule, not on the network's.
+    assert!(!reached(&r, "203.0.113.255:9412/tcp"));
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap_or_default())
+            .unwrap_or_default();
+    let dropped: Vec<&str> = v["dropped"]["destinations"]
+        .as_array()
+        .map_or_default(|a| a.iter().filter_map(|d| d["address"].as_str()).collect());
+    for a in ["198.51.100.0", "198.51.100.255", "203.0.113.255"] {
+        assert!(dropped.contains(&a), "{a} not in {dropped:?}");
+    }
+    assert!(!dropped.contains(&"198.51.100.7"), "{dropped:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // A name cannot be mapped to such an address either.
+    let out = run(&[
+        "run",
+        "--allow",
+        "198.51.100.0/24:9411/tcp",
+        "--host",
+        "all.example.test=198.51.100.255",
+        "--",
+        "true",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = text(&out.stderr);
+    assert!(err.contains("broadcast address"), "{err}");
+    assert!(err.contains("nothing was run"), "{err}");
+}
+
 #[test]
 fn loopback_inside_the_sandbox_works() {
     require_sandbox!();

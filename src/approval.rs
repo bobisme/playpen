@@ -158,6 +158,23 @@ impl Net {
         }
     }
 
+    /// The network address and the broadcast (all-ones) address of an IPv4
+    /// network of /30 or broader. Those two are not hosts: a packet to the
+    /// all-ones address may reach every host on the network. /31 (RFC 3021)
+    /// and /32 have no such addresses, and IPv6 has no broadcast. The same
+    /// rule as hallpass's `Network::is_network_or_broadcast`.
+    #[must_use]
+    pub fn edges(self) -> Option<[Ipv4Addr; 2]> {
+        match self.addr {
+            IpAddr::V4(a) if self.prefix <= 30 => {
+                let first = u32::from(a);
+                let host_bits = u32::MAX.checked_shr(u32::from(self.prefix)).unwrap_or(0);
+                Some([Ipv4Addr::from(first), Ipv4Addr::from(first | host_bits)])
+            }
+            _ => None,
+        }
+    }
+
     /// Whether the two networks share at least one address.
     fn overlaps(self, other: Self) -> bool {
         let shorter = self.prefix.min(other.prefix);
@@ -251,11 +268,36 @@ pub struct AllowRule {
 }
 
 impl AllowRule {
-    /// Whether this rule covers `ip` (any port, any protocol).
+    /// Whether `ip` lies in this rule's network (any port, any protocol).
+    /// For what a set of rules lets through, which leaves out the network
+    /// and broadcast addresses, see [`Approval::covers_addr`].
     #[must_use]
     pub fn covers_addr(&self, ip: IpAddr) -> bool {
         self.net.contains(ip)
     }
+}
+
+/// The addresses inside `rule`'s network that the rule does not open: the
+/// network and broadcast addresses of every IPv4 network (/30 or broader)
+/// in `rules`. Sorted, without duplicates.
+///
+/// A rule for a single address excludes nothing: an address listed on its
+/// own is a host, whatever network it is also in, and is open on that
+/// rule's own ports and protocol only.
+#[must_use]
+pub fn excluded_addrs(rules: &[AllowRule], rule: &AllowRule) -> Vec<Ipv4Addr> {
+    if rule.net.is_single() {
+        return Vec::new();
+    }
+    let mut out: Vec<Ipv4Addr> = rules
+        .iter()
+        .filter_map(|r| r.net.edges())
+        .flatten()
+        .filter(|a| rule.net.contains(IpAddr::V4(*a)))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 impl fmt::Display for AllowRule {
@@ -525,10 +567,30 @@ impl Approval {
         Ok(())
     }
 
-    /// Whether some rule covers `ip`.
+    /// Whether some rule lets traffic to `ip` through (any port, any
+    /// protocol): a rule for exactly this address, or a network rule that
+    /// holds it, unless it is the network or broadcast address of a listed
+    /// network (see [`excluded_addrs`]).
     #[must_use]
     pub fn covers_addr(&self, ip: IpAddr) -> bool {
-        self.rules.iter().any(|r| r.covers_addr(ip))
+        self.rules.iter().any(|r| {
+            r.covers_addr(ip)
+                && !excluded_addrs(&self.rules, r)
+                    .iter()
+                    .any(|a| IpAddr::V4(*a) == ip)
+        })
+    }
+
+    /// For an address inside a listed network that [`Self::covers_addr`]
+    /// still refuses: why, and what to do. Empty for any other address.
+    #[must_use]
+    pub fn edge_hint(&self, ip: IpAddr) -> String {
+        if self.covers_addr(ip) || !self.rules.iter().any(|r| r.covers_addr(ip)) {
+            return String::new();
+        }
+        format!(
+            ". {ip} is the network or broadcast address of a listed network, not a host: a packet to it may reach every host on that network, so playpen drops it. If it is one host of a larger network, it must be listed as its own address"
+        )
     }
 }
 
@@ -671,6 +733,63 @@ mod tests {
         assert!(r.covers_addr(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 200))));
         assert!(!r.covers_addr(IpAddr::V4(Ipv4Addr::new(198, 51, 101, 1))));
         assert!(!r.covers_addr(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn network_and_broadcast_addresses_are_not_covered() {
+        let v4 = |s: &str| s.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::UNSPECIFIED);
+        let ip = |s: &str| IpAddr::V4(v4(s));
+        let approval = |specs: &[&str]| Approval {
+            rules: specs.iter().map(|s| ok(s)).collect(),
+            ends_at: None,
+        };
+        let none: [Ipv4Addr; 0] = [];
+        let a = approval(&["198.51.100.0/24:80/tcp"]);
+        assert!(a.covers_addr(ip("198.51.100.1")));
+        assert!(a.covers_addr(ip("198.51.100.254")));
+        assert!(!a.covers_addr(ip("198.51.100.0")));
+        assert!(!a.covers_addr(ip("198.51.100.255")));
+        assert!(a.edge_hint(ip("198.51.100.255")).contains("broadcast"));
+        assert_eq!(a.edge_hint(ip("198.51.100.1")), "");
+        assert_eq!(a.edge_hint(ip("198.51.101.255")), "");
+        assert_eq!(
+            excluded_addrs(&a.rules, &a.rules[0]),
+            [v4("198.51.100.0"), v4("198.51.100.255")]
+        );
+        // /31 and /32 have no such addresses; neither has IPv6.
+        for spec in ["198.51.100.4/31:80/tcp", "198.51.100.255:80/tcp"] {
+            let a = approval(&[spec]);
+            assert_eq!(excluded_addrs(&a.rules, &a.rules[0]), none, "{spec}");
+        }
+        let a = approval(&["198.51.100.4/31:80/tcp"]);
+        assert!(a.covers_addr(ip("198.51.100.4")) && a.covers_addr(ip("198.51.100.5")));
+        let a = approval(&["[2001:db8::/120]:80/tcp"]);
+        assert_eq!(excluded_addrs(&a.rules, &a.rules[0]), none);
+        assert!(a.covers_addr(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0))));
+        assert!(a.covers_addr(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff
+        ))));
+        // A /30 has two hosts.
+        let a = approval(&["198.51.100.4/30:80/tcp"]);
+        assert!(!a.covers_addr(ip("198.51.100.4")) && !a.covers_addr(ip("198.51.100.7")));
+        assert!(a.covers_addr(ip("198.51.100.5")) && a.covers_addr(ip("198.51.100.6")));
+        // The edge of one listed network is not opened by another listed
+        // network that holds it as an ordinary address.
+        let a = approval(&["198.51.100.0/24:80/tcp", "198.51.100.0/25:443/tcp"]);
+        assert!(!a.covers_addr(ip("198.51.100.127")));
+        assert_eq!(
+            excluded_addrs(&a.rules, &a.rules[0]),
+            [
+                v4("198.51.100.0"),
+                v4("198.51.100.127"),
+                v4("198.51.100.255")
+            ]
+        );
+        // An address listed on its own is a host.
+        let a = approval(&["198.51.100.0/24:80/tcp", "198.51.100.255:443/tcp"]);
+        assert!(a.covers_addr(ip("198.51.100.255")));
+        assert_eq!(excluded_addrs(&a.rules, &a.rules[1]), none);
+        assert_eq!(excluded_addrs(&a.rules, &a.rules[0]).len(), 2);
     }
 
     #[test]

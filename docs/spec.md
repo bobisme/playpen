@@ -252,7 +252,8 @@ letters, digits and `-`, not starting or ending with `-`, at most 63
 characters per label and 253 in all, not all digits); it is lower-cased.
 `ADDR` is a literal address, as strict as in `--allow`, with or without
 brackets for IPv6. `ADDR` must be covered by some `--allow` rule (any port
-or protocol), otherwise playpen refuses. With `--pass`, `ADDR` must be in
+or protocol), otherwise playpen refuses; the network and broadcast
+addresses of a listed network (section 6.1) are not covered. With `--pass`, `ADDR` must be in
 the address or network of a destination in use (after `--only`), for at
 least one port; otherwise playpen refuses, naming the labels in use.
 
@@ -585,7 +586,15 @@ In this order:
 4. kernel-generated IPv6 MLD reports and router solicitations to
    `ff02::/16` dropped without being counted;
 5. one accept rule per `--allow`: destination address or network,
-   protocol, destination port range;
+   protocol, destination port range. A rule for an IPv4 network does not
+   accept the network address and the broadcast (all-ones) address of any
+   listed network of /30 or broader (`ip daddr NET ip daddr != { ... }`):
+   they are not hosts, and a packet to the all-ones address may reach every
+   host on the network. They fall through to 6 like any other unapproved
+   destination. An address listed on its own (`203.0.113.255:443/tcp`) is a
+   host and is accepted on that rule's ports and protocol. /31 and /32 and
+   IPv6 networks have no such addresses. hallpass refuses the same
+   addresses (`network-or-broadcast`);
 6. everything else: added to a per-destination set with a counter
    (address, protocol, port; port 0 for protocols other than TCP and UDP),
    counted in the `dropped` counter, and rejected with ICMP
