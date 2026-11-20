@@ -1,5 +1,7 @@
 # playpen
 
+![A lone cloaked figure faces a narrow stone causeway leading to the only illuminated gate in a vast wall.](docs/images/playpen.webp)
+
 playpen runs a command (a scanner, a proxy, a browser, a shell) so that its
 network traffic can reach only the literal addresses, ports and protocols you
 approved. Everything else is dropped and counted. It works without root on
