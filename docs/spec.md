@@ -364,8 +364,9 @@ second that it is running. When init hears nothing for 5 seconds
 process in the sandbox itself and prints `playpen itself has been stopped
 or stuck for 5 s ...; the command is paused until playpen continues`. When
 playpen is heard again, init continues the processes it stopped, and
-playpen enforces the end time and re-reads the pass at once. So the
-command runs at most 5 seconds without supervision.
+playpen checks the end time and re-reads the pass if due. Five seconds
+is the silence threshold. The time until processes stop also depends on
+Linux scheduling the sandbox init and delivering its stop signals.
 
 **`--report FILE`**. Write the JSON report to `FILE`, for every outcome,
 refusals by policy included. The file is created (truncated) before
@@ -569,6 +570,128 @@ Written by `run --report FILE`. Field names are stable.
 | `exposed` | array of strings | every exposed path (`--expose` and `--display`), canonical once checked; the `--expose` values as typed when refused |
 | `display` | bool | `--display` was given |
 | `new_session` | bool | the command ran (or would have run) in its own session without a controlling terminal |
+
+### Counted-drop assertion
+
+A zero total accompanied by positive per-destination packet counts makes the
+assertion indeterminate and the wrapper exits unsuccessfully.
+
+With `--fail-on-drop`, the report includes `drop_assertion`: `pass` for a
+known zero total, `violated` for a positive total even with partial detail,
+and `unknown` when counters are unavailable or the command did not start.
+For a child exit of zero, violated or unknown makes playpen exit 1. A nonzero
+child status is retained; signals retain their normal status, and a stop by
+expiry or pass revocation cannot become success. Refusal and setup failures
+retain their existing statuses. This counts dropped IP packets, not DNS
+misses, Unix sockets, or packets that never reached the ruleset. Without the
+option, the existing exit contract and JSON shape are unchanged.
+
+### Grant use in private reports
+
+Use `--report-grant-use --report FILE` to include `grant_use` in a
+successful run's private JSON report. Playpen adds a packet counter before
+the accept verdict of each of the first 256 explicit grant rules. Startup
+verification checks the counter names and their positions, and the teardown
+readback supplies both grant and drop counts. The report contains an ordered
+`grants` array and a `truncated` flag when later rules went uninstrumented.
+Each row has a one-based ID (`grant_1` and so on) stable for the same ordered
+policy, the canonical rule including port range, the source pass label or
+null for `--allow`, a `packets` count, and a `state`.
+
+- `observed` means at least one packet reached this grant rule. A failed
+  connection can still produce a counted packet.
+- `no_observed_match` means the rule's counter was zero.
+- `shadowed_or_ambiguous` means the counter was zero and an earlier rule's
+  address and port ranges overlap on the same protocol. Rule order decides
+  which explicit accept sees each packet. The overlap check conservatively
+  ignores individual address exclusions.
+- `unavailable` means the counter could not be read for this rule. Its
+  `packets` field is null.
+
+Established and related traffic and fixed sandbox exceptions match before
+explicit grants. These counters measure packets that reached each explicit
+accept rule. They do not measure connections or total bytes exchanged.
+A quiet observation alone does not establish that a future run will need
+less permission. A `--no-network` report has an empty grant list. Grant
+telemetry cannot be combined with `--shareable-report`. Without the option,
+the report schema and the installed accept rules are unchanged.
+
+### Shareable reports
+
+`--shareable-report --report FILE` writes a separate `playpen-shareable-v1`
+JSON object directly. Its only fields are `schema`, `outcome`, `exit_code`,
+`signal`, `playpen_exit_status`, `network`, `socket_guard`, `stopped_by_until`,
+`stopped_by_pass`, `dropped_packets`, `destinations_truncated`, and
+`drop_assertion`. The two drop fields are null when unavailable; zero is a
+known zero. The stop booleans classify expiry and pass stops without copying
+free-text reasons. The normal full report remains the default and retains its
+existing compatibility contract. Future shareable fields require an explicit
+allowlist addition and a schema compatibility decision.
+
+```json
+{"schema":"playpen-shareable-v1","outcome":"ran","exit_code":0,"signal":null,"playpen_exit_status":0,"network":"pasta","socket_guard":"landlock","stopped_by_until":false,"stopped_by_pass":false,"dropped_packets":0,"destinations_truncated":false,"drop_assertion":null}
+```
+
+Child output and files created by the caller or child are separate from this
+report and may contain sensitive data. Aggregate counts and the occurrence of
+stops can themselves disclose information, including timing-related behavior.
+
+### Offline report comparison
+
+`playpen compare BEFORE AFTER [--format json]` reads full 0.1.0 reports as
+inert data (at most 1 MiB each). It compares effective grants, network, host
+mappings, exposed sockets, display and socket guard independently of observed
+blocked endpoint tuples. Packet counts do not themselves trigger changes.
+Policy differences are shown before the observations. A newly observed tuple
+requires a complete baseline; a no-longer-observed tuple requires a complete
+later report and does not mean it is allowed or fixed. Missing or partial
+counters, malformed detail, unstarted runs and unsupported/reduced schemas
+cannot establish equality. Exit 0 means comparable policy and complete
+observations with no new denials; 1 means new denials were observed; 2 means
+comparison is indeterminate, policy differs without a new denial, or input
+is invalid. When new denials and a policy change coexist, exit 1 reports the
+new denial and the output still marks the policy change.
+
+### Pass enforcement coverage
+
+`--require-enforced` refuses before command execution when a selected pass
+destination restricts names or any pass-wide application ceiling is present.
+The full report's `enforcement_coverage` identifies packet and time filtering
+and lists selected labels and ceiling names requiring external enforcement,
+including on this refusal. Informational `hostname` is not a restriction;
+`--host` does not enforce request names. A strict run rechecks the pass and
+stops using the existing grace period if unsupported terms become applicable.
+The plan digest includes the strict option and coverage.
+
+### Offline policy examples
+
+`playpen policy-test cases.json --allow 192.0.2.1:443/tcp` evaluates a JSON
+array of outbound application tuples without loading nft or sending packets.
+Each case has `address`, `protocol` (`tcp` or `udp`), `port`, `expect` (`allow`
+or `deny`), and optional `name`. Use `--pass FILE` and optional repeated
+`--only LABEL` instead of `--allow` to test a narrowed pass. The pass must be
+currently valid. Loopback, multicast, unspecified addresses, port zero, and
+special kernel traffic are outside this test's scope.
+
+```json
+[{"name":"upload","address":"192.0.2.1","protocol":"tcp","port":443,"expect":"allow"},
+ {"name":"admin","address":"192.0.2.1","protocol":"tcp","port":8443,"expect":"deny"}]
+```
+
+The example exits 0. Changing the admin expectation to `allow` reports the
+failed case and exits 1. Invalid input or policy is refused with exit 2.
+
+### IPv6 pass prefixes
+
+For Hallpass-derived grants, playpen conservatively refuses any IPv6 prefix
+that can contain an address Hallpass rejects as IPv4 embedded or transitional.
+This includes 6to4, Teredo, SIIT, mapped/compatible, well-known and local-use
+NAT64, and ISATAP interface identifiers. ISATAP can occur under many native
+prefixes, so a broad prefix may be refused even when its base address is
+ordinary; select narrower ranges that cannot contain the pattern. Native
+addresses and narrow prefixes outside these classes remain supported. This
+check follows the pinned Hallpass predicate and does not recognize provider
+specific 6rd, MAP, or network-specific NAT64 prefixes.
 
 ### 4.6 Hidden test aids
 
@@ -827,9 +950,9 @@ Not guarded against, or known limits:
   one, so no supported nft version is claimed to provide that guarantee;
 - a signal sent to playpen's whole process group reaches the command
   twice unless it runs in a new session (section 5);
-- SIGSTOP sent to playpen itself (not Ctrl-Z) stops the command only
-  after 5 seconds of silence (section 4.1); in that time the end time and
-  the pass re-read are not enforced;
+- When SIGSTOP reaches playpen itself, its deadline and pass checks pause.
+  The sandbox init begins freezing the command when it observes 5 seconds
+  of silence (section 4.1).
 - the command can open the caller's other terminals (`/dev/pts/N`);
 - with `--pass`: a revocation or edit takes effect when a scheduled re-read observes it
   (normally every 2 seconds), followed by the grace; traffic in that time is still allowed. Who
@@ -849,125 +972,3 @@ related errors keep their own semantics. Denied requests must still be counted.
 Before enabling it, use namespace-local fixtures to demonstrate both families,
 a permitted reply, denial of an unlisted peer, and unchanged behavior for a
 pass without an echo grant.
-
-### Counted-drop assertion
-
-A zero total accompanied by positive per-destination packet counts makes the
-assertion indeterminate and the wrapper exits unsuccessfully.
-
-With `--fail-on-drop`, the report includes `drop_assertion`: `pass` for a
-known zero total, `violated` for a positive total even with partial detail,
-and `unknown` when counters are unavailable or the command did not start.
-For a child exit of zero, violated or unknown makes playpen exit 1. A nonzero
-child status is retained; signals retain their normal status, and a stop by
-expiry or pass revocation cannot become success. Refusal and setup failures
-retain their existing statuses. This counts dropped IP packets, not DNS
-misses, Unix sockets, or packets that never reached the ruleset. Without the
-option, the existing exit contract and JSON shape are unchanged.
-
-### Grant use in private reports
-
-Use `--report-grant-use --report FILE` to include `grant_use` in a
-successful run's private JSON report. Playpen adds a packet counter before
-the accept verdict of each of the first 256 explicit grant rules. Startup
-verification checks the counter names and their positions, and the teardown
-readback supplies both grant and drop counts. The report contains an ordered
-`grants` array and a `truncated` flag when later rules went uninstrumented.
-Each row has a one-based ID (`grant_1` and so on) stable for the same ordered
-policy, the canonical rule including port range, the source pass label or
-null for `--allow`, a `packets` count, and a `state`.
-
-- `observed` means at least one packet reached this grant rule. A failed
-  connection can still produce a counted packet.
-- `no_observed_match` means the rule's counter was zero.
-- `shadowed_or_ambiguous` means the counter was zero and an earlier rule's
-  address and port ranges overlap on the same protocol. Rule order decides
-  which explicit accept sees each packet. The overlap check conservatively
-  ignores individual address exclusions.
-- `unavailable` means the counter could not be read for this rule. Its
-  `packets` field is null.
-
-Established and related traffic and fixed sandbox exceptions match before
-explicit grants. These counters measure packets that reached each explicit
-accept rule. They do not measure connections or total bytes exchanged.
-A quiet observation alone does not establish that a future run will need
-less permission. A `--no-network` report has an empty grant list. Grant
-telemetry cannot be combined with `--shareable-report`. Without the option,
-the report schema and the installed accept rules are unchanged.
-
-### Shareable reports
-
-`--shareable-report --report FILE` writes a separate `playpen-shareable-v1`
-JSON object directly. Its only fields are `schema`, `outcome`, `exit_code`,
-`signal`, `playpen_exit_status`, `network`, `socket_guard`, `stopped_by_until`,
-`stopped_by_pass`, `dropped_packets`, `destinations_truncated`, and
-`drop_assertion`. The two drop fields are null when unavailable; zero is a
-known zero. The stop booleans classify expiry and pass stops without copying
-free-text reasons. The normal full report remains the default and retains its
-existing compatibility contract. Future shareable fields require an explicit
-allowlist addition and a schema compatibility decision.
-
-```json
-{"schema":"playpen-shareable-v1","outcome":"ran","exit_code":0,"signal":null,"playpen_exit_status":0,"network":"pasta","socket_guard":"landlock","stopped_by_until":false,"stopped_by_pass":false,"dropped_packets":0,"destinations_truncated":false,"drop_assertion":null}
-```
-
-Child output and files created by the caller or child are separate from this
-report and may contain sensitive data. Aggregate counts and the occurrence of
-stops can themselves disclose information, including timing-related behavior.
-
-### Offline report comparison
-
-`playpen compare BEFORE AFTER [--format json]` reads full 0.1.0 reports as
-inert data (at most 1 MiB each). It compares effective grants, network, host
-mappings, exposed sockets, display and socket guard independently of observed
-blocked endpoint tuples. Packet counts do not themselves trigger changes.
-Policy differences are shown before the observations. A newly observed tuple
-requires a complete baseline; a no-longer-observed tuple requires a complete
-later report and does not mean it is allowed or fixed. Missing or partial
-counters, malformed detail, unstarted runs and unsupported/reduced schemas
-cannot establish equality. Exit 0 means comparable policy and complete
-observations with no new denials; 1 means new denials were observed; 2 means
-comparison is indeterminate, policy differs without a new denial, or input
-is invalid. When new denials and a policy change coexist, exit 1 reports the
-new denial and the output still marks the policy change.
-
-### Pass enforcement coverage
-
-`--require-enforced` refuses before command execution when a selected pass
-destination restricts names or any pass-wide application ceiling is present.
-The full report's `enforcement_coverage` identifies packet and time filtering
-and lists selected labels and ceiling names requiring external enforcement,
-including on this refusal. Informational `hostname` is not a restriction;
-`--host` does not enforce request names. A strict run rechecks the pass and
-stops using the existing grace period if unsupported terms become applicable.
-The plan digest includes the strict option and coverage.
-
-### Offline policy examples
-
-`playpen policy-test cases.json --allow 192.0.2.1:443/tcp` evaluates a JSON
-array of outbound application tuples without loading nft or sending packets.
-Each case has `address`, `protocol` (`tcp` or `udp`), `port`, `expect` (`allow`
-or `deny`), and optional `name`. Use `--pass FILE` and optional repeated
-`--only LABEL` instead of `--allow` to test a narrowed pass. The pass must be
-currently valid. Loopback, multicast, unspecified addresses, port zero, and
-special kernel traffic are outside this test's scope.
-
-```json
-[{"name":"upload","address":"192.0.2.1","protocol":"tcp","port":443,"expect":"allow"},
- {"name":"admin","address":"192.0.2.1","protocol":"tcp","port":8443,"expect":"deny"}]
-```
-
-The example exits 0. Changing the admin expectation to `allow` reports the
-failed case and exits 1. Invalid input or policy is refused with exit 2.
-
-### IPv6 pass prefixes
-
-For Hallpass-derived grants, playpen conservatively refuses any IPv6 prefix
-that can contain an address Hallpass rejects as IPv4 embedded or transitional.
-This includes 6to4, Teredo, SIIT, mapped/compatible, well-known and local-use
-NAT64, and ISATAP interface identifiers. ISATAP can occur under many native
-prefixes, so a broad prefix may be refused even when its base address is
-ordinary; select narrower ranges that cannot contain the pattern. Native
-addresses and narrow prefixes outside these classes remain supported. This
-check follows the pinned Hallpass predicate and does not recognize provider
-specific 6rd, MAP, or network-specific NAT64 prefixes.

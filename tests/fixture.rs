@@ -21,9 +21,18 @@ fn concurrent_clients_get_private_routes_and_real_statuses() {
     let mut children = Vec::new();
     for body in ["first", "second"] {
         let file = recipe(body, body);
-        let child=Command::new(BIN).args(["run","--no-network","--fixture"]).arg(file)
-          .args(["--","sh","-ec",r#"curl -qsS --noproxy '*' -d hello -w ':%{http_code}' "$PLAYPEN_FIXTURE_URL/items"; curl -qsS --noproxy '*' -o /dev/null -w ':%{http_code}' "$PLAYPEN_FIXTURE_URL/missing""#])
-          .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("client");
+        let request = r#"
+            curl -qsS --noproxy '*' -d hello -w ':%{http_code}' "$PLAYPEN_FIXTURE_URL/items"
+            curl -qsS --noproxy '*' -o /dev/null -w ':%{http_code}' "$PLAYPEN_FIXTURE_URL/missing"
+        "#;
+        let child = Command::new(BIN)
+            .args(["run", "--no-network", "--fixture"])
+            .arg(file)
+            .args(["--", "sh", "-ec", request])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("client");
         children.push((body, child));
     }
     for (body, child) in children {

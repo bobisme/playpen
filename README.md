@@ -79,6 +79,10 @@ expired or revoked. `--only LABEL` narrows the pass to some destinations;
 `--until` can end the run earlier than the window, never later. The pass's
 host names are never resolved for you; map them with `--host`.
 
+Pass restrictions on destination names and application ceilings need a separate
+application-level enforcer. Use `--require-enforced` to refuse a pass with
+such applicable terms when playpen must enforce every restriction itself.
+
 ### How a pass-backed run ends
 
 If the owner sets `revoked = true`, playpen normally detects it at the
@@ -97,6 +101,12 @@ Time spent in system suspend counts toward the deadline. Poll intervals,
 grace periods and watchdog actions depend on Linux scheduling the supervisor
 and the sandbox init. A signal request and the final process exit can occur
 at different times.
+
+For CI jobs that signal the whole process group, use `playpen run --new-session`
+to deliver each signal to the command once. The default shared group preserves
+interactive shell job control, and a group signal can reach the command twice.
+With `--new-session`, stdin still works, but the command has no controlling
+terminal for `/dev/tty` prompts or nested shell job control.
 
 ### Run with a command-line allow list
 
@@ -166,6 +176,17 @@ playpen run --expect-plan "$digest" --no-network -- printf hello
 The digest binds the reviewed arguments and effective settings, including
 the pass bytes when present. The command reads executable and file contents
 at run time.
+
+### Check dropped traffic in CI
+
+For CI, fail a successful command if it sends a counted denied packet:
+
+```sh
+playpen run --allow 192.0.2.1:443/tcp --fail-on-drop --report report.json -- ./check
+```
+
+Unavailable counters also fail the assertion. The report keeps the child
+status separately from playpen's exit status.
 
 ### Run an HTTP client offline
 
@@ -245,16 +266,3 @@ playpen does not guard against:
 ## License
 
 [MIT License](LICENSE).
-
-For CI, fail a successful command if it sends a counted denied packet:
-
-```sh
-playpen run --allow 192.0.2.1:443/tcp --fail-on-drop --report report.json -- ./check
-```
-
-Unavailable counters also fail the assertion. The report keeps the child
-status separately from playpen's exit status.
-
-Pass destination names restrictions and application ceilings need a separate
-application-level enforcer. Use `--require-enforced` to refuse a pass with
-such applicable terms when playpen must enforce every restriction itself.
