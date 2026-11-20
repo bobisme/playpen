@@ -17,8 +17,20 @@ pub enum Outcome {
     Refused,
     /// The sandbox could not be built; nothing was run. Exit status 1.
     NotStarted,
-    /// Something failed after the command started. Exit status 1.
+    /// Supervision failed, and execution may have occurred. Exit status 1.
     Error,
+}
+
+/// Evidence available to a caller deciding whether a retry is safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupEvidence {
+    /// Refused before release, or the child explicitly reported a pre-exec error.
+    NotStarted,
+    /// The close-on-exec handshake completed and a normal child exit was observed.
+    ExecAndExit,
+    /// The available observations cannot establish whether user code executed.
+    Unknown,
 }
 
 /// The JSON report. Field names are stable.
@@ -32,6 +44,8 @@ pub struct Report {
     pub playpen_version: &'static str,
     /// What happened.
     pub outcome: Outcome,
+    /// Startup evidence for retry decisions.
+    pub startup_evidence: StartupEvidence,
     /// Human-readable explanation for anything but a clean run.
     pub message: Option<String>,
     /// The command line that was (or would have been) run.
@@ -176,6 +190,7 @@ mod tests {
         Report {
             playpen_version: "0",
             outcome: Outcome::Ran,
+            startup_evidence: StartupEvidence::ExecAndExit,
             message: None,
             command: vec!["true".into()],
             allowed: vec![],

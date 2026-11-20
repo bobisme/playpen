@@ -14,7 +14,7 @@ use time::OffsetDateTime;
 
 use crate::approval::{Approval, EndsAt, parse_allow, parse_literal_addr};
 use crate::pass::{self, FromPass, MIN_RECHECK_INTERVAL, NamedDestination, RECHECK_INTERVAL};
-use crate::report::{Outcome, PassReport, Report, text_summary};
+use crate::report::{Outcome, PassReport, Report, StartupEvidence, text_summary};
 use crate::resolver::{HostEntry, check_hosts, parse_host};
 use crate::sandbox::{self, CommandStatus, Events, Plan, RunError};
 use crate::sockets;
@@ -685,6 +685,7 @@ fn base_report(args: &RunArgs) -> Report {
     Report {
         playpen_version: env!("CARGO_PKG_VERSION"),
         outcome: Outcome::Refused,
+        startup_evidence: StartupEvidence::NotStarted,
         message: None,
         command: args
             .command
@@ -797,6 +798,9 @@ fn run(args: &RunArgs) -> i32 {
     let fail = |report: &mut Report, file: Option<&mut File>, outcome, msg: String| {
         eprintln!("playpen: {msg}");
         report.outcome = outcome;
+        if outcome == Outcome::Error {
+            report.startup_evidence = StartupEvidence::Unknown;
+        }
         report.message = Some(msg);
         report.playpen_exit_status = EXIT_ERROR;
         write_report(file, report);
@@ -885,10 +889,12 @@ fn run(args: &RunArgs) -> i32 {
     }
     let code = match result.status {
         CommandStatus::Exited(c) => {
+            report.startup_evidence = StartupEvidence::ExecAndExit;
             report.exit_code = Some(c);
             c
         }
         CommandStatus::Signaled(s) => {
+            report.startup_evidence = StartupEvidence::Unknown;
             report.signal = Some(s);
             128 + s
         }

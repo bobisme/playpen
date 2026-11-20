@@ -484,6 +484,16 @@ pass, 1 otherwise. JSON: `{"ok": bool, "checks": [{"name", "ok",
 
 ### 4.5 JSON report fields
 
+For retry decisions, read `startup_evidence`. A value of `not_started`
+means refusal before release or an explicit pre-exec failure.
+`exec_and_exit` means the exec-error pipe closed cleanly and the
+supervisor observed a normal child exit. A signal can close that pipe
+before exec; a signaled exit or missing startup evidence is `unknown`.
+A report with `outcome: "error"` can therefore describe a command that
+executed. For a non-idempotent job, retry automatically only on an explicit
+`not_started` result. Older reports omit the field.
+
+
 Written by `run --report FILE`. Field names are stable.
 
 | Field | Type | Meaning |

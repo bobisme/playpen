@@ -190,3 +190,13 @@
 1795204509156367	lead	itc:AQ		item.move	bn-755	{"state":"doing"}	blake3:9kGHVqen1LvPjoJ7rHfCRh5LSfOOXY2QcMG2LPSYrfI
 1795204509166883	lead	itc:AQ		item.assign	bn-755	{"action":"assign","agent":"lead"}	blake3:lsklLno8Zw-TXZyH2Uzc8EjDXKmj1Zf6T7IIJ-BijbQ
 1795204614249327	lead	itc:AQ		item.move	bn-755	{"reason":"Pinned native offline launch returned pinned-ok. CLI tests reject changed grants, argv and pass bytes. The supervisor revalidates the digest before GO; clippy all targets passed.","state":"done"}	blake3:XLBhumfRREMwM3YNGgWY6Soa9nxjEamz7oTnQiY5o3Y
+1795204628617449	lead	itc:AQ		item.move	bn-2xw	{"state":"doing"}	blake3:RyTSplveNXP00dTTKjP6AMEeQrhnBFqTvnsHFJLrk6Y
+1795204628630414	lead	itc:AQ		item.assign	bn-2xw	{"action":"assign","agent":"lead"}	blake3:dw7u6LUSAl-hp5t9A4bNeWcrqKaK3h7aqb9RlUeDLC4
+1795204628645230	sol	itc:AQ		item.move	bn-k0v	{"state":"doing"}	blake3:BUN2WvlOHs4F2GKOj_sDdpg6zAu-UUYxfwl3sScsQew
+1795204628655207	sol	itc:AQ		item.assign	bn-k0v	{"action":"assign","agent":"sol"}	blake3:GZgSPYQ2Ln6nSRujG6BvL5kEWrXmJTBUSEMeZX8gSwU
+1795204628670557	terra	itc:AQ		item.move	bn-3t9	{"state":"doing"}	blake3:JI0FWZALcDHpOp_-I9Mp7EyN22MxlOxztgE8x3xEQ7w
+1795204628680659	terra	itc:AQ		item.assign	bn-3t9	{"action":"assign","agent":"terra"}	blake3:hB4w0fN5LFS0ii27Ic-CwDTrUBMmnHiBk-8ussyjEzA
+1795204628695675	luna	itc:AQ		item.move	bn-38n	{"state":"doing"}	blake3:sDtEerCUuOH7_qoYxT_b4Swl-uYvI4ovZ9F-Mu2yZvQ
+1795204628705643	luna	itc:AQ		item.assign	bn-38n	{"action":"assign","agent":"luna"}	blake3:XXdzS2AlRCmlU6xSVVMKqWtGzMBX_WNEzQUg2-30Eq0
+1795204749826524	lead	itc:AQ		item.move	bn-2xw	{"reason":"Seven representative status traces checked for every partition into up to three reads. Treating missing post-GO evidence as refusal failed the init-only trace.","state":"done"}	blake3:2QJBNB67STEorKFSXfcwbf7miXPDtEXJtY5JODOcJAk
+1795204749857979	lead	itc:AQ		item.move	bn-3aq	{"reason":"Native offline reports distinguished explicit exec failure from normal exit 0 and child exit 2. Synthetic lost-status traces are unknown; the retry contract is in docs/spec.md.","state":"done"}	blake3:KB9JECXH0ymma5pCtnh-zAuMEM8qybU_ApgPJZyN0JE

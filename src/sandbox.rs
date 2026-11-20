@@ -145,7 +145,7 @@ pub struct RunResult {
 pub enum RunError {
     /// The sandbox could not be built; the command was never started.
     NotStarted(String),
-    /// Something failed after the command had started.
+    /// Execution may have occurred, and the supervisor lacks complete evidence.
     Failed(String),
 }
 
@@ -563,9 +563,11 @@ impl SandboxFiles {
 
 // ---------------------------------------------------------------- P ----
 
+#[derive(Default)]
 struct ParentState {
     buf: Vec<u8>,
     failure: Option<String>,
+    status_error: Option<String>,
     init: Option<Pid>,
     started: bool,
     status: Option<CommandStatus>,
@@ -585,6 +587,7 @@ impl ParentState {
                 }
             }
             "init" => self.init = rest.parse::<i32>().ok().map(Pid::from_raw),
+            "statuserr" => self.status_error = Some(rest.to_owned()),
             "started" => self.started = true,
             "exit" => self.status = rest.parse().ok().map(CommandStatus::Exited),
             "signal" => self.status = rest.parse().ok().map(CommandStatus::Signaled),
@@ -600,19 +603,35 @@ impl ParentState {
         }
     }
 
+    fn receive(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            self.handle_line(&String::from_utf8_lossy(&line[..pos]));
+        }
+    }
+
+    /// After GO, only an explicit pre-exec diagnostic proves refusal.
+    fn launch_result(&self) -> Result<(), RunError> {
+        if let Some(msg) = &self.status_error {
+            return Err(RunError::Failed(msg.clone()));
+        }
+        match (&self.failure, self.started) {
+            (None, true) => Ok(()),
+            (Some(msg), false) => Err(RunError::NotStarted(msg.clone())),
+            _ => Err(RunError::Failed(
+                "the supervisor lost reliable startup evidence; the command may have executed"
+                    .into(),
+            )),
+        }
+    }
+
     /// Reads what is available on `fd` and handles complete lines.
     fn pump(&mut self, fd: &OwnedFd) {
         let mut chunk = [0u8; 8192];
         match read(fd, &mut chunk) {
             Ok(0) => self.eof = true,
-            Ok(n) => {
-                self.buf.extend_from_slice(&chunk[..n]);
-                while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = self.buf.drain(..=pos).collect();
-                    let text = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
-                    self.handle_line(&text);
-                }
-            }
+            Ok(n) => self.receive(&chunk[..n]),
             Err(Errno::EINTR | Errno::EAGAIN) => {}
             Err(_) => self.eof = true,
         }
@@ -682,16 +701,7 @@ fn parent(
     down_w: OwnedFd,
     events: &mut dyn Events,
 ) -> Result<RunResult, RunError> {
-    let mut st = ParentState {
-        buf: Vec::new(),
-        failure: None,
-        init: None,
-        started: false,
-        status: None,
-        drops: None,
-        ready: false,
-        eof: false,
-    };
+    let mut st = ParentState::default();
     // Phase 1: C builds the namespaces and loads the ruleset.
     let setup_deadline = Instant::now() + Duration::from_secs(30);
     while !st.ready && st.failure.is_none() && !st.eof {
@@ -857,20 +867,7 @@ fn parent(
     if let Some(p) = pasta {
         p.stop();
     }
-    if !st.started {
-        let why = st.failure.unwrap_or_else(|| {
-            let ended = if term_sent_at.is_some() {
-                "the approval ended before the command started"
-            } else {
-                "the sandbox ended before the command started"
-            };
-            stopped_by_pass.as_ref().map_or_else(
-                || ended.to_owned(),
-                |why| format!("{why}, before the command started"),
-            )
-        });
-        return Err(RunError::NotStarted(why));
-    }
+    st.launch_result()?;
     let status = match st.status {
         Some(s) => s,
         None if killed => CommandStatus::Signaled(Signal::SIGKILL as i32),
@@ -1147,7 +1144,10 @@ fn stage_i(
             Ok(0) => break,
             Ok(n) => msg.extend_from_slice(&chunk[..n]),
             Err(Errno::EINTR) => {}
-            Err(_) => break,
+            Err(e) => {
+                write_line(up_w, &format!("statuserr cannot read exec status: {e}"));
+                return Ok(1);
+            }
         }
     }
     if !msg.is_empty() {
@@ -1163,7 +1163,13 @@ fn stage_i(
     } else {
         child
     };
-    init_loop(child, target, plan.new_session, &sigfd, up_w, down_r)
+    match init_loop(child, target, plan.new_session, &sigfd, up_w, down_r) {
+        Ok(code) => Ok(code),
+        Err(msg) => {
+            write_line(up_w, &format!("statuserr {msg}"));
+            Ok(1)
+        }
+    }
 }
 
 /// I's work while the command runs: pass the signals P names on to
@@ -1788,6 +1794,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn startup_evidence_survives_fragmentation_and_truncation() {
+        for (wire, expected) in [
+            ("started\nexit 0\n", "handshake"),
+            ("fail exec refused\n", "refused"),
+            ("statuserr interrupted\n", "unknown"),
+            ("started\nstatuserr lost status\n", "unknown"),
+            ("fail refused\nstarted\n", "unknown"),
+            ("init 3\n", "unknown"),
+            ("fail partial", "unknown"),
+        ] {
+            // Enumerate every two cuts of each ordered status stream, including
+            // empty reads. EINTR/EAGAIN leave the parser state untouched.
+            for a in 0..=wire.len() {
+                for b in a..=wire.len() {
+                    let mut state = ParentState::default();
+                    for chunk in [&wire[..a], &wire[a..b], &wire[b..]] {
+                        state.receive(chunk.as_bytes());
+                    }
+                    let actual = match state.launch_result() {
+                        Ok(()) => "handshake",
+                        Err(RunError::NotStarted(_)) => "refused",
+                        Err(RunError::Failed(_)) => "unknown",
+                    };
+                    assert_eq!(actual, expected, "{wire:?}, cuts {a}, {b}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn outer_id_reads_single_mappings() {
         assert_eq!(outer_id("         0       1000          1\n"), Some(1000));
         assert_eq!(outer_id("0 0 4294967295"), None);
@@ -1844,6 +1880,7 @@ mod tests {
         let mut st = ParentState {
             buf: Vec::new(),
             failure: None,
+            status_error: None,
             init: None,
             started: false,
             status: None,

@@ -1186,3 +1186,33 @@ fn doctor_passes_here() {
     assert_eq!(v["ok"], true, "{}", text(&out.stdout));
     assert_eq!(out.status.code(), Some(0));
 }
+
+#[test]
+fn startup_evidence_guides_retry_after_refusal_and_child_exit() {
+    require_sandbox!();
+    for (command, outcome, evidence, code) in [
+        (
+            "/nonexistent/playpen-test-command",
+            "not_started",
+            "not_started",
+            1,
+        ),
+        ("/bin/true", "ran", "exec_and_exit", 0),
+        ("/bin/sh", "ran", "exec_and_exit", 2),
+    ] {
+        let report = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("startup-evidence-{}.json", std::process::id()));
+        let mut cmd = Command::new(BIN);
+        cmd.args(["run", "--no-network", "--report"])
+            .arg(&report)
+            .args(["--", command]);
+        if command == "/bin/sh" {
+            cmd.args(["-c", "exit 2"]);
+        }
+        assert_eq!(cmd.output().expect("run").status.code(), Some(code));
+        let r: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report).expect("report")).expect("JSON");
+        assert_eq!(r["outcome"], outcome);
+        assert_eq!(r["startup_evidence"], evidence);
+    }
+}
