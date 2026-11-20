@@ -90,6 +90,8 @@ enum Cmd {
 
 #[derive(Debug, Subcommand)]
 enum ProbeCmd {
+    /// Serve the private HTTP fixture passed on standard input.
+    HttpFixture,
     /// Start listeners, then try to reach targets.
     Reach {
         #[arg(long = "serve")]
@@ -162,6 +164,9 @@ struct RunArgs {
     /// No network at all: only loopback inside the sandbox.
     #[arg(long)]
     no_network: bool,
+    /// Serve one literal HTTP fixture on private loopback in offline mode.
+    #[arg(long, requires = "no_network", value_name = "JSON")]
+    fixture: Option<PathBuf>,
     /// Also hide this host path from the command (sockets/files: bound to
     /// /dev/null; directories: an empty read-only tmpfs). Repeatable.
     #[arg(long = "hide", value_name = "PATH")]
@@ -311,6 +316,13 @@ fn pass_report(id: &pass::PassIdentity) -> PassReport {
 
 fn probe(what: ProbeCmd) -> i32 {
     match what {
+        ProbeCmd::HttpFixture => match crate::fixture::serve() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("fixture: {e}");
+                EXIT_ERROR
+            }
+        },
         ProbeCmd::Reach { serve, tries } => {
             let parse = |v: &[String]| -> Result<Vec<_>, String> {
                 v.iter().map(|s| crate::probe::parse_target(s)).collect()
@@ -405,6 +417,7 @@ fn probe(what: ProbeCmd) -> i32 {
 
 /// Validated run request.
 struct Checked {
+    fixture: Option<crate::fixture::Fixture>,
     new_session: bool,
     approval: Approval,
     hosts: Vec<HostEntry>,
@@ -584,6 +597,11 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
     let (exposed, display) = check_exposed(args)?;
     sandbox::check_stdio(!args.without_landlock)?;
     Ok(Checked {
+        fixture: args
+            .fixture
+            .as_deref()
+            .map(crate::fixture::Fixture::load)
+            .transpose()?,
         new_session: new_session(args),
         approval,
         hosts,
@@ -940,6 +958,7 @@ fn run(args: &RunArgs) -> i32 {
     };
     let grant_counters = crate::grant_use::counter_count(&checked.approval, args.report_grant_use);
     let plan = Plan {
+        fixture: checked.fixture,
         approval: checked.approval,
         hosts: checked.hosts,
         network: !args.no_network,

@@ -7,6 +7,7 @@ pub mod approval;
 pub mod cli;
 mod compare;
 pub mod doctor;
+pub mod fixture;
 mod grant_use;
 pub mod landlock;
 pub mod netlink;

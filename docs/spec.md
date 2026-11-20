@@ -416,6 +416,24 @@ holds its status), `"refused"` or `"not_started"` when nothing ran,
 `"error"` when playpen failed after starting it. Messages for the
 not-run cases always contain `nothing was run`.
 
+### Offline HTTP fixture
+
+With `--no-network --fixture FILE`, playpen reads a JSON object containing
+`method`, `path`, `status` and a literal UTF-8 response `body`. GET, POST,
+PUT, PATCH and DELETE are supported. Requests must match the path exactly,
+including the query string. Unmatched routes return 404. The recipe and
+fixed-length request body each have a 64 KiB limit; request headers have
+an 8 KiB limit. Chunked uploads and HTTP upgrades are outside this protocol.
+A bodyless response status (204, 205 or 304) requires an empty body.
+
+The helper binds the sandbox loopback interface and reports its port
+before the client can exec. The client receives the base URL in
+`PLAYPEN_FIXTURE_URL`. Invalid configuration or failed readiness prevents
+launch. The helper inherits the workload restrictions, runs as a separate
+process under namespace init and ends with that namespace. If the helper
+dies mid-run, the client sees the ordinary local connection failure.
+Preview and pin include the fixture contents. See the README for a curl example.
+
 ### Supervisor lifecycle events
 
 `run --events-fd N` accepts an inherited pipe writer above stderr. Close the

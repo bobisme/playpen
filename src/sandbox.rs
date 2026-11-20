@@ -85,6 +85,8 @@ const SI_KERNEL: i32 = 0x80;
 /// Everything the sandbox needs to know. Built and checked by the CLI.
 #[derive(Debug, Clone)]
 pub struct Plan {
+    /// Optional private loopback HTTP response for offline runs.
+    pub fixture: Option<crate::fixture::Fixture>,
     /// What is approved.
     pub approval: Approval,
     /// `--host` entries.
@@ -1806,7 +1808,11 @@ fn stage_x(plan: &Plan) -> Result<std::convert::Infallible, String> {
     sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
         .map_err(|e| format!("cannot unblock signals: {e}"))?;
     let (program, args) = plan.command.split_first().ok_or("no command was given")?;
-    let err = Command::new(program).args(args).exec();
+    let mut cmd = Command::new(program);
+    if let Some(fixture) = &plan.fixture {
+        cmd.env("PLAYPEN_FIXTURE_URL", fixture.start()?);
+    }
+    let err = cmd.args(args).exec();
     Err(format!(
         "cannot run {}: {err}",
         Path::new(program).display()

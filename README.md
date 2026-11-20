@@ -167,6 +167,17 @@ The digest binds the reviewed arguments and effective settings, including
 the pass bytes when present. The command reads executable and file contents
 at run time.
 
+### Run an HTTP client offline
+
+Save one response in a fixture file, then run a client against it:
+
+```sh
+printf '%s\n' '{"method":"GET","path":"/items","status":200,"body":"[]"}' > items.json
+playpen run --no-network --fixture items.json -- sh -c 'curl -qsS --noproxy "*" "$PLAYPEN_FIXTURE_URL/items"'
+```
+
+The client prints `[]`. Each run has a private listener and an ephemeral port.
+
 ## Requirements
 
 - Linux with unprivileged user namespaces enabled (the default on most

@@ -35,6 +35,7 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
     });
     Ok(json!({
         "schema": "playpen.plan.v1",
+        "fixture": checked.fixture,
         "fail_on_drop": args.fail_on_drop,
         "instrumented_grants": args.report_grant_use.then(|| checked.approval.rules().iter()
             .take(crate::grant_use::counter_count(&checked.approval, true))
