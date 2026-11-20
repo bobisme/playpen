@@ -800,6 +800,122 @@ fn signals_are_forwarded_to_the_command() {
     assert_eq!(status.code(), Some(42));
 }
 
+/// The pid of the one child of `parent`, from `/proc`.
+fn only_child(parent: u32) -> Option<u32> {
+    let mut found = std::fs::read_dir("/proc")
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()))
+        .filter(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            // After the command name: the state letter, then the parent.
+            stat.rsplit_once(") ")
+                .and_then(|(_, tail)| tail.split(' ').nth(1)?.parse().ok())
+                == Some(parent)
+        });
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
+}
+
+/// How a test sends SIGUSR1 to a running playpen.
+#[derive(Clone, Copy, Debug)]
+enum SendTo {
+    /// To playpen alone.
+    Supervisor,
+    /// To playpen's whole process group, the command included.
+    Group,
+    /// To every playpen process one by one (as `killall playpen` does),
+    /// not to the command.
+    EachPlaypen,
+}
+
+/// Starts a signal counter in a sandbox in its own process group, sends it
+/// SIGUSR1 `SENT` times, and returns how many arrived.
+fn usr1_deliveries(extra: &[&str], how: SendTo) -> u64 {
+    use std::io::BufRead as _;
+    use std::os::unix::process::CommandExt as _;
+    const SENT: u32 = 4;
+    let kill = |target: &str, sig: &str| {
+        let st = Command::new("kill").args([sig, "--", target]).status();
+        assert!(st.is_ok_and(|s| s.success()), "kill {sig} {target}");
+    };
+    let mut args = vec!["run", "--no-network"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--", BIN, "probe", "signals"]);
+    let mut child = playpen(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap_or_else(|e| panic!("{e}"));
+    let pid = child.id();
+    let mut stdout =
+        std::io::BufReader::new(child.stdout.take().unwrap_or_else(|| panic!("no stdout")));
+    let mut line = String::new();
+    let _ = stdout.read_line(&mut line);
+    assert_eq!(line, "ready\n");
+    // playpen and its three helpers (C, S and I in sandbox.rs), each the
+    // only child of the one before; the command is I's child.
+    let mut helpers = vec![pid];
+    for _ in 0..3 {
+        let last = helpers.last().copied().unwrap_or(pid);
+        helpers.push(only_child(last).unwrap_or_else(|| panic!("no child of {last}")));
+    }
+    for _ in 0..SENT {
+        match how {
+            SendTo::Supervisor => kill(&pid.to_string(), "-USR1"),
+            SendTo::Group => kill(&format!("-{pid}"), "-USR1"),
+            SendTo::EachPlaypen => {
+                for p in &helpers {
+                    kill(&p.to_string(), "-USR1");
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    kill(&pid.to_string(), "-TERM");
+    let mut rest = String::new();
+    let _ = stdout.read_to_string(&mut rest);
+    let _ = child.wait();
+    let v: serde_json::Value = serde_json::from_str(rest.trim()).unwrap_or_default();
+    v["usr1"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no count in {rest:?} ({how:?})"))
+}
+
+/// A signal for playpen reaches the command once, however it was sent:
+/// to playpen alone, or to each of its processes. Sent to the whole
+/// process group, the command also gets its own copy from the kernel when
+/// it is in that group (bn-1w3: playpen cannot tell that it did), so there
+/// it arrives twice, never more; in a new session, once.
+#[test]
+fn a_signal_for_playpen_reaches_the_command_once() {
+    require_sandbox!();
+    assert_eq!(usr1_deliveries(&[], SendTo::Supervisor), 4);
+    assert_eq!(usr1_deliveries(&[], SendTo::EachPlaypen), 4);
+    let group = usr1_deliveries(&[], SendTo::Group);
+    assert!((4..=8).contains(&group), "{group} deliveries of 4 signals");
+    for how in [SendTo::Supervisor, SendTo::EachPlaypen, SendTo::Group] {
+        assert_eq!(usr1_deliveries(&["--new-session"], how), 4, "{how:?}");
+    }
+}
+
+/// A process inside that signals PID 1 (the sandbox's init) reaches the
+/// command, as a container's init would pass it on.
+#[test]
+fn a_signal_sent_to_pid_1_inside_reaches_the_command() {
+    require_sandbox!();
+    let out = run(&[
+        "run",
+        "--no-network",
+        "--",
+        "sh",
+        "-c",
+        "trap 'exit 43' TERM; kill -TERM 1; sleep 2; exit 1",
+    ]);
+    assert_eq!(out.status.code(), Some(43), "{}", text(&out.stderr));
+}
+
 #[test]
 fn no_network_has_only_loopback() {
     require_sandbox!();

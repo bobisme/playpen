@@ -211,7 +211,16 @@ SIGWINCH on, and sends everything it passes on to the command's whole
 process group, as the terminal would. (A first version had P forward the
 terminal's signals to I. That lost signals under load: I also gets the
 terminal's own copy, a pending standard signal absorbs a second one, and
-I then saw only the kernel's copy, which it ignored.) Ctrl-Z works through
+I then saw only the kernel's copy, which it ignored.) Signals from other
+processes P passes to I as bytes on their pipe, never with `kill`: I is in
+P's process group, so a signal sent to the group, or to every playpen
+process, reaches I as well, and I could not tell that copy from P's. I
+passes on what P names, what the terminal sent (in a new session), and what
+a process inside the sandbox sent to PID 1 (its sender has a process id in
+I's namespace; a sender outside shows as 0), and drops the rest. What is
+left: outside a new session a signal sent to the whole process group
+reaches the command from the kernel and again through P, which cannot know
+that the command had its own copy. Ctrl-Z works through
 the freeze; but `/dev/tty` cannot be opened (password prompts of `ssh` or
 `sudo` fail) and a shell inside has no job control. Reading from the
 terminal on stdin works.

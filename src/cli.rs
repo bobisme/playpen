@@ -102,6 +102,8 @@ enum ProbeCmd {
     Fds,
     /// Try TIOCSTI on standard input and opening /dev/tty.
     Tty,
+    /// Count deliveries of SIGUSR1 until SIGTERM.
+    Signals,
     /// Listen on ADDR:PORT/tcp for MS milliseconds; print the connections.
     Listen {
         target: String,
@@ -314,6 +316,16 @@ fn probe(what: ProbeCmd) -> i32 {
             println!("{}", crate::probe::tty());
             0
         }
+        ProbeCmd::Signals => match crate::probe::signals() {
+            Ok(v) => {
+                println!("{v}");
+                0
+            }
+            Err(e) => {
+                eprintln!("probe: {e}");
+                EXIT_ERROR
+            }
+        },
         ProbeCmd::Listen { target, ms } => {
             match crate::probe::parse_target(&target).and_then(|t| crate::probe::listen_tcp(t, ms))
             {

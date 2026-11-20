@@ -339,3 +339,27 @@ pub fn resolve(name: &str) -> Value {
         Err(e) => json!({"name": name, "addresses": [], "error": e.to_string()}),
     }
 }
+
+/// Counts deliveries of SIGUSR1 until SIGTERM arrives. Prints `ready` once
+/// both are blocked; every delivery is taken as soon as it arrives, so two
+/// copies of one signal that arrive apart are counted as two.
+///
+/// # Errors
+/// When the signals cannot be blocked or waited for.
+pub fn signals() -> Result<Value, String> {
+    use nix::sys::signal::{SigSet, SigmaskHow, Signal, sigprocmask};
+    let mut set = SigSet::empty();
+    set.add(Signal::SIGUSR1);
+    set.add(Signal::SIGTERM);
+    sigprocmask(SigmaskHow::SIG_BLOCK, Some(&set), None).map_err(|e| e.to_string())?;
+    println!("ready");
+    let mut usr1 = 0u32;
+    loop {
+        match set.wait() {
+            Ok(Signal::SIGUSR1) => usr1 += 1,
+            Ok(_) => return Ok(json!({ "usr1": usr1 })),
+            Err(Errno::EINTR) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}

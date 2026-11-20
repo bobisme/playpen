@@ -26,7 +26,10 @@
 //! every process in the sandbox, `t` to thaw the ones it froze. P sends
 //! them when it is suspended (Ctrl-Z) and continued, so the command never
 //! runs while P, which enforces the end time and re-reads the pass, is
-//! stopped.
+//! stopped. The signals P passes on to the command travel on this pipe
+//! too, one byte each (see [`signal_byte`]): I is in P's process group, so
+//! a signal sent to the group, or to every playpen process, reaches I as
+//! well, and I could not tell that copy from one P sent it with `kill`.
 
 use std::ffi::OsString;
 use std::fs;
@@ -333,6 +336,25 @@ const FREEZE: u8 = b'f';
 const THAW: u8 = b't';
 /// Byte P sends C: build the PID namespace and start the command.
 const GO: u8 = b'g';
+
+/// The byte P sends I to have it pass `sig` on to the command: 1 to 7, the
+/// signal's place in [`FORWARDED`]. `None` for any other signal.
+fn signal_byte(sig: Signal) -> Option<u8> {
+    let at = FORWARDED.iter().position(|s| *s == sig)?;
+    u8::try_from(at + 1).ok()
+}
+
+/// The signal a byte from P stands for, if it is one of [`signal_byte`]'s.
+fn byte_signal(byte: u8) -> Option<Signal> {
+    FORWARDED.get(usize::from(byte).checked_sub(1)?).copied()
+}
+
+/// P asks I to pass `sig` on to the command.
+fn pass_on(down_w: &OwnedFd, sig: Signal) {
+    if let Some(b) = signal_byte(sig) {
+        send_byte(down_w, b);
+    }
+}
 
 /// True when this kernel lets an unprivileged process push input into its
 /// controlling terminal with `TIOCSTI`.
@@ -692,7 +714,6 @@ fn parent(
     // Phase 3: the command runs.
     let mut term_sent_at: Option<Instant> = None;
     let mut killed = false;
-    let mut pending: Vec<Signal> = Vec::new();
     let mut stopped_by_pass: Option<String> = None;
     let mut next_recheck = watch.as_ref().map(|w| Instant::now() + w.interval);
     while !st.eof {
@@ -709,7 +730,7 @@ fn parent(
                         events.pass_withdrawn(&why);
                         stopped_by_pass = Some(why);
                         term_sent_at = Some(now);
-                        stop_command(st.init, child);
+                        stop_command(st.init, child, &down_w);
                     }
                 }
                 next_recheck = Some(Instant::now() + w.interval);
@@ -724,7 +745,7 @@ fn parent(
             if now >= d {
                 events.until_reached();
                 term_sent_at = Some(now);
-                stop_command(st.init, child);
+                stop_command(st.init, child, &down_w);
             } else {
                 wake = wake.min(d);
             }
@@ -737,11 +758,6 @@ fn parent(
                 let _ = kill(st.init.unwrap_or(child), Signal::SIGKILL);
             } else {
                 wake = wake.min(t + GRACE);
-            }
-        }
-        if let Some(init) = st.init {
-            for s in std::mem::take(&mut pending) {
-                let _ = kill(init, s);
             }
         }
         let ms = u16::try_from(
@@ -778,11 +794,9 @@ fn parent(
                     Signal::SIGCONT => send_byte(&down_w, THAW),
                     // The terminal sent it to its foreground process group,
                     // which holds the command, or, in a new session, I
-                    // (which passes it on). Forwarding it as well would
-                    // race: standard signals merge while pending, and I
-                    // could see only the kernel's copy.
+                    // (which passes it on).
                     _ if info.ssi_code == SI_KERNEL => {}
-                    _ => pending.push(sig),
+                    _ => pass_on(&down_w, sig),
                 }
             }
         }
@@ -825,16 +839,13 @@ fn suspend(down_w: &OwnedFd) {
     let _ = kill(getpid(), Signal::SIGSTOP);
 }
 
-/// First step of stopping the command: SIGTERM to the sandbox's init, which
-/// passes it on; SIGKILL to C if init is not known yet.
-fn stop_command(init: Option<Pid>, child: Pid) {
-    match init {
-        Some(init) => {
-            let _ = kill(init, Signal::SIGTERM);
-        }
-        None => {
-            let _ = kill(child, Signal::SIGKILL);
-        }
+/// First step of stopping the command: ask the sandbox's init to pass
+/// SIGTERM on to it; SIGKILL to C if there is no init yet.
+fn stop_command(init: Option<Pid>, child: Pid, down_w: &OwnedFd) {
+    if init.is_some() {
+        pass_on(down_w, Signal::SIGTERM);
+    } else {
+        let _ = kill(child, Signal::SIGKILL);
     }
 }
 
@@ -1077,10 +1088,17 @@ fn stage_i(
     init_loop(child, target, plan.new_session, &sigfd, up_w, down_r)
 }
 
-/// I's work while the command runs: pass signals on to `target`, freeze
-/// and thaw on P's request, reap orphans, and report how the command
-/// ended. With `from_terminal`, signals the kernel sent (the terminal
-/// signals I's process group, no longer the command's) are passed on too.
+/// I's work while the command runs: pass the signals P names on to
+/// `target`, freeze and thaw on P's request, reap orphans, and report how
+/// the command ended.
+///
+/// Of the signals I receives itself, two kinds are passed on: those a
+/// process inside the sandbox sent to PID 1, and, with `from_terminal`,
+/// those the kernel sent (the terminal signals I's process group, no
+/// longer the command's). A signal from a process outside (sent to the
+/// process group, or to every playpen process) is not: P received it too
+/// and passes it on through the pipe, and passing on both would deliver it
+/// twice.
 fn init_loop(
     child: Pid,
     target: Pid,
@@ -1111,7 +1129,11 @@ fn init_loop(
                         match byte {
                             FREEZE => freeze(&mut frozen),
                             THAW => thaw(&mut frozen),
-                            _ => {}
+                            _ => {
+                                if let Some(sig) = byte_signal(byte) {
+                                    let _ = kill(target, sig);
+                                }
+                            }
                         }
                     }
                 }
@@ -1128,7 +1150,10 @@ fn init_loop(
         };
         if sig != Signal::SIGCHLD {
             // Job-control signals are P's business (freeze and thaw).
-            if FORWARDED.contains(&sig) && (from_terminal || info.ssi_code != SI_KERNEL) {
+            // A sender outside this PID namespace shows as pid 0.
+            let from_kernel = info.ssi_code == SI_KERNEL;
+            let from_inside = !from_kernel && info.ssi_pid != 0;
+            if FORWARDED.contains(&sig) && (from_inside || (from_terminal && from_kernel)) {
                 let _ = kill(target, sig);
             }
             continue;
@@ -1646,6 +1671,19 @@ mod tests {
         assert!(m.contains("userns,"), "{m}");
         assert!(m.contains("apparmor_restrict_unprivileged_userns"), "{m}");
         assert!(m.contains("docs/DESIGN.md"), "{m}");
+    }
+
+    #[test]
+    fn signal_bytes_round_trip_and_do_not_collide() {
+        for sig in FORWARDED {
+            let b = signal_byte(sig);
+            assert_eq!(b.and_then(byte_signal), Some(sig));
+            assert!(b.is_some_and(|b| ![FREEZE, THAW, GO].contains(&b)));
+        }
+        assert_eq!(signal_byte(Signal::SIGKILL), None);
+        for b in [0, 8, FREEZE, THAW, GO] {
+            assert_eq!(byte_signal(b), None);
+        }
     }
 
     #[test]

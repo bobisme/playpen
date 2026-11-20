@@ -481,7 +481,7 @@ Not part of the stable interface, hidden from `--help`:
 - `run --lo-addr ADDR` adds `ADDR` to the sandbox's `lo` before the
   ruleset is loaded. Used by tests and `doctor` to have destinations that
   exist only inside the sandbox.
-- `playpen probe reach|privs|resolve|unix|unix-send|fds|tty|listen` are the checks
+- `playpen probe reach|privs|resolve|unix|unix-send|fds|tty|signals|listen` are the checks
   run inside the sandbox by `doctor` and the tests (`unix` connects to Unix
   sockets and closes at once, writing nothing; `listen` reports
   connections to a TCP listener).
@@ -546,11 +546,20 @@ Each step either succeeds or stops the run with a message that ends
     (exit 1). Otherwise I reports "started".
 
 While the command runs, P forwards SIGINT, SIGTERM, SIGHUP, SIGQUIT,
-SIGUSR1, SIGUSR2 and SIGWINCH it receives from another process to I, which
-passes them to the command (to its process group in a new session).
+SIGUSR1, SIGUSR2 and SIGWINCH it receives from another process to I (as a
+byte on its pipe to I, not as a signal), which passes them to the command
+(to its process group in a new session).
 Signals the kernel generated (for example Ctrl-C from the terminal) already
 reach the command directly and are not sent twice; in a new session they
 reach I instead (it is in playpen's process group), which passes them on.
+I also passes on a signal that a process inside the sandbox sends to PID 1.
+A signal I receives from outside is not passed on: P received it too. So a
+signal sent to playpen, or to each playpen process (`killall playpen`),
+reaches the command once. A signal sent to playpen's whole process group
+(`kill -TERM -PGID`, `timeout` without `--foreground`, a shell's `kill
+%1`) reaches the command once in a new session; otherwise the command is
+in that group, gets its own copy from the kernel and P's as well: twice.
+P cannot tell the two cases apart.
 On SIGTSTP, P asks I to stop every
 process in the sandbox that is not stopped already, then stops itself; on
 SIGCONT it asks I to continue them. I reaps orphaned processes.
@@ -682,6 +691,8 @@ Not guarded against, or known limits:
 - per-destination drop lists hold 1024 destinations per address family;
   the total count stays exact and `destinations_truncated` says when the
   list is incomplete;
+- a signal sent to playpen's whole process group reaches the command
+  twice unless it runs in a new session (section 5);
 - SIGSTOP sent to playpen itself (not Ctrl-Z) stops playpen but not the
   command; the end time and the pass re-read wait until playpen continues;
 - the command can open the caller's other terminals (`/dev/pts/N`);
