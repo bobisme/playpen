@@ -11,7 +11,7 @@ use std::net::{TcpListener, UdpSocket};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BIN: &str = env!("CARGO_BIN_EXE_playpen");
 
@@ -1123,6 +1123,74 @@ fn host_sockets_are_hidden() {
 }
 
 #[test]
+fn explicit_missing_and_dangling_hide_paths_are_reported_on_stderr() {
+    require_sandbox!();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = tmpdir("hide-diagnostic").join(nonce.to_string());
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+    let missing = dir.join("missing");
+    let dangling = dir.join("dangling");
+    let existing = dir.join("existing");
+    std::fs::write(&existing, "host data").unwrap_or_else(|e| panic!("{e}"));
+    std::os::unix::fs::symlink(dir.join("absent-target"), &dangling)
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let mut sandbox_available = true;
+    for path in [&missing, &dangling] {
+        let path = path.to_str().unwrap_or("");
+        let out = run(&[
+            "run",
+            "--no-network",
+            "--hide",
+            path,
+            "--",
+            "printf",
+            "usable stdout",
+        ]);
+        assert!(
+            text(&out.stderr).contains("NOTE: --hide path"),
+            "{}",
+            text(&out.stderr)
+        );
+        assert!(text(&out.stderr).contains("nothing was hidden there"));
+        if out.status.code() != Some(0) {
+            assert!(
+                text(&out.stderr).contains("nothing was run"),
+                "{}",
+                text(&out.stderr)
+            );
+            sandbox_available = false;
+            break;
+        }
+        assert_eq!(text(&out.stdout), "usable stdout");
+    }
+
+    let path = existing.to_str().unwrap_or("");
+    let out = run(&["run", "--no-network", "--hide", path, "--", "cat", path]);
+    assert!(
+        !text(&out.stderr).contains("NOTE: --hide path"),
+        "{}",
+        text(&out.stderr)
+    );
+    if out.status.code() != Some(0) {
+        assert!(
+            text(&out.stderr).contains("nothing was run"),
+            "{}",
+            text(&out.stderr)
+        );
+        sandbox_available = false;
+    }
+    if !sandbox_available {
+        eprintln!("SKIPPED: host refused sandbox setup before hide/stdout behavior could run");
+        return;
+    }
+    assert_eq!(text(&out.stdout), "");
+}
+
+#[test]
 fn refusals_exit_2_and_run_nothing() {
     let cases: &[&[&str]] = &[
         &["run", "--", "true"],
@@ -1687,4 +1755,63 @@ fn published_reviewed_offline_workflow_and_report_contract() {
         serde_json::from_slice(&compared.stdout).unwrap_or_default();
     assert_eq!(comparison["policy"], "same");
     assert_eq!(comparison["evidence"], "incomplete");
+}
+
+#[test]
+fn doctor_offline_mode_does_not_require_pasta() {
+    require_sandbox!();
+    let offline = playpen(&["doctor", "--mode", "offline", "--format", "json"])
+        .env("PLAYPEN_PASTA", "/nonexistent/playpen-test-pasta")
+        .output()
+        .unwrap_or_else(|e| panic!("{e}"));
+    let offline_json: serde_json::Value =
+        serde_json::from_slice(&offline.stdout).unwrap_or_default();
+    assert_eq!(offline.status.code(), Some(0), "{}", text(&offline.stdout));
+    assert_eq!(offline_json["capability"]["mode"], "offline");
+    assert_eq!(offline_json["capability"]["status"], "available");
+    assert!(offline_json["probes"].as_array().is_some_and(|probes| {
+        probes
+            .iter()
+            .all(|probe| probe["status"] == "executed" && probe["ok"] == true)
+    }));
+    assert!(!text(&offline.stdout).contains("pasta"));
+
+    let egress = playpen(&["doctor", "--mode", "egress", "--format", "json"])
+        .env("PLAYPEN_PASTA", "/nonexistent/playpen-test-pasta")
+        .output()
+        .unwrap_or_else(|e| panic!("{e}"));
+    let egress_json: serde_json::Value = serde_json::from_slice(&egress.stdout).unwrap_or_default();
+    assert_eq!(egress.status.code(), Some(1), "{}", text(&egress.stdout));
+    assert_eq!(egress_json["capability"]["mode"], "egress");
+    assert_eq!(egress_json["capability"]["status"], "unavailable");
+    assert!(egress_json["probes"].as_array().is_some_and(|probes| {
+        probes
+            .iter()
+            .all(|probe| probe["status"] == "untested" && probe["ok"].is_null())
+    }));
+}
+
+#[test]
+fn doctor_missing_nft_makes_both_modes_unavailable_and_probes_untested() {
+    require_sandbox!();
+    for mode in ["offline", "egress"] {
+        let out = playpen(&["doctor", "--mode", mode, "--format", "json"])
+            .env("PLAYPEN_NFT", "/nonexistent/playpen-test-nft")
+            .output()
+            .unwrap_or_else(|e| panic!("{e}"));
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        assert_eq!(out.status.code(), Some(1), "{mode}: {}", text(&out.stdout));
+        assert_eq!(json["capability"]["mode"], mode);
+        assert_eq!(json["capability"]["status"], "unavailable");
+        assert!(json["probes"].as_array().is_some_and(|probes| {
+            probes
+                .iter()
+                .all(|probe| probe["status"] == "untested" && probe["ok"].is_null())
+        }));
+        assert!(json["checks"].as_array().is_some_and(|checks| {
+            checks
+                .iter()
+                .any(|check| check["name"] == "nft" && check["ok"] == false)
+        }));
+    }
 }

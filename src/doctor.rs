@@ -8,6 +8,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use clap::ValueEnum;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -17,10 +18,55 @@ struct Check {
     detail: String,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    Offline,
+    Egress,
+}
+
+impl Mode {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::Egress => "egress",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeResult {
+    name: &'static str,
+    status: &'static str,
+    ok: Option<bool>,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct Capability {
+    mode: &'static str,
+    status: &'static str,
+    detail: String,
+}
+
 fn read_sysctl(path: &str) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_owned())
+}
+
+fn apparmor_userns_check(value: &str) -> Check {
+    Check {
+        name: "AppArmor user namespace restriction",
+        ok: true,
+        detail: if value == "0" {
+            "kernel.apparmor_restrict_unprivileged_userns = 0".into()
+        } else {
+            format!(
+                "kernel.apparmor_restrict_unprivileged_userns = {value}; the live namespace probe will determine whether an AppArmor profile permits playpen"
+            )
+        },
+    }
 }
 
 fn userns_checks(out: &mut Vec<Check>) {
@@ -54,17 +100,7 @@ fn userns_checks(out: &mut Vec<Check>) {
         });
     }
     if let Some(v) = read_sysctl("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") {
-        out.push(Check {
-            name: "AppArmor user namespace restriction",
-            ok: v == "0",
-            detail: if v == "0" {
-                "kernel.apparmor_restrict_unprivileged_userns = 0".into()
-            } else {
-                format!(
-                    "kernel.apparmor_restrict_unprivileged_userns = {v}; unprivileged namespaces get no capabilities unless an AppArmor profile allows them for playpen"
-                )
-            },
-        });
+        out.push(apparmor_userns_check(&v));
     }
 }
 
@@ -125,6 +161,92 @@ fn self_run(run_args: &[&str], probe: &[&str]) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn self_command(run_args: &[&str], command: &[&str]) -> Check {
+    let name = "offline command";
+    let Some((executable, arguments)) = command.split_first() else {
+        return Check {
+            name,
+            ok: false,
+            detail: "no command was configured".into(),
+        };
+    };
+    let me = match std::env::current_exe() {
+        Ok(me) => me,
+        Err(e) => {
+            return Check {
+                name,
+                ok: false,
+                detail: format!("cannot find own binary: {e}"),
+            };
+        }
+    };
+    let out = Command::new(&me)
+        .arg("run")
+        .args(run_args)
+        .arg("--")
+        .arg(executable)
+        .args(arguments)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => Check {
+            name,
+            ok: true,
+            detail: "a real --no-network command ran successfully".into(),
+        },
+        Ok(o) => Check {
+            name,
+            ok: false,
+            detail: format!(
+                "exit status {}: {}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr)
+                    .trim()
+                    .replace('\n', " | ")
+            ),
+        },
+        Err(e) => Check {
+            name,
+            ok: false,
+            detail: format!("cannot run {}: {e}", me.display()),
+        },
+    }
+}
+
+fn offline_interfaces_check() -> Check {
+    let name = "offline loopback only";
+    let out = match self_run(&["--no-network"], &["interfaces"]) {
+        Ok(out) => out,
+        Err(e) => {
+            return Check {
+                name,
+                ok: false,
+                detail: e,
+            };
+        }
+    };
+    let interfaces = serde_json::from_str::<serde_json::Value>(out.trim())
+        .ok()
+        .and_then(|value| value["interfaces"].as_array().cloned())
+        .unwrap_or_default();
+    let names = interfaces
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    if names == ["lo"] {
+        Check {
+            name,
+            ok: true,
+            detail: "the sandbox exposes only its loopback interface".into(),
+        }
+    } else {
+        Check {
+            name,
+            ok: false,
+            detail: format!("expected only lo, found {}", names.join(", ")),
+        }
+    }
 }
 
 const SANDBOX: &[&str] = &[
@@ -219,10 +341,11 @@ fn reach_check() -> Check {
     }
 }
 
-fn privs_check(nft: &Path) -> Check {
+fn privs_check(nft: &Path, offline: bool) -> Check {
     let name = "command cannot change the network";
     let nft_s = nft.display().to_string();
-    let out = match self_run(SANDBOX, &["privs", "--nft", &nft_s]) {
+    let run_args: &[&str] = if offline { &["--no-network"] } else { SANDBOX };
+    let out = match self_run(run_args, &["privs", "--nft", &nft_s]) {
         Ok(o) => o,
         Err(e) => {
             return Check {
@@ -293,6 +416,10 @@ fn terminal_check() -> Check {
     }
 }
 
+fn prerequisites_ok(checks: &[Check]) -> bool {
+    checks.iter().all(|check| check.ok)
+}
+
 /// A host socket (in a fresh private directory) and a host abstract
 /// socket must not be connectable from inside.
 fn sockets_check() -> Check {
@@ -337,40 +464,147 @@ fn sockets_check() -> Check {
 
 /// Runs every check and prints the result. Returns the exit status.
 #[must_use]
-pub fn run(json: bool) -> i32 {
+pub fn run(mode: Mode, json: bool) -> i32 {
     let mut checks = Vec::new();
     userns_checks(&mut checks);
     let nft = crate::tools::nft();
-    let pasta = crate::tools::pasta();
     checks.push(tool_check(
         "nft",
         nft.as_deref(),
         "install nftables (it provides /usr/bin/nft) or set PLAYPEN_NFT",
     ));
-    checks.push(tool_check(
-        "pasta",
-        pasta.as_deref(),
-        "install passt (it provides /usr/bin/pasta) or set PLAYPEN_PASTA; without it only --no-network works",
-    ));
+    if matches!(mode, Mode::Egress) {
+        let found = crate::tools::pasta();
+        checks.push(tool_check(
+            "pasta",
+            found.as_deref(),
+            "install passt (it provides /usr/bin/pasta) or set PLAYPEN_PASTA",
+        ));
+    }
     checks.push(landlock_check());
     checks.push(terminal_check());
-    let basics_ok = checks.iter().all(|c| c.ok);
-    if basics_ok && let Some(nft) = &nft {
-        checks.push(reach_check());
-        checks.push(privs_check(nft));
-        checks.push(sockets_check());
-    } else {
+
+    let prereq_end = checks.len() - 1; // terminal behavior is informational
+    let prereqs_ok = prerequisites_ok(&checks[..prereq_end]);
+    let prereq_detail = checks[..prereq_end]
+        .iter()
+        .filter(|c| !c.ok)
+        .map(|c| format!("{}: {}", c.name, c.detail))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut probes = Vec::new();
+
+    if prereqs_ok && let Some(nft) = nft.as_deref() {
+        let executed = match mode {
+            Mode::Offline => vec![
+                self_command(&["--no-network"], &["true"]),
+                offline_interfaces_check(),
+                privs_check(nft, true),
+                sockets_check(),
+            ],
+            Mode::Egress => vec![reach_check(), privs_check(nft, false), sockets_check()],
+        };
+        for check in executed {
+            probes.push(ProbeResult {
+                name: check.name,
+                status: "executed",
+                ok: Some(check.ok),
+                detail: check.detail.clone(),
+            });
+            checks.push(check);
+        }
+    }
+
+    if probes.is_empty() {
+        let skipped: &[&str] = match mode {
+            Mode::Offline => &[
+                "offline command",
+                "offline loopback only",
+                "command cannot change the network",
+                "host Unix sockets unreachable",
+            ],
+            Mode::Egress => &[
+                "allowed reached, others blocked",
+                "command cannot change the network",
+                "host Unix sockets unreachable",
+            ],
+        };
+        for name in skipped {
+            probes.push(ProbeResult {
+                name,
+                status: "untested",
+                ok: None,
+                detail: format!("not run because prerequisites are unavailable: {prereq_detail}"),
+            });
+        }
         checks.push(Check {
             name: "namespace self-test",
             ok: false,
-            detail: "skipped because a check above failed".into(),
+            detail: format!("untested; prerequisites are unavailable: {prereq_detail}"),
         });
     }
+
     let ok = checks.iter().all(|c| c.ok);
+    let capability = capability(mode, prereqs_ok, prereq_detail, &probes);
+    print_result(mode, ok, &capability, &checks, &probes, json);
+    i32::from(!ok)
+}
+
+fn capability(
+    mode: Mode,
+    prereqs_ok: bool,
+    prereq_detail: String,
+    probes: &[ProbeResult],
+) -> Capability {
+    let probe_ok = probes.iter().all(|p| p.ok == Some(true));
+    Capability {
+        mode: mode.name(),
+        status: if !prereqs_ok {
+            "unavailable"
+        } else if probe_ok {
+            "available"
+        } else {
+            "failed"
+        },
+        detail: if prereqs_ok {
+            if probe_ok {
+                format!(
+                    "{} mode was demonstrated by every requested probe",
+                    mode.name()
+                )
+            } else {
+                format!(
+                    "{} mode has one or more failed executed probes",
+                    mode.name()
+                )
+            }
+        } else {
+            prereq_detail
+        },
+    }
+}
+
+fn print_result(
+    mode: Mode,
+    ok: bool,
+    capability: &Capability,
+    checks: &[Check],
+    probes: &[ProbeResult],
+    json: bool,
+) {
     if json {
-        println!("{}", serde_json::json!({"ok": ok, "checks": checks}));
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": ok,
+                "mode": mode,
+                "capability": capability,
+                "probes": probes,
+                "checks": checks,
+            })
+        );
     } else {
-        for c in &checks {
+        for c in checks {
             println!(
                 "{} {}: {}",
                 if c.ok { "ok  " } else { "FAIL" },
@@ -378,14 +612,72 @@ pub fn run(json: bool) -> i32 {
                 c.detail
             );
         }
+        for probe in probes {
+            if probe.status == "untested" {
+                println!("untested {}: {}", probe.name, probe.detail);
+            }
+        }
         println!(
             "{}",
             if ok {
-                "playpen can run here."
+                format!("playpen {} mode is available.", mode.name())
             } else {
-                "playpen cannot run here until the FAIL lines are fixed."
+                format!(
+                    "playpen {} mode is not available until the FAIL lines are fixed.",
+                    mode.name()
+                )
             }
         );
     }
-    i32::from(!ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Check, apparmor_userns_check, prerequisites_ok};
+
+    #[test]
+    fn unavailable_shared_prerequisite_blocks_either_mode() {
+        let checks = [
+            Check {
+                name: "user namespaces",
+                ok: false,
+                detail: "unavailable in this simulated host".into(),
+            },
+            Check {
+                name: "nft",
+                ok: true,
+                detail: "available".into(),
+            },
+            Check {
+                name: "Landlock (host Unix sockets)",
+                ok: true,
+                detail: "available".into(),
+            },
+        ];
+        assert!(!prerequisites_ok(&checks));
+    }
+
+    #[test]
+    fn restricted_but_profile_permitted_apparmor_does_not_block_live_probes() {
+        let checks = [
+            Check {
+                name: "user namespaces",
+                ok: true,
+                detail: "namespaces are enabled".into(),
+            },
+            Check {
+                name: "nft",
+                ok: true,
+                detail: "available".into(),
+            },
+            Check {
+                name: "Landlock (host Unix sockets)",
+                ok: true,
+                detail: "available".into(),
+            },
+            apparmor_userns_check("1"),
+        ];
+        assert!(checks[3].detail.contains("live namespace probe"));
+        assert!(prerequisites_ok(&checks));
+    }
 }

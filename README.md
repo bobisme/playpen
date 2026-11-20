@@ -32,7 +32,7 @@ $ git clone https://github.com/bobisme/playpen.git
 $ cd playpen
 $ cargo build --release --locked
 $ export PATH="$PWD/target/release:$PATH"
-$ ./target/release/playpen doctor
+$ ./target/release/playpen doctor --mode egress
 ok   user namespaces: user.max_user_namespaces = 512098
 ok   unprivileged user namespaces: kernel.unprivileged_userns_clone = 1
 ok   nft: /usr/bin/nft (nftables v1.1.7 (Commodore Bullmoose #8))
@@ -42,7 +42,7 @@ ok   terminal input injection (TIOCSTI): refused by the kernel (dev.tty.legacy_t
 ok   allowed reached, others blocked: TCP, UDP and IPv6 to in-sandbox addresses: approved reached, others dropped
 ok   command cannot change the network: nft, netlink address/link changes, raw and packet sockets all denied; no capabilities
 ok   host Unix sockets unreachable: a host socket and a host abstract socket were not reachable from inside
-playpen can run here.
+playpen egress mode is available.
 
 $ cat engagement.pass.toml          # written with hallpass init, mode 0600
 format = 1
@@ -220,6 +220,39 @@ Rootless Podman workloads that require a nested mount setup or subordinate
 UID/GID mappings are outside the supported configuration. Playpen runs the
 command with no new privileges and applies Landlock by default. Use the
 guarded offline invocation above to check ordinary command support.
+
+### Check this host
+
+Offline mode runs a real command with only the sandbox loopback interface.
+It checks the command’s network privileges and access to host Unix sockets.
+Egress mode also uses pasta and tests allowed and denied TCP, UDP and IPv6
+destinations. Both modes require user namespaces, nft and Landlock ABI 9 or later.
+
+```console
+$ playpen doctor --mode offline --format json | jq -r .capability.status
+available
+$ playpen doctor --mode egress --format json | jq -r .capability.status
+available
+```
+
+A missing prerequisite produces `unavailable` and marks the affected probes
+`untested`. A probe that ran and found unexpected behavior produces `failed`.
+A machine without pasta can still demonstrate offline mode.
+
+For CI, name the native scenarios the job requires. The command reports
+every scenario and exits unsuccessfully if a required scenario could not
+run or any scenario failed.
+
+```sh
+playpen qualify --require offline-command --require unix-socket-guard --format json
+playpen qualify --source "$PWD" --require terminal-pty-input --format json
+```
+
+Direct probes exercise the running Playpen binary. An explicit trusted
+`--source` checkout enables named Cargo tests from the run, pass, sockets,
+gateway and terminal suites. They use `--locked --offline`. Each result
+identifies its evidence source, prerequisites and outcome. See the
+[native qualification reference](docs/spec.md#441-playpen-qualify) for details.
 
 ## Threat model
 

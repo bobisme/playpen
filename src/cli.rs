@@ -76,6 +76,21 @@ enum Cmd {
     },
     /// Check that this machine can run playpen, and say exactly what is missing.
     Doctor {
+        /// Capability to demonstrate (offline avoids the pasta dependency).
+        #[arg(long, value_enum, default_value = "egress")]
+        mode: crate::doctor::Mode,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: Format,
+    },
+    /// Run native sandbox qualification scenarios and report what executed.
+    Qualify {
+        /// Explicit trusted source tree for integration-test scenarios.
+        #[arg(long, value_name = "PATH")]
+        source: Option<PathBuf>,
+        /// A scenario that this qualification job requires to execute.
+        #[arg(long = "require", value_name = "SCENARIO")]
+        required: Vec<String>,
         /// Output format.
         #[arg(long, value_enum, default_value = "text")]
         format: Format,
@@ -124,6 +139,8 @@ enum ProbeCmd {
     StdoutReconnect { target: String },
     /// List the open file descriptors.
     Fds,
+    /// List interfaces visible in this network namespace.
+    Interfaces,
     /// Try TIOCSTI on standard input and opening /dev/tty.
     Tty,
     /// Count deliveries of SIGUSR1 until SIGTERM.
@@ -253,7 +270,12 @@ pub fn main() -> i32 {
             only,
             format,
         } => rules(&allow, pass.as_deref(), &only, format),
-        Cmd::Doctor { format } => crate::doctor::run(format == Format::Json),
+        Cmd::Doctor { mode, format } => crate::doctor::run(mode, format == Format::Json),
+        Cmd::Qualify {
+            source,
+            required,
+            format,
+        } => crate::qualification::run(&required, source.as_deref(), format == Format::Json),
         Cmd::Probe { what } => probe(what),
     }
 }
@@ -314,6 +336,21 @@ fn pass_report(id: &pass::PassIdentity) -> PassReport {
     }
 }
 
+fn print_probe_lines(result: Result<Vec<serde_json::Value>, String>) -> i32 {
+    match result {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("probe: {e}");
+            EXIT_ERROR
+        }
+    }
+}
+
 fn probe(what: ProbeCmd) -> i32 {
     match what {
         ProbeCmd::HttpFixture => match crate::fixture::serve() {
@@ -330,18 +367,7 @@ fn probe(what: ProbeCmd) -> i32 {
             let result = parse(&serve)
                 .and_then(|s| parse(&tries).map(|t| (s, t)))
                 .and_then(|(s, t)| crate::probe::reach(&s, &t));
-            match result {
-                Ok(lines) => {
-                    for l in lines {
-                        println!("{l}");
-                    }
-                    0
-                }
-                Err(e) => {
-                    eprintln!("probe: {e}");
-                    EXIT_ERROR
-                }
-            }
+            print_probe_lines(result)
         }
         ProbeCmd::Privs { nft } => {
             println!("{}", crate::probe::privs(&nft));
@@ -351,20 +377,13 @@ fn probe(what: ProbeCmd) -> i32 {
             println!("{}", crate::probe::resolve(&name));
             0
         }
-        ProbeCmd::Unix { listen, tries } => match crate::probe::unix(&listen, &tries) {
-            Ok(lines) => {
-                for l in lines {
-                    println!("{l}");
-                }
-                0
-            }
-            Err(e) => {
-                eprintln!("probe: {e}");
-                EXIT_ERROR
-            }
-        },
+        ProbeCmd::Unix { listen, tries } => print_probe_lines(crate::probe::unix(&listen, &tries)),
         ProbeCmd::Fds => {
             println!("{}", crate::probe::fds());
+            0
+        }
+        ProbeCmd::Interfaces => {
+            println!("{}", crate::probe::interfaces());
             0
         }
         ProbeCmd::UnixSend { path } => {
@@ -895,6 +914,14 @@ fn run(args: &RunArgs) -> i32 {
         .iter()
         .map(ToString::to_string)
         .collect();
+    for path in &args.hide {
+        if explicitly_missing(path) {
+            eprintln!(
+                "playpen: NOTE: --hide path {} does not exist; nothing was hidden there",
+                path.display()
+            );
+        }
+    }
     report.until = checked.approval.ends_at.map(EndsAt::to_rfc3339);
     if let Some(p) = &checked.from_pass {
         report.pass = Some(pass_report(&p.identity));
@@ -1056,5 +1083,17 @@ pub(crate) fn apply_drop_assertion(report: &mut Report, code: i32, enabled: bool
         1
     } else {
         code
+    }
+}
+
+/// An explicit hide target that is absent, including a dangling symlink.
+/// Other metadata errors are left for the mount operation to report.
+fn explicitly_missing(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Ok(meta) if meta.file_type().is_symlink() => {
+            matches!(std::fs::metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        }
+        _ => false,
     }
 }

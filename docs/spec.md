@@ -344,8 +344,10 @@ no job control.
 
 **`--hide PATH`** (repeatable). Hide one more host path from the command:
 a directory gets an empty read-only tmpfs over it; anything else gets
-`/dev/null` bound over it. A path that does not exist is ignored. Applied
-after the mount layer and `--expose`.
+`/dev/null` bound over it. A path that does not exist is ignored, and playpen
+prints a note to stderr naming the explicit `--hide` path that was not found.
+A dangling symlink is treated the same way. Command stdout is unchanged.
+Applied after the mount layer and `--expose`.
 
 **Terminal and job control.** Without a new session the command stays in
 the terminal's foreground process group: Ctrl-C, Ctrl-\, resizes and
@@ -500,13 +502,36 @@ unknown label are refused.
 ### 4.4 `playpen doctor`
 
 ```text
-playpen doctor [--format text|json]
+playpen doctor [--mode offline|egress] [--format text|json]
 ```
 
-Checks, without changing any host setting:
+`--mode egress` is the default and retains the full egress check. `--mode
+offline` does not require `pasta`; it demonstrates a real `--no-network`
+command and verifies that only loopback is visible. Both modes require user
+namespaces, a working `nft`, and Landlock ABI 9 or later, and run local
+privilege and Unix-socket checks. Egress mode additionally requires `pasta`
+and tests approved TCP, UDP, and IPv6 destinations against blocked ones.
 
-1. user namespace settings (section 3), including the AppArmor
-   restriction where the setting exists;
+For example:
+
+```text
+playpen doctor --mode offline --format json
+playpen doctor --mode egress --format json
+```
+
+JSON retains the existing top-level `ok` and `checks` fields, and adds
+`mode`, `capability`, and `probes`. The capability status is `available` when
+every requested probe passed, `unavailable` when a prerequisite prevented
+the mode from being demonstrated, and `failed` when an executed probe failed.
+Probe entries say `executed` or `untested`; untested entries include the
+preflight reason. For example, an absent pasta makes egress `unavailable` and
+its egress probes `untested`, while offline can still be tested successfully.
+
+The egress checks, without changing any host setting:
+
+1. user namespace settings (section 3). The AppArmor restriction setting is
+   informational: a per-binary profile may permit playpen, so live namespace
+   probes determine whether the process can actually use namespaces;
 2. `nft --version` and `pasta --version` run;
 3. Landlock ABI 9 or later (`FAIL` otherwise, with the same message `run`
    gives);
@@ -526,9 +551,54 @@ Checks, without changing any host setting:
    Unix socket and an abstract Unix socket doctor creates on the host for
    the purpose.
 
-Each line says `ok` or `FAIL` and what is missing. Exit status 0 when all
-pass, 1 otherwise. JSON: `{"ok": bool, "checks": [{"name", "ok",
-"detail"}]}`.
+Each line says `ok` or `FAIL` and what is missing; unrun checks are marked
+`untested`. Exit status 0 when the selected mode is demonstrated, 1
+otherwise. Existing JSON check objects retain `name`, `ok`, and `detail`.
+
+### 4.4.1 `playpen qualify`
+
+```text
+playpen qualify [--source TRUSTED_PATH] [--require SCENARIO]... [--format text|json]
+```
+
+Runs the listed native scenarios and records prerequisites and results. The
+scenario set covers offline command isolation and loopback, local privilege
+and Unix-socket guards, egress filtering, run-loopback behavior, hallpass
+egress, the private runtime-directory fixture, the gateway mapping test on its
+dummy-interface fixture, and ordinary PTY input. The terminal scenario does
+not test terminal injection.
+
+Direct doctor probes exercise the installed `playpen` executable and are
+labelled `installed_binary`. Scenarios backed by integration tests require an
+explicit trusted `--source` directory containing this package's `Cargo.toml`
+and `Cargo.lock`; they are labelled `source_tree` and run with `cargo test
+--locked --offline --manifest-path ...`. Without `--source`, those scenarios
+are `unsupported` and Cargo is not started. This prevents qualification from
+silently testing a different checkout than the operator selected.
+
+The result for each scenario is `executed`, `unsupported`, or `failed`.
+Integration scenarios invoke one named test with `cargo test --locked
+--offline`; a test's `SKIPPED:` reason becomes `unsupported`. A failed
+assertion remains `failed`. Repeat `--require` for scenarios a qualification
+job needs. The command fails if any scenario failed, or if any required
+scenario is unsupported. Optional unsupported scenarios remain visible
+without blocking the job.
+
+For example, `playpen qualify --source "$PWD" --require offline-command
+--require unix-socket-guard --format json` requires those two native checks.
+If `PLAYPEN_PASTA` names a missing executable, `playpen qualify --source
+"$PWD" --require egress-filter --format json` reports that scenario as
+unsupported and exits 1; offline scenarios may still execute.
+
+The scenario IDs are `offline-command`, `offline-loopback`,
+`network-privileges`, `unix-socket-guard`, `socket-runtime-directory`,
+`egress-filter`, `run-loopback`, `pass-egress`, `gateway-host-loopback`, and
+`terminal-pty-input`.
+
+Read qualification as evidence for the named host scenarios only. The
+ordinary Rust unit and integration tests remain useful on constrained hosts,
+and portable tests or pure Rust proofs provide separate evidence; neither
+should be mistaken for a native scenario marked `executed` here.
 
 ### 4.5 JSON report fields
 

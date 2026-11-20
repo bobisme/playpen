@@ -1,6 +1,7 @@
 //! `playpen probe`: small checks run *inside* the sandbox by `playpen
 //! doctor` and by the tests. Hidden from `--help`; not a stable interface.
 
+use std::fs;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process::Command;
 use std::time::Duration;
@@ -21,6 +22,18 @@ pub struct Target {
     pub addr: SocketAddr,
     /// True for UDP.
     pub udp: bool,
+}
+
+/// Lists interface names visible through the current network namespace.
+#[must_use]
+pub fn interfaces() -> String {
+    let contents = fs::read_to_string("/proc/net/dev").unwrap_or_default();
+    let names = contents
+        .lines()
+        .skip(2)
+        .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim().to_owned()))
+        .collect::<Vec<_>>();
+    json!({"interfaces": names}).to_string()
 }
 
 /// Parses a probe target.

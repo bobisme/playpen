@@ -15,6 +15,7 @@ mod nft_readback;
 pub mod pass;
 pub mod pasta;
 pub mod probe;
+pub mod qualification;
 pub mod report;
 pub mod resolver;
 pub mod ruleset;

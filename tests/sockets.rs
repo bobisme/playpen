@@ -7,9 +7,11 @@
 
 use std::os::linux::net::SocketAddrExt as _;
 use std::os::unix::fs::FileTypeExt as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const BIN: &str = env!("CARGO_BIN_EXE_playpen");
 
@@ -51,13 +53,52 @@ fn tmpdir(name: &str) -> PathBuf {
     dir
 }
 
-fn uid() -> u32 {
-    nix::unistd::getuid().as_raw()
+struct PrivateDir(PathBuf);
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn private_dir(root: &Path, label: &str) -> PrivateDir {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = root.join(format!("pp-{label}-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
+    PrivateDir(path)
+}
+
+fn private_home_dir(label: &str) -> Option<PrivateDir> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    if ["/run", "/tmp", "/var/tmp", "/dev/shm"]
+        .iter()
+        .any(|root| home.starts_with(root))
+    {
+        return None;
+    }
+    Some(private_dir(&home, label))
+}
+
+struct RuntimeDir(PrivateDir);
+
+thread_local! {
+    // The test thread owns this fallback, and its Drop removes the private
+    // directory after all fixtures owned by that test have been dropped.
+    static FALLBACK_RUNTIME: RuntimeDir = {
+        let home = std::env::var_os("HOME").map(PathBuf::from)
+            .expect("HOME is required for a private runtime fixture when XDG_RUNTIME_DIR is unset");
+        RuntimeDir(private_dir(&home, "runtime"))
+    };
 }
 
 fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
-        || PathBuf::from(format!("/run/user/{}", uid())),
+        || FALLBACK_RUNTIME.with(|dir| dir.0.0.clone()),
         PathBuf::from,
     )
 }
@@ -70,6 +111,9 @@ fn sandbox(extra: &[&str], args: &[&str]) -> Output {
         .args(extra)
         .arg("--")
         .args(args)
+        // playpen and its child must agree on the runtime directory even on
+        // hosts whose test environment has no login-session variable.
+        .env("XDG_RUNTIME_DIR", runtime_dir())
         .stdin(Stdio::null())
         .output()
         .unwrap_or_else(|e| panic!("cannot run playpen: {e}"))
@@ -217,8 +261,11 @@ fn no_host_socket_is_connectable_from_inside() {
 #[test]
 fn without_landlock_the_mount_layer_still_hides_the_usual_places() {
     require_sandbox!();
-    let dir = tmpdir("mounts");
-    let in_home = listen(&dir.join("home.sock"));
+    let Some(home_fixture) = private_home_dir("mount-only") else {
+        eprintln!("SKIPPED: HOME is unavailable or inside a mount-hidden temporary root");
+        return;
+    };
+    let in_home = listen(&home_fixture.0.join("home.sock"));
     let own = [
         listen(&runtime_dir().join(format!("playpen-test-m-{}.sock", std::process::id()))),
         listen(Path::new(&format!(
@@ -271,7 +318,11 @@ fn abstract_sockets_of_the_host_are_not_reachable() {
 #[test]
 fn expose_lets_exactly_the_named_socket_or_directory_through() {
     require_sandbox!();
-    let dir = tmpdir("expose");
+    let Some(expose_fixture) = private_home_dir("expose") else {
+        eprintln!("SKIPPED: HOME is unavailable or inside a mount-hidden temporary root");
+        return;
+    };
+    let dir = &expose_fixture.0;
     let exposed_sock = listen(&dir.join("a.sock"));
     let sibling = listen(&dir.join("b.sock"));
     let sub = dir.join("sub");
