@@ -1,6 +1,6 @@
 # playpen
 
-![A faceless, cloaked figure kneels on cracked flagstones, pouring the last grains into a circle of salt.](docs/images/salt-circle.webp)
+![PLAYPEN — A firewall for a single command. A faceless, cloaked figure kneels on flagstones to complete a circle of salt.](docs/images/playpen-cover.webp)
 
 playpen runs a command and its children with a firewall that restricts
 outbound IP traffic to the addresses, ports and protocols you approve.

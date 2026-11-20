@@ -54,3 +54,7 @@
 1795192086553014	codex	itc:AQ		item.move	bn-3lx	{"state":"doing"}	blake3:zAMqLU_kMg19pDiQ3pTWVJDbqq830BlNPdIo4igEKd0
 1795192086699726	codex	itc:AQ		item.assign	bn-3lx	{"action":"assign","agent":"codex"}	blake3:0aSlPLkF3EObajYAtQY1acc4WugV3yhVdIkx1geDQCc
 1795192182798346	codex	itc:AQ		item.move	bn-3lx	{"reason":"Adopted MIT at the owner’s request, documented revocation and the watchdog, and validated the locked release build and all 120 tests using the public Hallpass dependency.","state":"done"}	blake3:AHDewrmWizItr8benA_5WJoglFqbH1rTqapl0loiUBE
+1795195184749395	codex	itc:AQ		item.create	bn-254	{"kind":"task","size":"xs","title":"Typeset the salt-circle cover and GitHub social preview"}	blake3:ZuEttyDQeNulbAHX3Ne8N1IIA39QPN6bGBVbp3-RQ5s
+1795195191602635	codex	itc:AQ		item.move	bn-254	{"state":"doing"}	blake3:rGdXMhVE-DaL2GDykfkJ8Mf63DvDmXUj75WdCU0Iv_s
+1795195191658012	codex	itc:AQ		item.assign	bn-254	{"action":"assign","agent":"codex"}	blake3:sWuUn7KkLxIAk5vnVnthijN8CptcTcGn0hAM8stf5BM
+1795195227271189	codex	itc:AQ		item.move	bn-254	{"reason":"Rendered two neutral grayscale exports from docs/images/salt-circle.webp with the project-art renderer. Verified the social JPEG at 540 px and README at 830 px; feathered the stone behind the text for legibility.","state":"done"}	blake3:p5xq_zdud98sbHuHADQL6fzBVp68rleOPmuakBoetEk
