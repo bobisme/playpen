@@ -79,6 +79,9 @@ pub struct Report {
     pub stopped_by_pass: bool,
     /// Why playpen stopped the command, when it did.
     pub stop_reason: Option<String>,
+    /// Enforcement coverage when the pass could be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enforcement_coverage: Option<crate::pass::Coverage>,
     /// The pass, with `--pass`.
     pub pass: Option<PassReport>,
     /// The exit status playpen itself returns.
@@ -256,6 +259,7 @@ mod tests {
             stopped_by_until: false,
             stopped_by_pass: false,
             stop_reason: None,
+            enforcement_coverage: None,
             pass: None,
             playpen_exit_status: 0,
             dropped: Some(DropSummary::default()),

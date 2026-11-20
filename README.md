@@ -243,3 +243,7 @@ playpen run --allow 192.0.2.1:443/tcp --fail-on-drop --report report.json -- ./c
 
 Unavailable counters also fail the assertion. The report keeps the child
 status separately from playpen's exit status.
+
+Pass destination names restrictions and application ceilings need a separate
+application-level enforcer. Use `--require-enforced` to refuse a pass with
+such applicable terms when playpen must enforce every restriction itself.

@@ -62,6 +62,26 @@ pub struct NamedDestination {
     pub single: bool,
 }
 
+/// Enforcement coverage of the selected pass terms.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Coverage {
+    /// Packet address, port and protocol filtering.
+    pub packet_filter: bool,
+    /// Approval window enforcement.
+    pub time_window: bool,
+    /// Selected labels with externally enforced name restrictions.
+    pub external_names: Vec<String>,
+    /// Pass-wide application counters enforced externally.
+    pub external_ceilings: Vec<String>,
+}
+impl Coverage {
+    /// Whether every applicable term is enforced by playpen.
+    #[must_use]
+    pub const fn fully_enforced(&self) -> bool {
+        self.external_names.is_empty() && self.external_ceilings.is_empty()
+    }
+}
+
 /// Everything `--pass` contributes to a run.
 #[derive(Debug, Clone)]
 pub struct FromPass {
@@ -76,6 +96,8 @@ pub struct FromPass {
     /// names, as `label (name, name)`. playpen filters addresses and
     /// ports and cannot enforce this.
     pub name_limited: Vec<String>,
+    /// Typed coverage for the selected terms.
+    pub coverage: Coverage,
     /// The handle the supervisor re-reads the pass with.
     pub watch: PassWatch,
 }
@@ -142,6 +164,16 @@ fn from_pass(
         valid_until: pass.approval.valid_until,
         labels: selected.iter().map(|d| d.label.clone()).collect(),
     };
+    let coverage = Coverage {
+        packet_filter: true,
+        time_window: true,
+        external_names: selected
+            .iter()
+            .filter(|d| !d.names.is_empty())
+            .map(|d| d.label.clone())
+            .collect(),
+        external_ceilings: pass.ceilings.keys().cloned().collect(),
+    };
     let watch = PassWatch {
         path: path.to_path_buf(),
         id: pass.id.clone(),
@@ -149,6 +181,7 @@ fn from_pass(
         digest,
         in_use,
         edge_addresses: edge_addresses.clone(),
+        require_enforced: false,
         interval: RECHECK_INTERVAL,
     };
     Ok(FromPass {
@@ -160,6 +193,7 @@ fn from_pass(
         identity,
         named,
         name_limited,
+        coverage,
         watch,
     })
 }
@@ -201,6 +235,31 @@ fn pass_edges(pass: &Pass) -> BTreeSet<Ipv4Addr> {
         .collect()
 }
 
+// Hallpass 05d657a rejects these address classes per target; a packet
+// filter over a prefix must not silently admit them. A masked-pattern
+// intersection catches ISATAP even though it is not a contiguous prefix.
+fn transition_overlap(address: std::net::Ipv6Addr, prefix: u8) -> bool {
+    let bits = u128::from(address);
+    let fixed = if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    };
+    let patterns = [
+        (0xffff_u128 << 112, 0x2002_u128 << 112),
+        (0xffff_ffff_u128 << 96, 0x2001_0000_u128 << 96),
+        (u128::MAX << 32, 0xffff_u128 << 48), // SIIT
+        (u128::MAX << 32, 0xffff_u128 << 32), // mapped
+        (u128::MAX << 32, 0),                 // compatible
+        (u128::MAX << 32, 0x0064_ff9b_u128 << 96),
+        (u128::MAX << 80, 0x0064_ff9b_0001_u128 << 80),
+        (0xfcff_ffff_u128 << 32, 0x5efe_u128 << 32), // ISATAP
+    ];
+    patterns
+        .iter()
+        .any(|(mask, value)| (bits ^ value) & fixed & mask == 0)
+}
+
 /// One allow rule per port range of the destination.
 ///
 /// # Errors
@@ -208,6 +267,13 @@ fn pass_edges(pass: &Pass) -> BTreeSet<Ipv4Addr> {
 /// hallpass accepts when listed: loopback inside the sandbox is always
 /// allowed and the host's cannot be reached).
 pub fn rules_for(d: &Destination) -> Result<Vec<AllowRule>, crate::approval::SpecError> {
+    if let std::net::IpAddr::V6(ip) = d.network.addr()
+        && transition_overlap(ip, d.network.prefix())
+    {
+        return Err(crate::approval::SpecError::from_message(
+            "IPv6 prefix may contain an IPv4 transition or embedded address",
+        ));
+    }
     let net = Net::new(d.network.addr(), d.network.prefix())?;
     let proto = match d.protocol {
         hallpass::Protocol::Tcp => Proto::Tcp,
@@ -246,6 +312,8 @@ pub struct PassWatch {
     digest: Digest,
     in_use: Vec<(String, Vec<AllowRule>)>,
     edge_addresses: BTreeSet<Ipv4Addr>,
+    /// Stop when an unsupported restriction becomes applicable.
+    pub require_enforced: bool,
     /// How often to re-read.
     pub interval: Duration,
 }
@@ -285,12 +353,22 @@ impl PassWatch {
                 self.owner, pass.approval.owner
             ));
         }
+        if self.require_enforced && !pass.ceilings.is_empty() {
+            return Recheck::Stop(
+                "the pass now has application ceilings playpen cannot enforce".into(),
+            );
+        }
         for (label, rules) in &self.in_use {
             let Some(d) = pass.destinations.iter().find(|d| &d.label == label) else {
                 return Recheck::Stop(format!(
                     "the pass was edited and destination `{label}`, which this run uses, was removed"
                 ));
             };
+            if self.require_enforced && !d.names.is_empty() {
+                return Recheck::Stop(format!(
+                    "destination `{label}` now has a name restriction playpen cannot enforce"
+                ));
+            }
             if rules_for(d).ok().as_ref() != Some(rules) {
                 return Recheck::Stop(format!(
                     "the pass was edited and destination `{label}`, which this run uses, changed"
@@ -390,12 +468,59 @@ calls = 6
             digest: Digest::of(text.as_bytes()),
             in_use,
             edge_addresses,
+            require_enforced: false,
             interval: RECHECK_INTERVAL,
         }
     }
 
     fn judge(w: &mut PassWatch, text: &str, now: OffsetDateTime) -> Recheck {
         w.judge(&parse(text), Digest::of(text.as_bytes()), now)
+    }
+
+    #[test]
+    fn ipv6_transition_ranges_are_conservatively_refused() {
+        // Independent address-class witnesses for the pinned Hallpass predicate.
+        for text in [
+            "2002:c000:201::1",
+            "2001:0:c000:201::1",
+            "::ffff:0:c000:201",
+            "::ffff:c000:201",
+            "::c000:201",
+            "64:ff9b::c000:201",
+            "64:ff9b:1::1",
+            "2001:db8:1234:5678:200:5efe:c000:201",
+        ] {
+            let ip: std::net::Ipv6Addr = text.parse().unwrap_or_else(|e| panic!("{e}"));
+            assert!(
+                hallpass::ipv6_transition(ip).is_some() || hallpass::embedded_ipv4(ip).is_some(),
+                "{text}"
+            );
+            for prefix in 0..=128 {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
+                let network = std::net::Ipv6Addr::from(u128::from(ip) & mask);
+                assert!(transition_overlap(network, prefix), "{text}/{prefix}");
+            }
+        }
+        for text in [
+            "2001:db8::1",
+            "2001:db8:1:2:abcd:1234:5678:9abc",
+            "2606:4700:4700::1111",
+        ] {
+            let ip: std::net::Ipv6Addr = text.parse().unwrap_or_else(|e| panic!("{e}"));
+            assert!(!transition_overlap(ip, 128), "{text}");
+        }
+        assert!(transition_overlap(
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
+            32
+        ));
+        assert!(!transition_overlap(
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
+            120
+        ));
     }
 
     #[test]

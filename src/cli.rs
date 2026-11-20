@@ -1,6 +1,7 @@
 //! Command-line interface.
 
 mod event_pipe;
+mod policy_test;
 mod preview;
 use event_pipe::EventPipe;
 
@@ -45,6 +46,8 @@ enum Format {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
+    /// Test expected packet decisions without loading a firewall.
+    PolicyTest(policy_test::PolicyTestArgs),
     /// Compare two full reports without executing either command.
     Compare {
         before: PathBuf,
@@ -186,6 +189,9 @@ struct RunArgs {
     /// Write lifecycle JSON lines to an inherited pipe above stderr.
     #[arg(long, value_name = "FD")]
     events_fd: Option<i32>,
+    /// Refuse pass terms that require an external enforcer.
+    #[arg(long)]
+    require_enforced: bool,
     /// Require the effective scope to match the digest from playpen plan.
     #[arg(long, value_name = "SHA256")]
     expect_plan: Option<hallpass::Digest>,
@@ -226,6 +232,7 @@ pub fn main() -> i32 {
     };
     match cli.command {
         Cmd::Run(args) => run(&args),
+        Cmd::PolicyTest(args) => policy_test::run(&args),
         Cmd::Plan(args) => preview::print(&args),
         Cmd::Compare {
             before,
@@ -468,6 +475,7 @@ fn check_pass(args: &RunArgs, path: &Path, now: OffsetDateTime) -> Result<FromPa
         }
         from_pass.approval.ends_at = Some(until);
     }
+    from_pass.watch.require_enforced = args.require_enforced;
     if let Some(ms) = args.pass_recheck_ms {
         from_pass.watch.interval =
             Duration::from_millis(ms).clamp(MIN_RECHECK_INTERVAL, RECHECK_INTERVAL);
@@ -583,6 +591,18 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
     })
 }
 
+fn enforce_coverage(args: &RunArgs, checked: &Checked) -> Result<(), String> {
+    if args.require_enforced
+        && checked
+            .from_pass
+            .as_ref()
+            .is_some_and(|p| !p.coverage.fully_enforced())
+    {
+        return Err("--require-enforced: selected names or application ceilings require an external enforcer".into());
+    }
+    Ok(())
+}
+
 struct StderrEvents<'a> {
     pipe: &'a EventPipe,
     args: &'a RunArgs,
@@ -595,8 +615,9 @@ impl Events for StderrEvents<'_> {
         self.pipe.close();
     }
     fn before_start(&mut self) -> Result<(), String> {
-        if self.args.expect_plan.is_some() {
+        if self.args.expect_plan.is_some() || self.args.require_enforced {
             let current = check(self.args)?;
+            enforce_coverage(self.args, &current)?;
             preview::match_pin(self.args, &current)?;
         }
         Ok(())
@@ -733,6 +754,7 @@ fn base_report(args: &RunArgs) -> Report {
         stopped_by_until: false,
         stopped_by_pass: false,
         stop_reason: None,
+        enforcement_coverage: None,
         pass: args.pass.as_ref().map(|p| PassReport {
             file: p.display().to_string(),
             id: None,
@@ -836,6 +858,14 @@ fn run(args: &RunArgs) -> i32 {
             return EXIT_REFUSED;
         }
     };
+    report.enforcement_coverage = checked.from_pass.as_ref().map(|p| p.coverage.clone());
+    if let Err(e) = enforce_coverage(args, &checked) {
+        eprintln!("playpen: refused: {e}; nothing was run");
+        report.message = Some(e);
+        pipe.terminal(&report);
+        write_report(report_file.as_mut(), &report, args.shareable_report);
+        return EXIT_REFUSED;
+    }
     pipe.send("validated", &serde_json::Value::Null);
     report.allowed = checked
         .approval

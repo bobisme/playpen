@@ -5,7 +5,7 @@ use std::os::unix::ffi::OsStrExt as _;
 
 use serde_json::{Value, json};
 
-use super::{Checked, EXIT_REFUSED, Format, RunArgs, check};
+use super::{Checked, EXIT_REFUSED, Format, RunArgs, check, enforce_coverage};
 use crate::approval::EndsAt;
 
 fn unix_string(value: &OsStr) -> Value {
@@ -30,12 +30,12 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
             "file": unix_string(p.identity.file.as_os_str()), "id": p.identity.id,
             "digest": p.identity.digest.to_string(), "labels": p.identity.labels,
             "recheck_ms": p.watch.interval.as_millis(),
-            "name_limits": p.name_limited,
+            "name_limits": p.name_limited, "coverage": p.coverage,
         })
     });
     Ok(json!({
         "schema": "playpen.plan.v1",
-        "fail_on_drop": args.fail_on_drop,
+        "fail_on_drop": args.fail_on_drop, "require_enforced": args.require_enforced,
         "command": args.command.iter().map(|a| unix_string(a)).collect::<Vec<_>>(),
         "cwd": unix_string(cwd.as_os_str()), "pass": pass,
         "allowed": grants.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -67,7 +67,10 @@ pub(super) fn match_pin(args: &RunArgs, checked: &Checked) -> Result<(), String>
 }
 
 pub(super) fn print(args: &RunArgs) -> i32 {
-    let scope = match check(args).and_then(|checked| scope(args, &checked)) {
+    let scope = match check(args).and_then(|checked| {
+        enforce_coverage(args, &checked)?;
+        scope(args, &checked)
+    }) {
         Ok(scope) => scope,
         Err(e) => {
             eprintln!("playpen: refused: {e}");

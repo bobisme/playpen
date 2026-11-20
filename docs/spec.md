@@ -527,6 +527,7 @@ Written by `run --report FILE`. Field names are stable.
 |---|---|---|
 | `playpen_version` | string | version of playpen |
 | `outcome` | `"ran"`, `"refused"`, `"not_started"`, `"error"` | see 4.2 |
+| `startup_evidence` | `"not_started"`, `"exec_and_exit"`, `"unknown"` | evidence available for deciding whether a retry is safe |
 | `message` | string or null | why, for anything but `"ran"` |
 | `command` | array of strings | the command line |
 | `allowed` | array of strings | approved specs (canonical form once parsed; as typed when refused; with `--pass`, the rules from the pass once loaded) |
@@ -538,9 +539,11 @@ Written by `run --report FILE`. Field names are stable.
 | `stopped_by_until` | bool | playpen stopped the command because the end time was reached |
 | `stopped_by_pass` | bool | playpen stopped the command after re-reading the pass |
 | `stop_reason` | string or null | why playpen stopped the command, when `stopped_by_until` or `stopped_by_pass` |
+| `enforcement_coverage` | object, if available | selected pass enforcement coverage; omitted when unavailable |
 | `pass` | object or null | null without `--pass`; else `{"file", "id", "name", "owner", "digest", "valid_until", "labels"}`: the file as given, the pass id, name, `approval.owner`, `sha256:` digest of the file at start, `valid_until` (RFC 3339 UTC), and the labels in use. When the pass could not be loaded, everything but `file` is null and `labels` is empty |
 | `playpen_exit_status` | integer | the status playpen exits with |
 | `dropped` | object or null | `{"packets": N, "destinations": [{"address", "protocol", "port", "packets"}], "destinations_truncated": bool}`; `port` is null for protocols other than TCP and UDP; destinations are sorted by packet count, largest first |
+| `drop_assertion` | `"pass"`, `"violated"`, or `"unknown"` | present only with `--fail-on-drop` |
 | `dropped_error` | string or null | why the counters could not be read |
 | `socket_guard` | `"landlock"` or `"mounts_only"` | how host Unix sockets were kept from the command; `"mounts_only"` with `--without-landlock` |
 | `exposed` | array of strings | every exposed path (`--expose` and `--display`), canonical once checked; the `--expose` values as typed when refused |
@@ -868,3 +871,44 @@ observations with no new denials; 1 means new denials were observed; 2 means
 comparison is indeterminate, policy differs without a new denial, or input
 is invalid. When new denials and a policy change coexist, exit 1 reports the
 new denial and the output still marks the policy change.
+
+### Pass enforcement coverage
+
+`--require-enforced` refuses before command execution when a selected pass
+destination restricts names or any pass-wide application ceiling is present.
+The full report's `enforcement_coverage` identifies packet and time filtering
+and lists selected labels and ceiling names requiring external enforcement,
+including on this refusal. Informational `hostname` is not a restriction;
+`--host` does not enforce request names. A strict run rechecks the pass and
+stops using the existing grace period if unsupported terms become applicable.
+The plan digest includes the strict option and coverage.
+
+### Offline policy examples
+
+`playpen policy-test cases.json --allow 192.0.2.1:443/tcp` evaluates a JSON
+array of outbound application tuples without loading nft or sending packets.
+Each case has `address`, `protocol` (`tcp` or `udp`), `port`, `expect` (`allow`
+or `deny`), and optional `name`. Use `--pass FILE` and optional repeated
+`--only LABEL` instead of `--allow` to test a narrowed pass. The pass must be
+currently valid. Loopback, multicast, unspecified addresses, port zero, and
+special kernel traffic are outside this test's scope.
+
+```json
+[{"name":"upload","address":"192.0.2.1","protocol":"tcp","port":443,"expect":"allow"},
+ {"name":"admin","address":"192.0.2.1","protocol":"tcp","port":8443,"expect":"deny"}]
+```
+
+The example exits 0. Changing the admin expectation to `allow` reports the
+failed case and exits 1. Invalid input or policy is refused with exit 2.
+
+### IPv6 pass prefixes
+
+For Hallpass-derived grants, playpen conservatively refuses any IPv6 prefix
+that can contain an address Hallpass rejects as IPv4 embedded or transitional.
+This includes 6to4, Teredo, SIIT, mapped/compatible, well-known and local-use
+NAT64, and ISATAP interface identifiers. ISATAP can occur under many native
+prefixes, so a broad prefix may be refused even when its base address is
+ordinary; select narrower ranges that cannot contain the pattern. Native
+addresses and narrow prefixes outside these classes remain supported. This
+check follows the pinned Hallpass predicate and does not recognize provider
+specific 6rd, MAP, or network-specific NAT64 prefixes.

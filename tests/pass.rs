@@ -923,3 +923,153 @@ fn atomic_revocation_during_setup_prevents_release() {
     );
     assert_eq!(out.status.code(), Some(1));
 }
+
+#[test]
+fn strict_pass_reports_external_terms_and_respects_selection() {
+    let dir = tmpdir("strict-coverage");
+    let limited = WEB.replace(
+        "hostname = \"app.example.test\"",
+        "names = [\"app.example.test\"]",
+    );
+    let contents = valid_pass(&[&limited, SIP]).replace("[ceilings]\ncalls = 6\n", "");
+    let pass = new_pass(&dir, &contents);
+    let rep = dir.join("report.json");
+    let out = run(&[
+        "run",
+        "--pass",
+        s(&pass),
+        "--only",
+        "web",
+        "--require-enforced",
+        "--report",
+        s(&rep),
+        "--",
+        "true",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    let json = report(&rep);
+    assert_eq!(
+        json["enforcement_coverage"]["external_names"],
+        serde_json::json!(["web"])
+    );
+    assert_eq!(
+        json["enforcement_coverage"]["external_ceilings"],
+        serde_json::json!([])
+    );
+    let out = run(&[
+        "plan",
+        "--pass",
+        s(&pass),
+        "--only",
+        "sip",
+        "--require-enforced",
+        "--format",
+        "json",
+        "--",
+        "true",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let plan: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    assert_eq!(plan["plan"]["require_enforced"], true);
+    assert_eq!(
+        plan["plan"]["pass"]["coverage"]["external_names"],
+        serde_json::json!([])
+    );
+    write_pass(&pass, &valid_pass(&[WEB]));
+    let out = run(&[
+        "run",
+        "--pass",
+        s(&pass),
+        "--require-enforced",
+        "--report",
+        s(&rep),
+        "--",
+        "true",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        report(&rep)["enforcement_coverage"]["external_ceilings"],
+        serde_json::json!(["calls"])
+    );
+    write_pass(
+        &pass,
+        &valid_pass(&[WEB]).replace("[ceilings]\ncalls = 6\n", ""),
+    );
+    let out = run(&[
+        "plan",
+        "--pass",
+        s(&pass),
+        "--require-enforced",
+        "--",
+        "true",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+}
+
+#[test]
+fn strict_running_job_stops_if_selected_names_are_added() {
+    require_sandbox!();
+    let dir = tmpdir("strict-edit");
+    let before = valid_pass(&[WEB]).replace("[ceilings]\ncalls = 6\n", "");
+    let pass = new_pass(&dir, &before);
+    let rep = dir.join("report.json");
+    let child = spawn(&[
+        "run",
+        "--pass",
+        s(&pass),
+        "--require-enforced",
+        "--pass-recheck-ms",
+        "200",
+        "--report",
+        s(&rep),
+        "--",
+        "sleep",
+        "30",
+    ]);
+    std::thread::sleep(Duration::from_secs(1));
+    write_pass(
+        &pass,
+        &before.replace(
+            "hostname = \"app.example.test\"",
+            "names = [\"app.example.test\"]",
+        ),
+    );
+    let out = child.wait_with_output().unwrap_or_else(|e| panic!("{e}"));
+    assert_ne!(out.status.code(), Some(0));
+    assert_eq!(report(&rep)["stopped_by_pass"], true);
+}
+
+#[test]
+fn policy_test_respects_selected_pass_and_revocation() {
+    let dir = tmpdir("policy-cases");
+    let pass = new_pass(&dir, &valid_pass(&[WEB, SIP]));
+    let cases = dir.join("cases.json");
+    std::fs::write(&cases, r#"[{"name":"web","address":"192.0.2.1","protocol":"tcp","port":9101,"expect":"allow"},{"name":"excluded","address":"192.0.2.2","protocol":"udp","port":5060,"expect":"deny"}]"#).unwrap_or_else(|e| panic!("{e}"));
+    let args = [
+        "policy-test",
+        s(&cases),
+        "--pass",
+        s(&pass),
+        "--only",
+        "web",
+    ];
+    assert_eq!(run(&args).status.code(), Some(0));
+    write_pass(
+        &pass,
+        &valid_pass(&[WEB, SIP]).replace("revoked = false", "revoked = true"),
+    );
+    assert_eq!(run(&args).status.code(), Some(2));
+}
+
+#[test]
+fn broad_ipv6_pass_prefix_is_refused_but_narrow_native_prefix_works() {
+    let dir = tmpdir("v6-transition-scope");
+    let broad = V6.replace("2001:db8::/120", "2001:db8::/32");
+    let pass = new_pass(&dir, &valid_pass(&[&broad]));
+    let out = run(&["plan", "--pass", s(&pass), "--", "true"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("transition"));
+    write_pass(&pass, &valid_pass(&[V6]));
+    let out = run(&["plan", "--pass", s(&pass), "--", "true"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+}

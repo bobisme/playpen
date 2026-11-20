@@ -1344,3 +1344,138 @@ fn compare_reports_uses_endpoints_and_requires_complete_evidence() {
     save(&old, &serde_json::json!({"schema":"playpen-shareable-v1"}));
     assert_eq!(run(&args).status.code(), Some(2));
 }
+
+#[test]
+fn policy_test_matches_loopback_fixture_and_catches_wrong_expectation() {
+    require_sandbox!();
+    let dir = tmpdir("policy-test");
+    let cases = dir.join("cases.json");
+    std::fs::write(
+        &cases,
+        r#"[{"name":"wrong","address":"192.0.2.1","protocol":"tcp","port":9102,"expect":"allow"}]"#,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let out = run(&[
+        "policy-test",
+        cases.to_str().unwrap_or(""),
+        "--allow",
+        "192.0.2.1:9101/tcp",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stdout).contains("wrong: expected allow, got deny"));
+    let (observed, _) = reach(
+        &["192.0.2.1:9101/tcp"],
+        &["192.0.2.1:9102/tcp"],
+        &["192.0.2.1:9102/tcp"],
+    );
+    assert!(!reached(&observed, "192.0.2.1:9102/tcp"));
+}
+
+#[test]
+fn policy_test_covers_edges_overlaps_ipv6_and_protocols() {
+    let dir = tmpdir("policy-matrix");
+    let cases = dir.join("cases.json");
+    std::fs::write(&cases, r#"[{"address":"192.0.2.0","protocol":"tcp","port":80,"expect":"deny"},{"address":"192.0.2.255","protocol":"tcp","port":80,"expect":"deny"},{"address":"192.0.2.1","protocol":"udp","port":80,"expect":"deny"},{"address":"192.0.2.128","protocol":"tcp","port":80,"expect":"deny"},{"address":"192.0.2.0","protocol":"tcp","port":81,"expect":"allow"},{"address":"198.51.100.0","protocol":"tcp","port":80,"expect":"allow"},{"address":"198.51.100.1","protocol":"tcp","port":80,"expect":"allow"},{"address":"2001:db8::1","protocol":"udp","port":53,"expect":"allow"}]"#).unwrap_or_else(|e| panic!("{e}"));
+    let out = run(&[
+        "policy-test",
+        cases.to_str().unwrap_or(""),
+        "--allow",
+        "192.0.2.0/24:80/tcp",
+        "--allow",
+        "192.0.2.128/25:80/tcp",
+        "--allow",
+        "192.0.2.0:81/tcp",
+        "--allow",
+        "198.51.100.0/31:80/tcp",
+        "--allow",
+        "[2001:db8::/120]:53/udp",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{} {}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn published_reviewed_offline_workflow_and_report_contract() {
+    require_sandbox!();
+    let dir = tmpdir("published-workflow");
+    let report_path = dir.join("report.json");
+    let plan = run(&[
+        "plan",
+        "--format",
+        "json",
+        "--no-network",
+        "--",
+        "printf",
+        "hello",
+    ]);
+    assert_eq!(plan.status.code(), Some(0), "{}", text(&plan.stderr));
+    let preview: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap_or_default();
+    let digest = preview["digest"].as_str().unwrap_or("");
+    assert!(digest.starts_with("sha256:"));
+    assert_eq!(preview["plan"]["network"], "none");
+    let run_out = run(&[
+        "run",
+        "--expect-plan",
+        digest,
+        "--no-network",
+        "--report",
+        report_path.to_str().unwrap_or(""),
+        "--",
+        "printf",
+        "hello",
+    ]);
+    assert_eq!(run_out.status.code(), Some(0), "{}", text(&run_out.stderr));
+    assert_eq!(run_out.stdout, b"hello");
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).unwrap_or_default())
+            .unwrap_or_default();
+    assert_eq!(report["outcome"], "ran");
+    assert_eq!(report["startup_evidence"], "exec_and_exit");
+    assert_eq!(report["exit_code"], 0);
+    assert_eq!(report["playpen_exit_status"], 0);
+    assert_eq!(report["dropped"]["packets"], 0);
+    assert_eq!(report["dropped"]["destinations_truncated"], false);
+    let refused = run(&[
+        "run",
+        "--expect-plan",
+        digest,
+        "--no-network",
+        "--report",
+        report_path.to_str().unwrap_or(""),
+        "--",
+        "printf",
+        "changed",
+    ]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(refused.stdout, [] as [u8; 0]);
+    let refusal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).unwrap_or_default())
+            .unwrap_or_default();
+    assert_eq!(refusal["outcome"], "refused");
+    assert_eq!(refusal["startup_evidence"], "not_started");
+    assert_eq!(refusal["playpen_exit_status"], 2);
+    assert!(refusal["dropped"].is_null());
+    let before = dir.join("baseline.json");
+    let after = dir.join("incomplete.json");
+    std::fs::write(&before, report.to_string()).unwrap_or_else(|e| panic!("{e}"));
+    let mut incomplete = report;
+    incomplete["dropped"] = serde_json::Value::Null;
+    std::fs::write(&after, incomplete.to_string()).unwrap_or_else(|e| panic!("{e}"));
+    let compared = run(&[
+        "compare",
+        before.to_str().unwrap_or(""),
+        after.to_str().unwrap_or(""),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(compared.status.code(), Some(2));
+    let comparison: serde_json::Value =
+        serde_json::from_slice(&compared.stdout).unwrap_or_default();
+    assert_eq!(comparison["policy"], "same");
+    assert_eq!(comparison["evidence"], "incomplete");
+}
