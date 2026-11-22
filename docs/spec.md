@@ -576,11 +576,11 @@ The default invocation runs the named native scenarios and records results. The
 scenario set covers offline command isolation and loopback, local privilege
 and Unix-socket guards, egress filtering, run-loopback behavior, hallpass
 egress, the private runtime-directory fixture, the gateway mapping test on its
-dummy-interface fixture, and ordinary PTY input. The terminal scenario does
-not test terminal injection.
+dummy-interface fixture, routed peer redirect and UDP controls, and ordinary
+PTY input. The terminal scenario checks interactive input.
 
 Direct doctor probes exercise the installed `playpen` executable and are
-labelled `installed_binary`. Scenarios backed by integration tests require an
+labelled `installed_binary`. Cargo integration tests require an
 explicit trusted `--source` directory containing this package's `Cargo.toml`
 and `Cargo.lock`; they are labelled `source_tree` and run with `cargo test
 --locked --offline --manifest-path ...`. Without `--source`, those scenarios
@@ -588,7 +588,7 @@ are `unsupported` and Cargo is not started. This prevents qualification from
 silently testing a different checkout than the operator selected.
 
 The result for each scenario is `executed`, `unsupported`, or `failed`.
-Integration scenarios invoke one named test with `cargo test --locked
+Cargo scenarios invoke one named test with `cargo test --locked
 --offline`; a test's `SKIPPED:` reason becomes `unsupported`. A failed
 assertion remains `failed`. Repeat `--require` for scenarios a qualification
 job needs. The command fails if any scenario failed, or if any required
@@ -603,8 +603,14 @@ unsupported and exits 1; offline scenarios may still execute.
 
 The scenario IDs are `offline-command`, `offline-loopback`,
 `network-privileges`, `unix-socket-guard`, `socket-runtime-directory`,
-`egress-filter`, `run-loopback`, `pass-egress`, `gateway-host-loopback`, and
-`terminal-pty-input`.
+`egress-filter`, `run-loopback`, `pass-egress`, `gateway-host-loopback`,
+`routed-peer`, and `terminal-pty-input`.
+
+The `routed-peer` scenario runs `tests/routed_peer.py` from the trusted source
+against the qualifying executable. It needs Python 3, ip, unshare, curl,
+dummy-interface support and the egress prerequisites. HTTP and UDP listeners
+record actual deliveries in an isolated namespace. The fixture compares these
+observations with the command outcome and firewall counters for each run.
 
 Read qualification as evidence for the named host scenarios only. The
 ordinary Rust unit and integration tests remain useful on constrained hosts,

@@ -90,6 +90,13 @@ fn format_precedence_errors_and_workload_arguments() {
             .as_array()
             .expect("scenarios")
             .iter()
+            .any(|s| s["id"] == "routed-peer" && s["evidence"] == "source_tree")
+    );
+    assert!(
+        catalog["scenarios"]
+            .as_array()
+            .expect("scenarios")
+            .iter()
             .any(|s| s["id"] == "offline-command" && s.get("status").is_none())
     );
 }

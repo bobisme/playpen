@@ -18,6 +18,7 @@ struct Scenario {
 #[derive(Clone, Copy)]
 enum ScenarioCheck {
     DoctorProbe(&'static str),
+    RoutedPeer,
     IntegrationTest {
         suite: &'static str,
         test: &'static str,
@@ -124,6 +125,16 @@ const SCENARIOS: &[Scenario] = &[
         ],
     },
     Scenario {
+        id: "routed-peer",
+        mode: "egress",
+        check: ScenarioCheck::RoutedPeer,
+        prerequisites: &[
+            "trusted source tree containing tests/routed_peer.py",
+            "python3, ip, unshare, curl, nft and pasta",
+            "nested user and network namespaces, IPv6, dummy interface and Landlock ABI 9",
+        ],
+    },
+    Scenario {
         id: "terminal-pty-input",
         mode: "offline",
         check: ScenarioCheck::IntegrationTest {
@@ -206,6 +217,50 @@ fn integration_test(source: Option<&Path>, suite: &str, test: &str) -> (&'static
         String::from_utf8_lossy(&output.stderr)
     );
     classify_test_output(suite, test, output.status.success(), &combined)
+}
+
+fn routed_peer(source: Option<&Path>) -> (&'static str, String) {
+    let Some(source) = source else {
+        return (
+            "unsupported",
+            "routed-peer needs an explicit trusted --source PATH".into(),
+        );
+    };
+    let script = source.join("tests/routed_peer.py");
+    if !script.is_file() {
+        return (
+            "unsupported",
+            format!("fixture {} is unavailable", script.display()),
+        );
+    }
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(e) => return ("failed", format!("cannot locate playpen: {e}")),
+    };
+    let output = match Command::new("python3")
+        .arg(&script)
+        .arg("--playpen")
+        .arg(exe)
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return ("unsupported", format!("python3 unavailable: {e}"));
+        }
+        Err(e) => return ("failed", format!("cannot run routed-peer fixture: {e}")),
+    };
+    let detail = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .trim()
+    .to_owned();
+    match output.status.code() {
+        Some(0) if detail.contains("EXECUTED: routed-peer") => ("executed", detail),
+        Some(77) => ("unsupported", detail),
+        _ => ("failed", detail),
+    }
 }
 
 fn classify_test_output(
@@ -325,7 +380,7 @@ pub(crate) fn list(format: Format) -> i32 {
     for scenario in SCENARIOS {
         let source = match scenario.check {
             ScenarioCheck::DoctorProbe(_) => "installed_binary",
-            ScenarioCheck::IntegrationTest { .. } => "source_tree",
+            ScenarioCheck::IntegrationTest { .. } | ScenarioCheck::RoutedPeer => "source_tree",
         };
         if format == Format::Json {
             scenarios.push(serde_json::json!({"id":scenario.id,"mode":scenario.mode,"evidence":source,"prerequisites":scenario.prerequisites}));
@@ -403,9 +458,15 @@ pub(crate) fn run_formatted(required: &[String], source: Option<&Path>, format: 
                     let (status, detail) = probe_result(report, probe);
                     (status, detail, "installed_binary", None)
                 }
-                ScenarioCheck::IntegrationTest { suite, test } => match report {
+                source_check => match report {
                     Ok(report) if report["capability"]["status"] != "unavailable" => {
-                        let (status, detail) = integration_test(source.as_deref(), suite, test);
+                        let (status, detail) = match source_check {
+                            ScenarioCheck::RoutedPeer => routed_peer(source.as_deref()),
+                            ScenarioCheck::IntegrationTest { suite, test } => {
+                                integration_test(source.as_deref(), suite, test)
+                            }
+                            ScenarioCheck::DoctorProbe(_) => unreachable!("handled above"),
+                        };
                         (status, detail, "source_tree", source_str.clone())
                     }
                     Ok(report) => (
@@ -476,7 +537,14 @@ fn print_qualification(qualification: &Qualification, format: Format) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScenarioResult, classify_test_output, integration_test, results_ok};
+    use super::{ScenarioResult, classify_test_output, integration_test, results_ok, routed_peer};
+
+    #[test]
+    fn routed_peer_requires_trusted_source() {
+        let (status, detail) = routed_peer(None);
+        assert_eq!(status, "unsupported");
+        assert!(detail.contains("trusted --source"));
+    }
 
     fn result(status: &'static str, required: bool) -> ScenarioResult {
         ScenarioResult {
