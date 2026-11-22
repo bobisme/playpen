@@ -83,8 +83,9 @@ and the sandbox init. A signal request and the final process exit can occur
 at different times.
 
 For CI jobs that signal the whole process group, use `playpen run --new-session`
-to keep the workload out of the caller's process group while the supervisor forwards signals. The default shared group preserves
-interactive shell job control, and a group signal can reach the command twice.
+to give the workload its own process group. The supervisor forwards signals
+to it. The default shared group supports interactive use, and a group signal
+can reach the command twice.
 With `--new-session`, stdin still works, but the command has no controlling
 terminal for `/dev/tty` prompts or nested shell job control.
 
@@ -108,9 +109,8 @@ programs need `--display`. Both are listed on the start line and in the
 report:
 
 ```console
-$ playpen run --pass engagement.pass.toml --expose "$SSH_AUTH_SOCK" \
+$ playpen run --allow 192.0.2.10:22/tcp --expose "$SSH_AUTH_SOCK" \
               -- ssh admin@192.0.2.10
-playpen: under pass ...; everything else is dropped; host Unix sockets: none reachable; exposed: /home/sam/.ssh/agent.sock
 ```
 
 Upgrading from v0.1? The spec lists the [changes](docs/spec.md#changes-since-v01):
@@ -154,8 +154,9 @@ playpen qualify --list --format json | jq -r '.scenarios[].id'
 ```
 
 Every public command accepts `--format text|pretty|json` before or after the
-command name. An explicit flag overrides `FORMAT`. By default a terminal gets
-pretty output and a pipe gets text. JSON results are objects with an `advice`
+command name. Use `--json` as a shorthand for `--format json`. An explicit
+flag overrides `FORMAT`. By default a terminal gets pretty output and a pipe
+gets text. JSON results are objects with an `advice`
 array. Invalid CLI syntax in JSON mode produces a structured error on stderr.
 Pass the workload and its flags after `--`.
 
@@ -240,14 +241,26 @@ run or any scenario failed.
 
 ```sh
 playpen qualify --require offline-command --require unix-socket-guard --format json
-playpen qualify --source "$PWD" --require terminal-pty-input --format json
+playpen qualify --source "$PWD" --require routed-peer --format json
 ```
 
 Direct probes exercise the running Playpen binary. An explicit trusted
 `--source` checkout enables named Cargo tests from the run, pass, sockets,
 gateway and terminal suites. They use `--locked --offline`. Each result
-identifies its evidence source, prerequisites and outcome. See the
-[native qualification reference](docs/spec.md#441-playpen-qualify) for details.
+identifies its evidence source, prerequisites and outcome. The `routed-peer`
+scenario runs a Python fixture against the qualifying binary. It follows an
+HTTP redirect with and without a grant for the second server, then sends UDP
+to approved and denied ports over IPv4 and IPv6. The listeners record which
+requests arrived, and playpen reports which packets it dropped.
+
+| Tested Linux configuration | nftables | pasta | Landlock | Checks that ran |
+| --- | --- | --- | --- | --- |
+| Arch host, 7.2.8-arch1-2 | 1.1.7 | 2026_09_25.df90211 | ABI 10 | All 11 qualification scenarios |
+| Isolated Arch guest, 7.1.4-arch1-1 | 1.1.6 | 2026_07_28.f8df3f1 | ABI 9 | Egress doctor, offline command and routed-peer fixture |
+
+The guest had no external network interface. Its test servers ran inside the
+guest. See the [guest qualification record](docs/qualification-second-linux.md)
+and the [qualification command reference](docs/spec.md#441-playpen-qualify).
 
 ## Threat model
 
