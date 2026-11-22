@@ -130,23 +130,14 @@ fn connectable_inside(extra: &[&str], listen: &[&str], tries: &[String]) -> (Vec
         args.extend_from_slice(&["--try", t]);
     }
     let out = sandbox(extra, &args);
-    let stdout = text(&out.stdout);
-    let lines: Vec<serde_json::Value> = stdout
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    assert_eq!(
-        lines.len(),
-        tries.len(),
-        "probe output incomplete: {stdout} / {}",
-        text(&out.stderr)
-    );
-    let ok = lines
-        .iter()
-        .filter(|v| v["connected"] == true)
-        .map(|v| v["path"].as_str().unwrap_or("").to_owned())
-        .collect();
-    (ok, out)
+    let connected = observed_connections(&out, tries);
+    (connected, out)
+}
+
+fn observed_connections(out: &Output, paths: &[impl AsRef<str>]) -> Vec<String> {
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let stdout = std::str::from_utf8(&out.stdout).expect("UTF-8 Unix probe output");
+    playpen::probe::connected_unix_paths(stdout, paths).unwrap_or_else(|e| panic!("{e}: {stdout}"))
 }
 
 /// A listening socket at `path`, removed again on drop.
@@ -244,6 +235,8 @@ fn no_host_socket_is_connectable_from_inside() {
             l.path.display()
         );
     }
+    all.sort();
+    all.dedup();
     let tries = strings(&all);
     let (connected, out) = connectable_inside(&[], &[], &tries);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
@@ -275,6 +268,8 @@ fn without_landlock_the_mount_layer_still_hides_the_usual_places() {
     ];
     let mut usual = host_sockets(false);
     usual.extend(own.iter().map(|l| l.path.clone()));
+    usual.sort();
+    usual.dedup();
     let tries = strings(&usual);
     let (connected, out) = connectable_inside(&["--without-landlock"], &[], &tries);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
@@ -536,19 +531,10 @@ fn display_exposes_the_wayland_socket_and_is_off_by_default() {
             .unwrap_or_else(|e| panic!("{e}"))
     };
     let off = run(&[]);
-    assert!(
-        text(&off.stdout).contains("\"connected\":false"),
-        "{}",
-        text(&off.stdout)
-    );
+    assert_eq!(observed_connections(&off, &[&wls]), Vec::<String>::new());
     assert!(!text(&off.stderr).contains("display exposed"));
     let on = run(&["--display"]);
-    assert!(
-        text(&on.stdout).contains("\"connected\":true"),
-        "{} {}",
-        text(&on.stdout),
-        text(&on.stderr)
-    );
+    assert_eq!(observed_connections(&on, &[&wls]), [wls.as_str()]);
     assert!(
         text(&on.stderr).contains(&format!("display exposed: {wls}")),
         "{}",
@@ -741,11 +727,8 @@ fn the_runtime_directory_is_private_empty_and_usable() {
     let out = sandbox(&[], &["sh", "-c", &script]);
     let _ = std::fs::remove_file(&marker);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-    assert!(
-        text(&out.stdout).contains("\"connected\":true"),
-        "{}",
-        text(&out.stdout)
-    );
+    let own = runtime_dir().join("own.sock").display().to_string();
+    assert_eq!(observed_connections(&out, &[&own]), [own]);
     assert!(!inside.exists(), "a file made inside appeared on the host");
 }
 

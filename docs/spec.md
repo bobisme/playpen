@@ -556,9 +556,9 @@ The egress checks, without changing any host setting:
    add table`, netlink address, link and link-state changes, raw IPv4, raw
    IPv6 and packet sockets, joining the user namespace of PID 1, and
    reading PID 1's memory, and must have no capabilities;
-7. a third sandbox (`--no-network`) that must not be able to connect to a
-   Unix socket and an abstract Unix socket doctor creates on the host for
-   the purpose.
+7. a third sandbox (`--no-network`) that must reach its own private Unix
+   socket and must fail to connect to the host pathname and abstract sockets
+   doctor creates. Doctor requires one structured result for each endpoint.
 
 Pretty output labels each check `ok` or `FAIL`. Text output places the check name first. Unrun checks are marked
 `untested`. Exit status 0 when the selected mode is demonstrated, 1

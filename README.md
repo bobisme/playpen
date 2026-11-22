@@ -4,12 +4,11 @@
 
 playpen runs a command and its children with a firewall that restricts
 outbound IP traffic to the addresses, ports and protocols you approve.
-It works without root on Linux and reports attempts to reach other
-destinations.
+It works without root on Linux and reports packets the firewall drops.
 
-It is a guard for tools that do not police themselves. A tool that follows
-a redirect, resolves a name to an unexpected address, or was configured
-with the wrong target cannot reach anywhere else.
+It is a guard for tools that do not police themselves. If an HTTP client follows a redirect,
+the new connection must also match the allow list. The command keeps its own
+loopback. An approved server can forward traffic, so choose destinations you trust.
 
 A [Hallpass](https://github.com/bobisme/hallpass) file records the
 owner, approved destinations and time window. playpen loads those
@@ -32,45 +31,26 @@ $ git clone https://github.com/bobisme/playpen.git
 $ cd playpen
 $ cargo build --release --locked
 $ export PATH="$PWD/target/release:$PATH"
-$ ./target/release/playpen doctor --mode egress
-ok   user namespaces: user.max_user_namespaces = 512098
-ok   unprivileged user namespaces: kernel.unprivileged_userns_clone = 1
-ok   nft: /usr/bin/nft (nftables v1.1.7 (Commodore Bullmoose #8))
-ok   pasta: /usr/bin/pasta (pasta 2026_09_25.df90211)
-ok   Landlock (host Unix sockets): ABI 10: connections to host Unix sockets can be refused
-ok   terminal input injection (TIOCSTI): refused by the kernel (dev.tty.legacy_tiocsti = 0): the command keeps the terminal and job control
-ok   allowed reached, others blocked: TCP, UDP and IPv6 to in-sandbox addresses: approved reached, others dropped
-ok   command cannot change the network: nft, netlink address/link changes, raw and packet sockets all denied; no capabilities
-ok   host Unix sockets unreachable: a host socket and a host abstract socket were not reachable from inside
-playpen egress mode is available.
+$ playpen doctor --mode offline --format json | jq -r .capability.status
+available
+$ playpen run --no-network --format json -- printf 'hello\n' | jq '{outcome, exit_code}'
+```
 
-$ cat engagement.pass.toml          # written with hallpass init, mode 0600
-format = 1
-id = "example-2026-11"
-name = "Example web app"
+The command's `hello` and playpen's diagnostics go to stderr. The pipe receives
+one JSON report with `outcome: "ran"` and `exit_code: 0`.
+This example needs no network destination, pass file or pasta. For a run with
+outbound access, check `playpen doctor --mode egress` first.
 
-[approval]
-owner = "Pat Owner, Example Corp"
-reference = "email of 2026-11-18"
-operator = "Sam Tester"
-valid_from = 2026-11-19T08:00:00Z
-valid_until = 2026-11-19T17:00:00Z
-revoked = false
+### Run under a Hallpass approval
 
-[[destination]]
-label = "app"
-address = "192.0.2.10"
-protocol = "tcp"
-ports = 443
-hostname = "app.example.test"     # informational: grants nothing
+Use a current pass from the owner. For example, if the pass approves
+`192.0.2.10:443/tcp`, the invocation below gives curl a local name for that
+address. Substitute the address and hostname from your own engagement.
 
-$ playpen run --pass engagement.pass.toml \
-              --host app.example.test=192.0.2.10 \
-              -- curl -sS https://app.example.test/
-playpen: under pass example-2026-11 ("Example web app", owner "Pat Owner, Example Corp", sha256:3f1c..., window ends 2026-11-19T17:00:00Z, destinations app): allowing only 192.0.2.10:443/tcp until 2026-11-19T17:00:00Z (no DNS, names app.example.test=192.0.2.10); everything else is dropped; host Unix sockets: none reachable
-...curl output...
-playpen: command exited with status 0
-playpen: no packets to unapproved destinations were dropped
+```sh
+playpen run --pass engagement.pass.toml \
+  --host app.example.test=192.0.2.10 \
+  -- curl -sS https://app.example.test/
 ```
 
 playpen refuses to start (exit 2, "nothing was run") when the pass is
@@ -103,19 +83,17 @@ and the sandbox init. A signal request and the final process exit can occur
 at different times.
 
 For CI jobs that signal the whole process group, use `playpen run --new-session`
-to deliver each signal to the command once. The default shared group preserves
+to keep the workload out of the caller's process group while the supervisor forwards signals. The default shared group preserves
 interactive shell job control, and a group signal can reach the command twice.
 With `--new-session`, stdin still works, but the command has no controlling
 terminal for `/dev/tty` prompts or nested shell job control.
 
 ### Run with a command-line allow list
 
-```console
-$ playpen run --allow 192.0.2.10:443/tcp \
-              --host app.example.test=192.0.2.10 \
-              --until 2026-11-19T18:00:00+01:00 \
-              -- curl -sS https://app.example.test/
-playpen: allowing only 192.0.2.10:443/tcp until 2026-11-19T17:00:00Z (no DNS, names app.example.test=192.0.2.10); everything else is dropped; host Unix sockets: none reachable
+```sh
+playpen run --allow 192.0.2.10:443/tcp \
+  --host app.example.test=192.0.2.10 \
+  -- curl -sS https://app.example.test/
 ```
 
 `--pass` and `--allow` cannot be combined: an `--allow` beside a pass would
@@ -240,7 +218,8 @@ guarded offline invocation above to check ordinary command support.
 ### Check this host
 
 Offline mode runs a real command with only the sandbox loopback interface.
-It checks the command’s network privileges and access to host Unix sockets.
+It checks the command’s network privileges and verifies that a private Unix socket
+connects while the host pathname and abstract sockets are unreachable.
 Egress mode also uses pasta and tests allowed and denied TCP, UDP and IPv6
 destinations. Both modes require user namespaces, nft and Landlock ABI 9 or later.
 
@@ -277,7 +256,8 @@ playpen guards against:
 - accidents and misconfigured tools: a wrong target, a forgotten default
   host, a tool reaching for updates or telemetry;
 - tools that follow redirects, or resolve names, to places nobody approved:
-  there is no DNS inside, and only literal approved addresses are reachable;
+  the system resolver uses the sandbox hosts file. A client that implements
+  its own DNS still needs permission to reach the resolver;
 - children and background processes of the command: they stay in the same
   sandbox and are killed when the command exits;
 - the command trying to undo the guard: it cannot change the firewall,

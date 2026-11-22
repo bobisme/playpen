@@ -161,7 +161,7 @@ fn self_run(run_args: &[&str], probe: &[&str]) -> Result<String, String> {
                 .replace('\n', " | ")
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    String::from_utf8(out.stdout).map_err(|e| format!("invalid probe stdout: {e}"))
 }
 
 fn self_command(run_args: &[&str], command: &[&str]) -> Check {
@@ -445,20 +445,30 @@ fn sockets_check() -> Check {
     })();
     let path_s = path.display().to_string();
     let at = format!("@{abstract_name}");
+    let control = format!("{at}-inside");
     let result = match listeners {
-        Ok(_held) => self_run(&["--no-network"], &["unix", "--try", &path_s, "--try", &at]),
+        Ok(_held) => self_run(
+            &["--no-network"],
+            &[
+                "unix", "--listen", &control, "--try", &path_s, "--try", &at, "--try", &control,
+            ],
+        )
+        .and_then(|out| crate::probe::connected_unix_paths(&out, &[&path_s, &at, &control])),
         Err(e) => Err(format!("cannot create the test sockets: {e}")),
     };
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir(&dir);
     match result {
-        Ok(out) if out.lines().count() == 2 && !out.contains("\"connected\":true") => Check {
+        Ok(connected) if connected == [control.as_str()] => Check {
             name,
             ok: true,
-            detail: "a host socket and a host abstract socket were not reachable from inside"
-                .into(),
+            detail:
+                "private control socket reached; host pathname and abstract sockets unreachable"
+                    .into(),
         },
-        Ok(out) => fail(format!("unexpected probe output: {}", out.trim())),
+        Ok(connected) => fail(format!(
+            "expected only the private control {control:?} to connect; reached {connected:?}"
+        )),
         Err(e) => fail(e),
     }
 }

@@ -245,6 +245,54 @@ pub fn unix(listen: &[String], tries: &[String]) -> Result<Vec<Value>, String> {
     Ok(lines)
 }
 
+/// Read exactly one connection result per requested Unix endpoint and return
+/// the paths that connected. The probe can emit results in any order.
+///
+/// # Errors
+/// Returns an error for malformed, contradictory, duplicate or missing evidence.
+pub fn connected_unix_paths(
+    output: &str,
+    paths: &[impl AsRef<str>],
+) -> Result<Vec<String>, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Record {
+        path: String,
+        connected: bool,
+        error: Option<String>,
+    }
+
+    let mut pending: std::collections::BTreeSet<&str> = paths.iter().map(AsRef::as_ref).collect();
+    if pending.len() != paths.len() {
+        return Err("duplicate Unix probe request".into());
+    }
+    let mut connected = Vec::new();
+    for (index, line) in output.lines().enumerate() {
+        let record: Record = serde_json::from_str(line)
+            .map_err(|e| format!("invalid Unix probe record on line {}: {e}", index + 1))?;
+        if !pending.remove(record.path.as_str()) {
+            return Err(format!(
+                "unexpected or repeated Unix endpoint {:?}",
+                record.path
+            ));
+        }
+        match (record.connected, record.error) {
+            (true, None) => connected.push(record.path),
+            (false, Some(error)) if !error.trim().is_empty() => {}
+            _ => {
+                return Err(format!(
+                    "inconsistent Unix probe result for {:?}",
+                    record.path
+                ));
+            }
+        }
+    }
+    if let Some(path) = pending.first() {
+        return Err(format!("missing Unix probe result for {path:?}"));
+    }
+    Ok(connected)
+}
+
 /// `probe unix-send PATH`: sends one datagram, `playpen-probe`, by address
 /// from an unconnected datagram socket. Only for sockets the caller made
 /// for the test.
@@ -483,4 +531,44 @@ pub fn stdout_reconnect(target: &str) -> Value {
         "connected": outcome(connected),
         "wrote": outcome(wrote),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::connected_unix_paths;
+
+    #[test]
+    fn unix_evidence_matches_the_requested_paths_and_decodes_boolean_values() {
+        let lines = r#"{"connected": false,"error":"unreachable","path":"@host"}
+{"path":"/own/socket", "connected": true}
+"#;
+        assert_eq!(
+            connected_unix_paths(lines, &["/own/socket", "@host"]).expect("valid records"),
+            ["/own/socket"]
+        );
+    }
+
+    #[test]
+    fn incomplete_or_malformed_output_cannot_establish_socket_isolation() {
+        let denied = r#"{"path":"@a","connected":false,"error":"unreachable"}"#;
+        for other in [
+            "",
+            "{}",
+            "malformed",
+            denied,
+            r#"{"path":"@unknown","connected":false,"error":"unreachable"}"#,
+            r#"{"path":"@b","connected":"false","error":"unreachable"}"#,
+            r#"{"path":"@b","connected":false}"#,
+            r#"{"path":"@b","connected":false,"error":""}"#,
+            r#"{"path":"@b","connected":true,"error":"unreachable"}"#,
+            r#"{"path":"@b","connected":false,"connected":true}"#,
+            r#"{"path":"@b","reachable":false,"error":"unreachable"}"#,
+        ] {
+            assert!(
+                connected_unix_paths(&format!("{denied}\n{other}"), &["@a", "@b"]).is_err(),
+                "{other}"
+            );
+        }
+        assert!(connected_unix_paths(denied, &["@a", "@a"]).is_err());
+    }
 }
