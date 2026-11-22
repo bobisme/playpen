@@ -972,75 +972,168 @@ enum SendTo {
     EachPlaypen,
 }
 
-/// Starts a signal counter in a sandbox in its own process group, sends it
-/// SIGUSR1 `SENT` times, and returns how many arrived.
-fn usr1_deliveries(extra: &[&str], how: SendTo) -> u64 {
-    use std::io::BufRead as _;
+fn spawn_headless_signal_workload(extra: &[&str], workload: &[&str]) -> std::process::Child {
     use std::os::unix::process::CommandExt as _;
-    const SENT: u32 = 4;
-    let kill = |target: &str, sig: &str| {
-        let st = Command::new("kill").args([sig, "--", target]).status();
-        assert!(st.is_ok_and(|s| s.success()), "kill {sig} {target}");
-    };
+
     let mut args = vec!["run", "--no-network"];
     args.extend_from_slice(extra);
-    args.extend_from_slice(&["--", BIN, "probe", "signals"]);
-    let mut child = playpen(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .unwrap_or_else(|e| panic!("{e}"));
-    let pid = child.id();
-    let mut stdout =
-        std::io::BufReader::new(child.stdout.take().unwrap_or_else(|| panic!("no stdout")));
-    let mut line = String::new();
-    let _ = stdout.read_line(&mut line);
-    assert_eq!(line, "ready\n");
-    // playpen and its three helpers (C, S and I in sandbox.rs), each the
-    // only child of the one before; the command is I's child.
-    let mut helpers = vec![pid];
-    for _ in 0..3 {
-        let last = helpers.last().copied().unwrap_or(pid);
-        helpers.push(only_child(last).unwrap_or_else(|| panic!("no child of {last}")));
-    }
-    for _ in 0..SENT {
-        match how {
-            SendTo::Supervisor => kill(&pid.to_string(), "-USR1"),
-            SendTo::Group => kill(&format!("-{pid}"), "-USR1"),
-            SendTo::EachPlaypen => {
-                for p in &helpers {
-                    kill(&p.to_string(), "-USR1");
-                }
+    args.push("--");
+    args.extend_from_slice(workload);
+    let mut command = playpen(&args);
+    command.stdout(Stdio::piped()).stderr(Stdio::inherit());
+    // SAFETY: setsid is async-signal-safe. Run it after fork to guarantee a
+    // private process group and detach from any terminal inherited from Cargo.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
             }
-        }
-        std::thread::sleep(Duration::from_millis(150));
+            Ok(())
+        });
     }
-    kill(&pid.to_string(), "-TERM");
-    let mut rest = String::new();
-    let _ = stdout.read_to_string(&mut rest);
-    let _ = child.wait();
-    let v: serde_json::Value = serde_json::from_str(rest.trim()).unwrap_or_default();
-    v["usr1"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("no count in {rest:?} ({how:?})"))
+    command.spawn().expect("start a headless local sandbox")
 }
 
-/// A signal for playpen reaches the command once, however it was sent:
-/// to playpen alone, or to each of its processes. Sent to the whole
-/// process group, the command also gets its own copy from the kernel when
-/// it is in that group (bn-1w3: playpen cannot tell that it did), so there
-/// it arrives twice, never more; in a new session, once.
+fn usr1_deliveries(extra: &[&str], how: SendTo, workload: &[&str]) -> Vec<usize> {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    use std::io::BufRead as _;
+    use std::sync::mpsc;
+
+    const SENT: usize = 4;
+    const QUIET: Duration = Duration::from_millis(200);
+    let mut child = spawn_headless_signal_workload(extra, workload);
+    let pid = i32::try_from(child.id()).expect("Linux PID");
+    let (tx, rx) = mpsc::channel();
+    let stdout = child.stdout.take().expect("piped sandbox stdout");
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if matches!(line.as_str(), "ready" | "usr1") && tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let collect = || -> Result<Vec<usize>, String> {
+        let ready = rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
+        if ready != "ready" {
+            return Err(format!("unexpected readiness event: {ready}"));
+        }
+        let targets = match how {
+            SendTo::Supervisor => vec![pid],
+            SendTo::Group => vec![-pid],
+            SendTo::EachPlaypen => {
+                // P, C, S and I, each the only child of the one before.
+                let mut helpers = vec![pid];
+                for _ in 0..3 {
+                    let last = helpers[helpers.len() - 1];
+                    let next = only_child(u32::try_from(last).map_err(|e| e.to_string())?)
+                        .ok_or_else(|| format!("no child of {last}"))?;
+                    helpers.push(i32::try_from(next).map_err(|e| e.to_string())?);
+                }
+                helpers
+            }
+        };
+        let mut batches = Vec::with_capacity(SENT);
+        for _ in 0..SENT {
+            for &target in &targets {
+                kill(Pid::from_raw(target), Signal::SIGUSR1).map_err(|e| e.to_string())?;
+            }
+            // Wait for the first receipt, then observe a quiet interval before
+            // sending again. Ordinary signals can coalesce when queued at once.
+            let first = rx
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|e| e.to_string())?;
+            if first != "usr1" {
+                return Err(format!("unexpected signal event: {first}"));
+            }
+            let mut count = 1;
+            loop {
+                match rx.recv_timeout(QUIET) {
+                    Ok(event) if event == "usr1" => count += 1,
+                    Ok(event) => return Err(format!("unexpected signal event: {event}")),
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            batches.push(count);
+        }
+        Ok(batches)
+    };
+    let deliveries = collect();
+    let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("check sandbox exit") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("stop stuck sandbox");
+            let _ = child.wait();
+            panic!("signal receiver did not exit after SIGTERM ({how:?}, {extra:?})");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    reader.join().expect("collect signal events");
+    let late: Vec<_> = rx.try_iter().collect();
+    assert!(
+        late.is_empty(),
+        "late signal receipts: {late:?} ({how:?}, {extra:?})"
+    );
+    assert!(
+        status.success(),
+        "receiver exit {status} ({how:?}, {extra:?})"
+    );
+    deliveries.unwrap_or_else(|err| panic!("signal receiver: {err} ({how:?}, {extra:?})"))
+}
+
 #[test]
 fn a_signal_for_playpen_reaches_the_command_once() {
     require_sandbox!();
-    assert_eq!(usr1_deliveries(&[], SendTo::Supervisor), 4);
-    assert_eq!(usr1_deliveries(&[], SendTo::EachPlaypen), 4);
-    let group = usr1_deliveries(&[], SendTo::Group);
-    assert!((4..=8).contains(&group), "{group} deliveries of 4 signals");
-    for how in [SendTo::Supervisor, SendTo::EachPlaypen, SendTo::Group] {
-        assert_eq!(usr1_deliveries(&["--new-session"], how), 4, "{how:?}");
+    let mut observations = Vec::new();
+    for extra in [&[][..], &["--new-session"][..]] {
+        for how in [SendTo::Supervisor, SendTo::EachPlaypen, SendTo::Group] {
+            observations.push((
+                extra,
+                how,
+                usr1_deliveries(extra, how, &[BIN, "probe", "signals"]),
+            ));
+        }
     }
+    for (extra, how, deliveries) in &observations {
+        assert_eq!(
+            deliveries,
+            &[1, 1, 1, 1],
+            "{how:?} in {extra:?}; all observations: {observations:?}"
+        );
+    }
+}
+
+#[test]
+fn a_headless_forwarded_signal_reaches_a_background_descendant_once() {
+    require_sandbox!();
+    // The background probe is the only process that emits receipts. Its
+    // parent shell traps USR1 without relaying it. TERM arranges a clean
+    // shutdown of the probe even on versions with leader-only forwarding.
+    let workload = [
+        "sh",
+        "-c",
+        r#"
+trap ':' USR1
+trap 'kill -TERM "$member" 2>/dev/null || :; wait "$member"; exit 0' TERM
+"$1" probe signals &
+member=$!
+while kill -0 "$member" 2>/dev/null; do wait "$member" || :; done
+"#,
+        "signal-descendant",
+        BIN,
+    ];
+    let deliveries = usr1_deliveries(&[], SendTo::Supervisor, &workload);
+    assert_eq!(deliveries, &[1, 1, 1, 1]);
 }
 
 /// A process inside that signals PID 1 (the sandbox's init) reaches the

@@ -580,3 +580,83 @@ fn in_a_new_session_ctrl_c_ctrl_z_resize_and_input_still_work() {
     t.send("\x03");
     assert_eq!(t.status(), "130");
 }
+
+#[test]
+fn background_and_foreground_resume_a_sandbox_pipeline() {
+    require_pty!(t);
+    t.send("$P run --no-network -- sh -c 'while :; do echo p\"\"ulse; sleep 0.1; done' | cat\n");
+    t.expect("pulse");
+    t.send("\x1a");
+    t.expect("Stopped");
+    let _ = t.quiet_for(Duration::from_millis(300));
+    assert!(!t.quiet_for(Duration::from_millis(500)).contains("pulse"));
+    t.send("bg\n");
+    t.expect("pulse");
+    t.send("fg\n");
+    t.expect("| cat");
+    t.expect("pulse");
+    t.send("\x03");
+    assert_eq!(t.status(), "130");
+    t.send("echo p\"\"ipeline-finished\n");
+    t.expect("pipeline-finished");
+}
+
+#[test]
+fn nested_interactive_pipeline_can_stop_background_foreground_and_interrupt() {
+    if playpen::sandbox::tiocsti_allowed() {
+        eprintln!(
+            "SKIPPED: automatic new-session mode has no controlling terminal for nested job control"
+        );
+        return;
+    }
+    require_pty!(t);
+    t.send("$P run --no-network -- bash --norc --noprofile -i\n");
+    t.expect("host Unix sockets");
+    t.expect("$ ");
+    t.send("while :; do echo n\"\"ested-pulse; sleep 0.1; done | cat\n");
+    t.expect("nested-pulse");
+    t.send("\x1a");
+    t.expect("Stopped");
+    t.expect("$ ");
+    let _ = t.quiet_for(Duration::from_millis(300));
+    assert!(
+        !t.quiet_for(Duration::from_millis(500))
+            .contains("nested-pulse")
+    );
+    t.send("bg\n");
+    t.expect("nested-pulse");
+    t.send("fg\n");
+    t.expect("| cat");
+    t.expect("nested-pulse");
+    t.send("\x03");
+    t.expect("$ ");
+    t.send("echo n\"\"ested-alive\n");
+    t.expect("nested-alive");
+    t.send("exit\n");
+    t.expect("command exited with status 0");
+    assert_eq!(t.status(), "0");
+}
+
+#[test]
+fn foreground_pipeline_host_stage_can_read_terminal_input() {
+    require_pty!(t);
+    t.send("bash -c 'echo host-\"\"ready >/dev/tty; IFS= read -r word; printf \"host-read:%s\\n\" \"$word\"' | $P run --no-network -- cat\n");
+    t.expect("host-ready");
+    t.send("pipeline-input\n");
+    t.expect("host-read:pipeline-input");
+    assert_eq!(t.status(), "0");
+}
+
+#[test]
+fn redirected_workload_can_use_its_controlling_terminal() {
+    if playpen::sandbox::tiocsti_allowed() {
+        eprintln!("SKIPPED: automatic new-session mode has no controlling terminal");
+        return;
+    }
+    require_pty!(t);
+    t.send("$P run --no-network -- sh -c 'echo tty-\"\"ready >/dev/tty; IFS= read -r word </dev/tty; printf \"tty-read:%s\\n\" \"$word\" >/dev/tty' </dev/null >/dev/null 2>&1\n");
+    t.expect("tty-ready");
+    t.send("terminal-input\n");
+    t.expect("tty-read:terminal-input");
+    assert_eq!(t.status(), "0");
+}

@@ -402,8 +402,8 @@ pub fn resolve(name: &str) -> Value {
 }
 
 /// Counts deliveries of SIGUSR1 until SIGTERM arrives. Prints `ready` once
-/// both are blocked; every delivery is taken as soon as it arrives, so two
-/// copies of one signal that arrive apart are counted as two.
+/// both are blocked and `usr1` for each receipt. Two
+/// copies that arrive apart are counted separately.
 ///
 /// # Errors
 /// When the signals cannot be blocked or waited for.
@@ -417,7 +417,10 @@ pub fn signals() -> Result<Value, String> {
     let mut usr1 = 0u32;
     loop {
         match set.wait() {
-            Ok(Signal::SIGUSR1) => usr1 += 1,
+            Ok(Signal::SIGUSR1) => {
+                usr1 += 1;
+                println!("usr1");
+            }
             Ok(_) => return Ok(json!({ "usr1": usr1 })),
             Err(Errno::EINTR) => {}
             Err(e) => return Err(e.to_string()),
