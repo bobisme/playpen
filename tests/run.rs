@@ -965,7 +965,7 @@ fn only_child(parent: u32) -> Option<u32> {
 enum SendTo {
     /// To playpen alone.
     Supervisor,
-    /// To playpen's whole process group, the command included.
+    /// To the process group created for the headless playpen supervisor.
     Group,
     /// To every playpen process one by one (as `killall playpen` does),
     /// not to the command.
@@ -1054,7 +1054,7 @@ fn usr1_deliveries(extra: &[&str], how: SendTo, workload: &[&str]) -> Vec<usize>
             let mut count = 1;
             loop {
                 match rx.recv_timeout(QUIET) {
-                    Ok(event) if event == "usr1" => count += 1,
+                    Ok(event) if event == "usr1" && count <= 8 => count += 1,
                     Ok(event) => return Err(format!("unexpected signal event: {event}")),
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                     Err(e) => return Err(e.to_string()),
@@ -1134,6 +1134,39 @@ while kill -0 "$member" 2>/dev/null; do wait "$member" || :; done
     ];
     let deliveries = usr1_deliveries(&[], SendTo::Supervisor, &workload);
     assert_eq!(deliveries, &[1, 1, 1, 1]);
+}
+
+#[test]
+fn a_headless_workload_can_create_its_own_session_and_receive_signals() {
+    require_sandbox!();
+    let deliveries = usr1_deliveries(&[], SendTo::Group, &["setsid", BIN, "probe", "signals"]);
+    assert_eq!(deliveries, &[1, 1, 1, 1]);
+}
+
+#[test]
+fn headless_workload_group_excludes_its_signal_forwarder() {
+    require_sandbox!();
+    // These command names contain no spaces. Linux stat field 5 is pgrp.
+    let mut child = spawn_headless_signal_workload(
+        &[],
+        &["sh", "-c", "awk '{print $5}' /proc/1/stat /proc/$$/stat"],
+    );
+    let mut groups = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut groups)
+        .expect("groups");
+    assert!(child.wait().expect("wait").success());
+    let groups: Vec<i32> = groups
+        .lines()
+        .map(|s| s.parse().expect("group ID"))
+        .collect();
+    let [init, workload] = groups.as_slice() else {
+        panic!("unexpected groups: {groups:?}")
+    };
+    assert!(workload > &1 && workload != init, "groups: {groups:?}");
 }
 
 /// A process inside that signals PID 1 (the sandbox's init) reaches the

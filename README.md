@@ -82,12 +82,16 @@ grace periods and watchdog actions depend on Linux scheduling the supervisor
 and the sandbox init. A signal request and the final process exit can occur
 at different times.
 
-For CI jobs that signal the whole process group, use `playpen run --new-session`
-to give the workload its own process group. The supervisor forwards signals
-to it. The default shared group supports interactive use, and a group signal
-can reach the command twice.
-With `--new-session`, stdin still works, but the command has no controlling
-terminal for `/dev/tty` prompts or nested shell job control.
+For a headless job (no controlling terminal), send signals to the playpen PID
+or its process group. Playpen forwards them to the workload group. Redirecting
+stdio alone does not make a terminal job headless.
+
+At a terminal, the default preserves shell pipelines, `fg`/`bg` and
+`/dev/tty`. Signal the playpen **PID** when you need a single delivery.
+An explicit signal to the **group** can also reach the command directly,
+giving it a second copy. For automation that allocates a terminal and signals
+the whole group, use `--new-session`. The command keeps its standard streams
+and gives up its controlling terminal.
 
 ### Run with a command-line allow list
 

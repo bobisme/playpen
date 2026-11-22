@@ -660,3 +660,30 @@ fn redirected_workload_can_use_its_controlling_terminal() {
     t.expect("tty-read:terminal-input");
     assert_eq!(t.status(), "0");
 }
+
+#[test]
+fn attached_pid_and_new_session_group_signals_have_one_delivery() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    require_pty!(t);
+    for (option, whole_group) in [("", false), ("--new-session", true)] {
+        t.send(&format!(
+            "$P run --no-network {option} -- $P probe signals\n"
+        ));
+        t.expect("ready");
+        // SAFETY: master is the live master fd for this test's private PTY.
+        let pgid = unsafe { libc::tcgetpgrp(t.master.as_raw_fd()) };
+        assert!(pgid > 1 && pgid != i32::try_from(t.child.id()).expect("shell PID"));
+        let target = Pid::from_raw(if whole_group { -pgid } else { pgid });
+        for _ in 0..4 {
+            kill(target, Signal::SIGUSR1).expect("signal the foreground test job");
+            t.expect("usr1");
+            let late = t.quiet_for(Duration::from_millis(200));
+            assert!(!late.contains("usr1"), "duplicate receipt: {late:?}");
+        }
+        kill(Pid::from_raw(pgid), Signal::SIGTERM).expect("finish the counter");
+        t.expect(r#"{"usr1":4}"#);
+        assert_eq!(t.status(), "0");
+    }
+}

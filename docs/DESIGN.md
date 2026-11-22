@@ -186,7 +186,7 @@ pointed anywhere: a connected stream or sequenced-packet socket, or a
 listening one. A datagram socket, connected or not, and an unconnected
 stream socket are refused in that mode.
 
-**Job control.** The command stays in the terminal's foreground process
+**Job control.** In an attached job the command stays in the terminal's foreground process
 group, as without playpen, so Ctrl-C, Ctrl-\, resizes and reading from the
 terminal reach it directly from the kernel. Ctrl-Z needed work: in v0.1 it
 stopped playpen (P) and the command, but a process in another process
@@ -231,26 +231,29 @@ before the `dev.tty.legacy_tiocsti` setting, or with it set to 1), a
 command could queue a shell command for the operator's shell to read after
 playpen exits. There playpen runs the command in a new session (`setsid`
 in X), with no controlling terminal: `TIOCSTI` needs the terminal to be the
-caller's controlling one. `--new-session` forces this mode. The price: the
-terminal no longer signals the command. It still signals I, which is in
-playpen's process group, so I passes the terminal's SIGINT, SIGQUIT and
-SIGWINCH on, and sends everything it passes on to the command's whole
-process group, as the terminal would. (A first version had P forward the
-terminal's signals to I. That lost signals under load: I also gets the
-terminal's own copy, a pending standard signal absorbs a second one, and
-I then saw only the kernel's copy, which it ignored.) Signals from other
-processes P passes to I as bytes on their pipe, never with `kill`: I is in
-P's process group, so a signal sent to the group, or to every playpen
-process, reaches I as well, and I could not tell that copy from P's. I
-passes on what P names, what the terminal sent (in a new session), and what
-a process inside the sandbox sent to PID 1 (its sender has a process id in
-I's namespace; a sender outside shows as 0), and drops the rest. What is
-left: outside a new session a signal sent to the whole process group
-reaches the command from the kernel and again through P, which cannot know
-that the command had its own copy. Ctrl-Z works through
-the freeze; but `/dev/tty` cannot be opened (password prompts of `ssh` or
-`sudo` fail) and a shell inside has no job control. Reading from the
-terminal on stdin works.
+caller's controlling one. `--new-session` forces this mode. Playpen retains its place in the caller's job.
+PID 1 leaves that group before it forks the command. The supervisor sends
+terminal interrupts, quits and resize signals over the control pipe. PID 1
+delivers them to the workload group. The existing freeze and thaw protocol
+handles Ctrl-Z. Programs can read terminal stdin but have no controlling
+terminal for `/dev/tty` or nested shell job control.
+
+**Headless jobs.** Playpen checks Linux's controlling terminal field
+(`tty_nr` in `/proc/self/stat`) before it forks. With no controlling terminal,
+PID 1 leaves the caller’s group before forking. The workload joins a separate
+group led briefly by a setup child, then reaps that child before exec. This
+keeps the workload free to create a session of its own and keeps PID 1 out
+of signals sent by the command to its own group. PID 1 forwards a signal from
+the control pipe to the workload's current group. A sender inside the namespace
+can also signal PID 1.
+
+**Attached jobs.** A group signal sent with `kill` can reach both the
+supervisor and the workload. Linux supplies the sender's PID and UID to the
+supervisor for both PID-targeted and group-targeted sends. Suppressing the
+forward could lose a signal sent to the supervisor alone. The shared group
+also lets other pipeline stages read the real terminal and lets a command
+open `/dev/tty` with redirected stdin. For single delivery in this mode,
+address the supervisor PID.
 
 ## AppArmor
 

@@ -27,9 +27,8 @@
 //! them when it is suspended (Ctrl-Z) and continued, so the command never
 //! runs while P, which enforces the end time and re-reads the pass, is
 //! stopped. The signals P passes on to the command travel on this pipe
-//! too, one byte each (see [`signal_byte`]): I is in P's process group, so
-//! a signal sent to the group, or to every playpen process, reaches I as
-//! well, and I could not tell that copy from one P sent it with `kill`.
+//! too, one byte each (see [`signal_byte`]). This distinguishes forwarded
+//! signals from copies received by helpers in the caller's process group.
 //! P also sends `b` every second. When I hears nothing from P for
 //! [`SILENCE_LIMIT`] (P was stopped with SIGSTOP, which it cannot catch,
 //! or is stuck), I freezes the sandbox by itself until P is heard again.
@@ -78,8 +77,7 @@ const FORWARDED: [Signal; 7] = [
 ];
 
 /// `si_code` of signals the kernel generated itself, for example a terminal's
-/// Ctrl-C. Those already reach every process in the foreground process
-/// group, the command included, so they are not forwarded a second time.
+/// Ctrl-C. In attached mode the terminal already signals its foreground job.
 const SI_KERNEL: i32 = 0x80;
 
 /// Everything the sandbox needs to know. Built and checked by the CLI.
@@ -507,6 +505,7 @@ fn run_sandbox(
         gid: getgid(),
         parent: getpid(),
     };
+    let job = JobControl::for_run(plan.new_session).map_err(not_started)?;
     let grant_counters = plan.grant_counter_count();
     let ruleset_text = ruleset::render_instrumented(&plan.approval, grant_counters);
     let files = SandboxFiles::build(plan);
@@ -524,7 +523,7 @@ fn run_sandbox(
                 );
                 exit_now(1);
             }
-            let code = match stage_c(plan, &ids, &ruleset_text, &files, &up_w, &down_r) {
+            let code = match stage_c(plan, &ids, &ruleset_text, &files, &up_w, &down_r, job) {
                 Ok(()) => 0,
                 Err(msg) => {
                     write_line(&up_w, &format!("fail {msg}"));
@@ -536,7 +535,7 @@ fn run_sandbox(
         ForkResult::Parent { child } => {
             drop(up_w);
             drop(down_r);
-            parent(plan, child, &sigfd, &up_r, down_w, events)
+            parent(plan, child, &sigfd, &up_r, down_w, events, job)
         }
     }
 }
@@ -740,6 +739,7 @@ fn parent(
     up_r: &OwnedFd,
     down_w: OwnedFd,
     events: &mut dyn Events,
+    job: JobControl,
 ) -> Result<RunResult, RunError> {
     let deadline = plan.approval.ends_at.map(|end| {
         let left = end.at() - time::OffsetDateTime::now_utc();
@@ -893,10 +893,10 @@ fn parent(
                     // once its loop runs, even if they come before that.
                     Signal::SIGTSTP => suspend(&down_w),
                     Signal::SIGCONT => send_byte(&down_w, THAW),
-                    // The terminal sent it to its foreground process group,
-                    // which holds the command, or, in a new session, I
-                    // (which passes it on).
-                    _ if info.ssi_code == SI_KERNEL => {}
+                    // An attached foreground workload receives the terminal's
+                    // signal directly. Detached helpers have already left this
+                    // group, so P is the single route into a new session.
+                    _ if info.ssi_code == SI_KERNEL && job == JobControl::CallerTerminal => {}
                     _ => pass_on(&down_w, sig),
                 }
             }
@@ -1008,6 +1008,7 @@ fn stage_c(
     files: &SandboxFiles,
     up_w: &OwnedFd,
     down_r: &OwnedFd,
+    job: JobControl,
 ) -> Result<(), String> {
     die_with_parent(ids.parent)?;
     unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET).map_err(|e| {
@@ -1043,7 +1044,7 @@ fn stage_c(
 
     match fork_checked()? {
         ForkResult::Child => {
-            let code = match stage_s(plan, files, up_w, down_r) {
+            let code = match stage_s(plan, files, up_w, down_r, job) {
                 Ok(()) => 0,
                 Err(msg) => {
                     write_line(up_w, &format!("fail {msg}"));
@@ -1135,6 +1136,54 @@ fn report_counters(nft: &Path, grant_counters: usize, up: &OwnedFd) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobControl {
+    CallerTerminal,
+    PrivateGroup,
+    NewSession,
+}
+
+impl JobControl {
+    fn forward(self, child: Pid, sig: Signal) {
+        let target = match self {
+            Self::CallerTerminal => child,
+            Self::NewSession => Pid::from_raw(-child.as_raw()),
+            Self::PrivateGroup => match nix::unistd::getpgid(Some(child)) {
+                // The workload may make its own session or change groups.
+                // Never translate an invisible group or PID 1 to kill(0/-1).
+                Ok(group) if group.as_raw() > 1 => Pid::from_raw(-group.as_raw()),
+                _ => child,
+            },
+        };
+        let _ = kill(target, sig);
+    }
+
+    fn for_run(new_session: bool) -> Result<Self, String> {
+        if new_session {
+            return Ok(Self::NewSession);
+        }
+        // Linux stat field 7 is tty_nr. A process can still open its
+        // controlling terminal even when all three standard streams are pipes.
+        let stat = fs::read("/proc/self/stat").map_err(|e| format!("cannot read tty_nr: {e}"))?;
+        let fields = stat.rsplitn(2, |&b| b == b')').next().unwrap_or_default();
+        let tty = fields
+            .split(u8::is_ascii_whitespace)
+            .filter(|v| !v.is_empty())
+            .nth(4)
+            .ok_or("missing tty_nr in /proc/self/stat")?;
+        Ok(if tty == b"0" {
+            Self::PrivateGroup
+        } else {
+            Self::CallerTerminal
+        })
+    }
+}
+
+fn make_process_group() -> Result<(), String> {
+    nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0))
+        .map_err(|e| format!("cannot create a process group: {e}"))
+}
+
 // ---------------------------------------------------------------- S ----
 
 fn stage_s(
@@ -1142,12 +1191,13 @@ fn stage_s(
     files: &SandboxFiles,
     up_w: &OwnedFd,
     down_r: &OwnedFd,
+    job: JobControl,
 ) -> Result<(), String> {
     prctl::set_pdeathsig(Signal::SIGKILL).map_err(|e| format!("PR_SET_PDEATHSIG: {e}"))?;
     unshare(CloneFlags::CLONE_NEWPID).map_err(|e| format!("cannot create a PID namespace: {e}"))?;
     match fork_checked()? {
         ForkResult::Child => {
-            let code = match stage_i(plan, files, up_w, down_r) {
+            let code = match stage_i(plan, files, up_w, down_r, job) {
                 Ok(code) => code,
                 Err(msg) => {
                     write_line(up_w, &format!("fail {msg}"));
@@ -1171,8 +1221,14 @@ fn stage_i(
     files: &SandboxFiles,
     up_w: &OwnedFd,
     down_r: &OwnedFd,
+    job: JobControl,
 ) -> Result<i32, String> {
     prctl::set_pdeathsig(Signal::SIGKILL).map_err(|e| format!("PR_SET_PDEATHSIG: {e}"))?;
+    if job != JobControl::CallerTerminal {
+        // Leave the caller's group before forking the workload. A
+        // group signal during setup must never become pending in the workload.
+        make_process_group()?;
+    }
     // A private IPC namespace: System V shared memory, semaphores and
     // message queues, and POSIX message queues, of host processes are not
     // reachable from inside.
@@ -1206,7 +1262,7 @@ fn stage_i(
         ForkResult::Child => {
             drop(err_r);
             drop(sigfd);
-            let msg = match stage_x(plan) {
+            let msg = match stage_x(plan, job) {
                 Ok(never) => match never {},
                 Err(msg) => msg,
             };
@@ -1234,15 +1290,7 @@ fn stage_i(
         return Err(String::from_utf8_lossy(&msg).trim().to_owned());
     }
     write_line(up_w, "started");
-    // In its own session the command leads its own process group, and
-    // the terminal no longer signals it: send what P passes on to the whole
-    // group, as the terminal would.
-    let target = if plan.new_session {
-        Pid::from_raw(-child.as_raw())
-    } else {
-        child
-    };
-    match init_loop(child, target, plan.new_session, &sigfd, up_w, down_r) {
+    match init_loop(child, job, &sigfd, up_w, down_r) {
         Ok(code) => Ok(code),
         Err(msg) => {
             write_line(up_w, &format!("statuserr {msg}"));
@@ -1252,20 +1300,14 @@ fn stage_i(
 }
 
 /// I's work while the command runs: pass the signals P names on to
-/// `target`, freeze and thaw on P's request, reap orphans, and report how
+/// the workload, freeze and thaw on P's request, reap orphans, and report how
 /// the command ended.
 ///
-/// Of the signals I receives itself, two kinds are passed on: those a
-/// process inside the sandbox sent to PID 1, and, with `from_terminal`,
-/// those the kernel sent (the terminal signals I's process group, no
-/// longer the command's). A signal from a process outside (sent to the
-/// process group, or to every playpen process) is not: P received it too
-/// and passes it on through the pipe, and passing on both would deliver it
-/// twice.
+/// PID 1 also accepts signals sent to it by processes in its own PID
+/// namespace. Signals from outside the namespace use P's control pipe.
 fn init_loop(
     child: Pid,
-    target: Pid,
-    from_terminal: bool,
+    job: JobControl,
     sigfd: &SignalFd,
     up_w: &OwnedFd,
     down_r: &OwnedFd,
@@ -1333,7 +1375,7 @@ fn init_loop(
                             }
                             _ => {
                                 if let Some(sig) = byte_signal(byte) {
-                                    let _ = kill(target, sig);
+                                    job.forward(child, sig);
                                 }
                             }
                         }
@@ -1363,10 +1405,8 @@ fn init_loop(
         if sig != Signal::SIGCHLD {
             // Job-control signals are P's business (freeze and thaw).
             // A sender outside this PID namespace shows as pid 0.
-            let from_kernel = info.ssi_code == SI_KERNEL;
-            let from_inside = !from_kernel && info.ssi_pid != 0;
-            if FORWARDED.contains(&sig) && (from_inside || (from_terminal && from_kernel)) {
-                let _ = kill(target, sig);
+            if FORWARDED.contains(&sig) && info.ssi_code != SI_KERNEL && info.ssi_pid > 1 {
+                job.forward(child, sig);
             }
             continue;
         }
@@ -1792,7 +1832,26 @@ fn verify_dropped(uid: Uid, gid: Gid) -> Result<(), String> {
     Ok(())
 }
 
-fn stage_x(plan: &Plan) -> Result<std::convert::Infallible, String> {
+/// Give the command a group distinct from init without making the command
+/// a group leader. This preserves its ability to call `setsid()` after exec.
+fn join_private_group() -> Result<(), String> {
+    let (hold, release) = pipe2(OFlag::O_CLOEXEC).map_err(|e| format!("pipe: {e}"))?;
+    let anchor = match fork_checked()? {
+        ForkResult::Child => {
+            drop(release);
+            while read(&hold, &mut [0]) == Err(Errno::EINTR) {}
+            exit_now(0);
+        }
+        ForkResult::Parent { child } => child,
+    };
+    let joined = nix::unistd::setpgid(anchor, anchor)
+        .and_then(|()| nix::unistd::setpgid(Pid::from_raw(0), anchor));
+    drop(release);
+    while waitpid(anchor, None) == Err(Errno::EINTR) {}
+    joined.map_err(|e| format!("cannot join the workload process group: {e}"))
+}
+
+fn stage_x(plan: &Plan, job: JobControl) -> Result<std::convert::Infallible, String> {
     // Outer namespace ids of the caller: 0 inside the outer namespace maps
     // to the caller's uid/gid on the host. Read them from the outer map.
     let uid_map = fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
@@ -1820,10 +1879,12 @@ fn stage_x(plan: &Plan) -> Result<std::convert::Infallible, String> {
         crate::landlock::restrict(&plan.exposed)
             .map_err(|e| format!("cannot restrict Unix socket connections with Landlock: {e}"))?;
     }
-    if plan.new_session {
-        // No controlling terminal: TIOCSTI needs the terminal to be the
-        // caller's controlling terminal, and /dev/tty cannot be opened.
-        nix::unistd::setsid().map_err(|e| format!("cannot start a new session: {e}"))?;
+    match job {
+        JobControl::NewSession => {
+            nix::unistd::setsid().map_err(|e| format!("cannot start a new session: {e}"))?;
+        }
+        JobControl::PrivateGroup => join_private_group()?,
+        JobControl::CallerTerminal => {}
     }
     sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
         .map_err(|e| format!("cannot unblock signals: {e}"))?;

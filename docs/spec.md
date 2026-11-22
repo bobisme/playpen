@@ -355,7 +355,8 @@ prints a note to stderr naming the explicit `--hide` path that was not found.
 A dangling symlink is treated the same way. Command stdout is unchanged.
 Applied after the mount layer and `--expose`.
 
-**Terminal and job control.** Without a new session the command stays in
+**Terminal and job control.** With a controlling terminal and without
+`--new-session`, the command stays in
 the terminal's foreground process group: Ctrl-C, Ctrl-\, resizes and
 reading from the terminal reach it as they would without playpen, and a
 shell inside (`-- bash -i`) has job control for its own jobs. Ctrl-Z (or
@@ -858,20 +859,21 @@ Each step either succeeds or stops the run with a message that ends
     (exit 1). Otherwise I reports "started".
 
 While the command runs, P forwards SIGINT, SIGTERM, SIGHUP, SIGQUIT,
-SIGUSR1, SIGUSR2 and SIGWINCH it receives from another process to I (as a
-byte on its pipe to I, not as a signal), which passes them to the command
-(to its process group in a new session).
-Signals the kernel generated (for example Ctrl-C from the terminal) already
-reach the command directly and are not sent twice; in a new session they
-reach I instead (it is in playpen's process group), which passes them on.
-I also passes on a signal that a process inside the sandbox sends to PID 1.
-A signal I receives from outside is not passed on: P received it too. So a
-signal sent to playpen, or to each playpen process (`killall playpen`),
-reaches the command once. A signal sent to playpen's whole process group
-(`kill -TERM -PGID`, `timeout` without `--foreground`, a shell's `kill
-%1`) reaches the command once in a new session; otherwise the command is
-in that group, gets its own copy from the kernel and P's as well: twice.
-P cannot tell the two cases apart.
+SIGUSR1, SIGUSR2 and SIGWINCH from other processes to I, one byte per
+signal on their control pipe. I also accepts those signals directly from
+other processes in its PID namespace. Signal routing depends on the job:
+
+| Job | Target of a forwarded signal | External signal sent to P's group |
+| --- | --- | --- |
+| No controlling terminal | Workload's current process group | P forwards one copy |
+| `--new-session` (explicit or automatic) | Workload's initial session process group | P forwards one copy |
+| Attached to the caller's terminal | Workload PID | A workload still in P's group can receive both the direct and forwarded copies |
+
+The supervisor's controlling terminal determines the default even when
+stdin, stdout and stderr are redirected. In an attached job the kernel
+delivers terminal-generated signals to the foreground group directly. In a
+new session P forwards those signals. Standard signals of the same kind can
+coalesce while pending.
 On SIGTSTP, P asks I to stop every
 process in the sandbox that is not stopped already, then stops itself; on
 SIGCONT it asks I to continue them. P sends I one byte every second; after
@@ -1036,7 +1038,7 @@ Not guarded against, or known limits:
   does not specify an atomic cross-counter snapshot or a version range for
   one, so no supported nft version is claimed to provide that guarantee;
 - a signal sent to playpen's whole process group reaches the command
-  twice unless it runs in a new session (section 5);
+  twice when the command shares its caller's terminal process group (section 5);
 - When SIGSTOP reaches playpen itself, its deadline and pass checks pause.
   The sandbox init begins freezing the command when it observes 5 seconds
   of silence (section 4.1).
