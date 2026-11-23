@@ -13,8 +13,8 @@
 //! it never spends from the ledger.
 
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
-use std::net::Ipv4Addr;
+use std::fmt::{self, Write as _};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ use hallpass::{Destination, Digest, Pass};
 use time::OffsetDateTime;
 
 use crate::approval::{AllowRule, Approval, EndsAt, Net, Ports, Proto, ipv4_edges};
+use crate::resolver::{HostEntry, valid_hostname};
 
 /// How often the supervisor re-reads the pass while the command runs.
 pub const RECHECK_INTERVAL: Duration = Duration::from_secs(2);
@@ -49,7 +50,8 @@ pub struct PassIdentity {
 }
 
 /// A destination in use that names a host name. The name grants nothing
-/// and is never resolved; the operator can map it with `--host`.
+/// and is never resolved; the operator can map it with `--host`, or with
+/// `--pass-hosts` when the destination is a single address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedDestination {
     /// The destination's label.
@@ -58,8 +60,97 @@ pub struct NamedDestination {
     pub hostname: String,
     /// The destination's address or network, as text.
     pub destination: String,
-    /// Whether the destination is a single address.
-    pub single: bool,
+    /// The address, when the destination is a single address.
+    pub address: Option<IpAddr>,
+}
+
+/// A hosts entry that `--pass-hosts` takes from the pass: a destination's
+/// own `hostname` and its single address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassHost {
+    /// The entry for `/etc/hosts`, with the name in lower case.
+    pub entry: HostEntry,
+    /// The labels of the destinations that give this name this address,
+    /// in file order.
+    pub labels: Vec<String>,
+}
+
+impl fmt::Display for PassHost {
+    /// `NAME=ADDR (pass: LABEL, ...)`, as in the start line, the plan and
+    /// the report.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}={} (pass: {})",
+            self.entry.name,
+            self.entry.addr,
+            self.labels.join(", ")
+        )
+    }
+}
+
+/// What `--pass-hosts` makes of the host names of the destinations in use.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PassHosts {
+    /// The entries written into `/etc/hosts`, in file order.
+    pub entries: Vec<PassHost>,
+    /// The entries left out because a `--host` maps the same name.
+    pub replaced: Vec<PassHost>,
+    /// Why a destination's host name is not mapped, one line per
+    /// destination.
+    pub notes: Vec<String>,
+}
+
+/// The hosts entries `--pass-hosts` takes from `named`, the destinations in
+/// use that have a `hostname`.
+///
+/// Each entry maps a destination's own `hostname` to that destination's
+/// single address, so it points at an address the pass approves. Nothing is
+/// looked up. A network destination is skipped with a note, and so is a
+/// `hostname` that `/etc/hosts` cannot hold (see
+/// [`valid_hostname`]). Two destinations with the same `hostname` give
+/// that name both addresses. A name that `explicit` (the `--host` entries)
+/// maps is not taken from the pass: the entries go to
+/// [`PassHosts::replaced`].
+#[must_use]
+pub fn pass_hosts(named: &[NamedDestination], explicit: &[HostEntry]) -> PassHosts {
+    let mut out = PassHosts::default();
+    for n in named {
+        let name = n.hostname.to_ascii_lowercase();
+        let mapped = explicit.iter().any(|h| h.name == name);
+        let Some(addr) = n.address else {
+            if !mapped {
+                out.notes.push(format!(
+                    "--pass-hosts does not map {name}: destination `{}` is a network ({}), not one address. If the tool needs the name, map it with --host {name}=ADDR-IN-{}",
+                    n.label, n.destination, n.destination
+                ));
+            }
+            continue;
+        };
+        if !valid_hostname(&name) {
+            out.notes.push(format!(
+                "--pass-hosts does not map {}: the hostname of destination `{}` is not a plain host name (letters, digits, '-' and '.') that /etc/hosts can hold",
+                n.hostname, n.label
+            ));
+            continue;
+        }
+        let list = if mapped {
+            &mut out.replaced
+        } else {
+            &mut out.entries
+        };
+        match list
+            .iter_mut()
+            .find(|p| p.entry.name == name && p.entry.addr == addr)
+        {
+            Some(p) => p.labels.push(n.label.clone()),
+            None => list.push(PassHost {
+                entry: HostEntry { name, addr },
+                labels: vec![n.label.clone()],
+            }),
+        }
+    }
+    out
 }
 
 /// Enforcement coverage of the selected pass terms.
@@ -142,6 +233,7 @@ fn from_pass(
     let mut rules = Vec::new();
     let mut in_use = Vec::new();
     let mut named = Vec::new();
+    let mut hostnames = Vec::new();
     let mut name_limited = Vec::new();
     for d in &selected {
         if !d.names.is_empty() {
@@ -163,8 +255,11 @@ fn from_pass(
                 label: d.label.clone(),
                 hostname: h.clone(),
                 destination: d.network.to_string(),
-                single: d.network.is_host(),
+                address: d.network.is_host().then(|| d.network.addr()),
             });
+        }
+        if d.network.is_host() {
+            hostnames.push((d.label.clone(), d.hostname.clone()));
         }
     }
     let identity = PassIdentity {
@@ -192,8 +287,10 @@ fn from_pass(
         owner: pass.approval.owner.clone(),
         digest,
         in_use,
+        hostnames,
         edge_addresses: edge_addresses.clone(),
         require_enforced: false,
+        pass_hosts: false,
         interval: RECHECK_INTERVAL,
     };
     Ok(FromPass {
@@ -323,9 +420,15 @@ pub struct PassWatch {
     owner: String,
     digest: Digest,
     in_use: Vec<(String, Vec<AllowRule>)>,
+    /// The `hostname` of each single-address destination in use (the
+    /// ones `--pass-hosts` maps), by label, at start.
+    hostnames: Vec<(String, Option<String>)>,
     edge_addresses: BTreeSet<Ipv4Addr>,
     /// Stop when an unsupported restriction becomes applicable.
     pub require_enforced: bool,
+    /// `--pass-hosts`: the run's `/etc/hosts` holds host names from the
+    /// pass, so the notice for an edit names a changed `hostname`.
+    pub pass_hosts: bool,
     /// How often to re-read.
     pub interval: Duration,
 }
@@ -401,9 +504,40 @@ impl PassWatch {
             ));
         }
         self.digest = digest;
+        let renamed = self.renamed(pass);
+        if !renamed.is_empty() {
+            let what = if renamed.len() == 1 {
+                "the hostname of destination"
+            } else {
+                "the hostnames of destinations"
+            };
+            return Recheck::Edited(format!(
+                "the pass was edited (now {digest}): {what} {} changed. No rule changed, so the command continues under the rules loaded at start, and /etc/hosts keeps the names --pass-hosts wrote at start; start a new run to use the new names",
+                renamed.join(", ")
+            ));
+        }
         Recheck::Edited(format!(
             "the pass was edited (now {digest}); nothing this run uses changed, so the command continues under the rules loaded at start. Anything the edit adds (destinations, a later valid_until) does not apply to this run; start a new run to use it"
         ))
+    }
+
+    /// With `--pass-hosts`: the labels, quoted, of the single-address
+    /// destinations in use whose `hostname` in `pass` differs from the one
+    /// at start.
+    fn renamed(&self, pass: &Pass) -> Vec<String> {
+        if !self.pass_hosts {
+            return Vec::new();
+        }
+        self.hostnames
+            .iter()
+            .filter(|(label, before)| {
+                pass.destinations
+                    .iter()
+                    .find(|d| &d.label == label)
+                    .is_some_and(|d| d.hostname != *before)
+            })
+            .map(|(label, _)| format!("`{label}`"))
+            .collect()
     }
 }
 
@@ -472,6 +606,12 @@ calls = 6
             .filter(|d| labels.contains(&d.label.as_str()))
             .map(|d| (d.label.clone(), rules_for(d).unwrap_or_default()))
             .collect();
+        let hostnames = pass
+            .destinations
+            .iter()
+            .filter(|d| labels.contains(&d.label.as_str()) && d.network.is_host())
+            .map(|d| (d.label.clone(), d.hostname.clone()))
+            .collect();
         let edge_addresses = pass_edges(&pass);
         PassWatch {
             path: PathBuf::from("unused"),
@@ -479,8 +619,10 @@ calls = 6
             owner: pass.approval.owner,
             digest: Digest::of(text.as_bytes()),
             in_use,
+            hostnames,
             edge_addresses,
             require_enforced: false,
+            pass_hosts: false,
             interval: RECHECK_INTERVAL,
         }
     }
@@ -592,7 +734,181 @@ calls = 6
         assert!(matches!(judge(&mut w, &other, NOW), Recheck::Edited(_)));
         // The hostname grants nothing; changing it changes no rule.
         let renamed = other.replace("app.example.test", "www.example.test");
-        assert!(matches!(judge(&mut w, &renamed, NOW), Recheck::Edited(_)));
+        let Recheck::Edited(m) = judge(&mut w, &renamed, NOW) else {
+            panic!("a changed hostname is harmless")
+        };
+        assert!(m.contains("nothing this run uses changed"), "{m}");
+    }
+
+    #[test]
+    fn with_pass_hosts_a_hostname_edit_continues_and_names_the_destination() {
+        let mut w = watch_for(PASS, &["web", "v6"]);
+        w.pass_hosts = true;
+        // The network `v6` gets a hostname: --pass-hosts does not map a
+        // network, so there is no news about names.
+        let other = PASS.replace(
+            "ports = 5060",
+            "ports = 5060\nhostname = \"sip.example.test\"",
+        );
+        let Recheck::Edited(m) = judge(&mut w, &other, NOW) else {
+            panic!("a hostname on a network changes no rule")
+        };
+        assert!(m.contains("nothing this run uses changed"), "{m}");
+        // The hostname of a destination in use changes: the existing rule
+        // for edits that change no rule applies, and the notice says what
+        // the run keeps.
+        for edited in [
+            other.replace("app.example.test", "www.example.test"),
+            other.replace("hostname = \"app.example.test\"\n", ""),
+        ] {
+            let Recheck::Edited(m) = judge(&mut w, &edited, NOW) else {
+                panic!("a changed hostname changes no rule:\n{edited}")
+            };
+            assert!(
+                m.contains("the hostname of destination `web` changed"),
+                "{m}"
+            );
+            assert!(m.contains("/etc/hosts keeps the names"), "{m}");
+        }
+    }
+
+    /// A pass with named single addresses, a named network, a name
+    /// `/etc/hosts` cannot hold and a destination without a name.
+    fn named_pass() -> String {
+        let header = PASS
+            .split("[[destination]]")
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let destinations = [
+            (
+                "web",
+                "address = \"192.0.2.10\"",
+                "tcp",
+                "hostname = \"App.Example.Test\"",
+            ),
+            (
+                "web-udp",
+                "address = \"192.0.2.10\"",
+                "udp",
+                "hostname = \"app.example.test\"",
+            ),
+            (
+                "alt",
+                "address = \"192.0.2.11\"",
+                "tcp",
+                "hostname = \"app.example.test\"",
+            ),
+            (
+                "sip",
+                "address = \"2001:db8::5\"",
+                "udp",
+                "hostname = \"sip.example.test\"",
+            ),
+            (
+                "lab",
+                "network = \"198.51.100.0/28\"",
+                "tcp",
+                "hostname = \"lab.example.test\"",
+            ),
+            (
+                "srv",
+                "address = \"192.0.2.20\"",
+                "tcp",
+                "hostname = \"_srv.example.test\"",
+            ),
+            ("plain", "address = \"192.0.2.30\"", "tcp", ""),
+        ];
+        let mut text = header;
+        for (label, target, protocol, hostname) in destinations {
+            let _ = write!(
+                text,
+                "[[destination]]\nlabel = \"{label}\"\n{target}\nprotocol = \"{protocol}\"\nports = 443\n{hostname}\n\n"
+            );
+        }
+        text
+    }
+
+    fn named(only: &[&str]) -> Vec<NamedDestination> {
+        let text = named_pass();
+        let only: Vec<String> = only.iter().map(|&l| l.to_owned()).collect();
+        from_pass(
+            Path::new("p.toml"),
+            &parse(&text),
+            Digest::of(text.as_bytes()),
+            &only,
+            NOW,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+        .named
+    }
+
+    fn texts(hosts: &[PassHost]) -> Vec<String> {
+        hosts.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn pass_hosts_map_each_named_single_address() {
+        let hosts = pass_hosts(&named(&[]), &[]);
+        assert_eq!(
+            texts(&hosts.entries),
+            [
+                "app.example.test=192.0.2.10 (pass: web, web-udp)",
+                "app.example.test=192.0.2.11 (pass: alt)",
+                "sip.example.test=2001:db8::5 (pass: sip)",
+            ]
+        );
+        assert_eq!(hosts.replaced, []);
+        assert_eq!(hosts.notes.len(), 2, "{:?}", hosts.notes);
+        assert!(
+            hosts.notes[0].contains(
+                "destination `lab` is a network (198.51.100.0/28), not one address. If the tool needs the name, map it with --host lab.example.test=ADDR-IN-198.51.100.0/28"
+            ),
+            "{:?}",
+            hosts.notes
+        );
+        assert!(
+            hosts.notes[1].contains("_srv.example.test: the hostname of destination `srv`"),
+            "{:?}",
+            hosts.notes
+        );
+        // Every entry's text is a --host entry with a marker after a space.
+        for text in texts(&hosts.entries) {
+            let (entry, _) = text.split_once(' ').unwrap_or_default();
+            assert!(crate::resolver::parse_host(entry).is_ok(), "{text}");
+        }
+    }
+
+    #[test]
+    fn pass_hosts_follow_only_and_yield_to_host() {
+        let hosts = pass_hosts(&named(&["alt", "plain"]), &[]);
+        assert_eq!(
+            texts(&hosts.entries),
+            ["app.example.test=192.0.2.11 (pass: alt)"]
+        );
+        assert_eq!(hosts.notes, [] as [String; 0]);
+
+        let explicit = [
+            crate::resolver::parse_host("APP.example.test=192.0.2.11")
+                .unwrap_or_else(|e| panic!("{e}")),
+            crate::resolver::parse_host("lab.example.test=198.51.100.7")
+                .unwrap_or_else(|e| panic!("{e}")),
+        ];
+        let hosts = pass_hosts(&named(&[]), &explicit);
+        assert_eq!(
+            texts(&hosts.entries),
+            ["sip.example.test=2001:db8::5 (pass: sip)"]
+        );
+        assert_eq!(
+            texts(&hosts.replaced),
+            [
+                "app.example.test=192.0.2.10 (pass: web, web-udp)",
+                "app.example.test=192.0.2.11 (pass: alt)",
+            ]
+        );
+        // The network's name is mapped by --host: no note for it.
+        assert_eq!(hosts.notes.len(), 1, "{:?}", hosts.notes);
+        assert!(hosts.notes[0].contains("`srv`"), "{:?}", hosts.notes);
     }
 
     #[test]

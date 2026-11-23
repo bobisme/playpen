@@ -425,6 +425,32 @@ the destination of another label. The start line says how to map it with
 `--host` instead, and `--host` must point at an address of a destination in
 use.
 
+**`--pass-hosts` is the operator's choice to use the pass's names.** It
+exists so the operator does not copy an address out of the pass onto the
+command line, where a typo maps a name to the wrong destination. The
+operator asks for it, and the start line, the plan and the report list
+every entry it adds with the label it came from. Each entry pairs a
+destination's own `hostname` with that destination's own address. Both come
+from the text the owner wrote, so the name can only lead to an address the
+pass approves, and no rule changes: `playpen rules` prints the same ruleset
+with and without it. Only a single-address destination gives an entry. For
+a network, playpen would have to choose an address inside it, and that
+choice is the operator's, with `--host`. A `--host` for the same name wins
+for the same reason: the operator said so explicitly.
+
+playpen does not look a name up. A lookup on the host at start, approving
+the addresses it returns, was considered and dropped: playpen exists so
+that a name resolving to an unexpected address cannot widen the scope, and
+with a lookup playpen itself would approve whatever DNS answered.
+
+A mid-run edit of a `hostname` follows the rule for edits that change no
+rule: the run continues with a notice. `/etc/hosts` is bound at start, like
+the ruleset, and is not rewritten. The old name still leads to an address
+the pass approves (if that address had changed, the destination's rules
+would have changed and the run would stop), so the edit cannot widen what
+the command reaches. Stopping would end runs for a correction that grants
+nothing.
+
 **Loopback destinations are refused.** hallpass allows `127.0.0.0/8` and
 `::1` when listed. playpen cannot enforce them: inside the sandbox loopback
 is always allowed and is the sandbox's own, and the host's loopback is not

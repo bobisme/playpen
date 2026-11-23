@@ -44,12 +44,12 @@ outbound access, check `playpen doctor --mode egress` first.
 ### Run under a Hallpass approval
 
 Use a current pass from the owner. For example, if the pass approves
-`192.0.2.10:443/tcp`, the invocation below gives curl a local name for that
-address. Substitute the address and hostname from your own engagement.
+`192.0.2.10:443/tcp` with `hostname = "app.example.test"`, the invocation
+below gives curl that name for that address. Substitute the pass from your
+own engagement.
 
 ```sh
-playpen run --pass engagement.pass.toml \
-  --host app.example.test=192.0.2.10 \
+playpen run --pass engagement.pass.toml --pass-hosts \
   -- curl -sS https://app.example.test/
 ```
 
@@ -57,7 +57,10 @@ playpen refuses to start (exit 2, "nothing was run") when the pass is
 invalid, unreadable, a symbolic link, writable by others, not yet valid,
 expired or revoked. `--only LABEL` narrows the pass to some destinations;
 `--until` can end the run earlier than the window, never later. The pass's
-host names are never resolved for you; map them with `--host`.
+host names are never resolved for you. `--pass-hosts` writes the `hostname`
+of each selected single-address destination, with that address, into the
+sandbox's `/etc/hosts`; it looks nothing up and grants nothing. Map any
+other name to an address of the pass with `--host NAME=ADDR`.
 
 Pass restrictions on destination names and application ceilings need a separate
 application-level enforcer. Use `--require-enforced` to refuse a pass with

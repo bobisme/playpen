@@ -20,9 +20,11 @@ pub(super) const RUN: &str = "Examples
   playpen run --format json --no-network -- printf hello
   playpen run --no-network --private-tty -- bash -i
   playpen run --allow 192.0.2.10:443/tcp --report run.json -- true
+  playpen run --pass engagement.pass.toml --pass-hosts -- curl -sS https://app.example.test/
 
 Agent workflow
   Choose --no-network, explicit --allow grants, or --pass FILE. Use plan with the same command and policy first, then pass its digest to --expect-plan.
+  Nothing is resolved: there is no DNS inside. With --pass, --pass-hosts maps the hostname of each selected single-address destination to its address. --host NAME=ADDR maps any other name to an approved address.
   In JSON mode the final report goes to stdout and workload output streams to stderr. With --report FILE, the file gets the report and stdout belongs to the workload.
   Read startup_evidence before retrying a job with side effects. not_started permits a retry after fixing the cause. unknown requires investigation.
   A policy refusal exits 2, a setup error exits 1, and a launched command normally supplies its own exit status. --fail-on-drop can turn child success into exit 1.";

@@ -43,7 +43,7 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
         "command": args.command.iter().map(|a| unix_string(a)).collect::<Vec<_>>(),
         "cwd": unix_string(cwd.as_os_str()), "pass": pass,
         "allowed": grants.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "hosts": checked.hosts.iter().map(|h| format!("{}={}",h.name,h.addr)).collect::<Vec<_>>(),
+        "hosts": checked.host_texts(),
         "until": checked.approval.ends_at.map(EndsAt::to_rfc3339),
         "network": if args.no_network { "none" } else { "pasta" },
         "loopback_addresses": checked.lo_addrs,
@@ -55,6 +55,10 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
     // Keep pre-existing plan digests valid for unchanged terminal behavior.
     if args.private_tty {
         scope["private_tty"] = json!(true);
+    }
+    // Likewise for runs without --pass-hosts; its entries are in `hosts`.
+    if args.pass_hosts {
+        scope["pass_hosts"] = json!(true);
     }
     Ok(scope)
 }

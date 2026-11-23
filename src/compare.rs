@@ -26,6 +26,24 @@ struct Input {
     complete: bool,
 }
 
+/// The report's `hosts` as a map from each name to its addresses.
+///
+/// An entry from `--pass-hosts` ends in ` (pass: LABEL, ...)`; the mapping
+/// is the same whichever option gave it.
+fn host_mappings(field: &Value) -> Result<Value, String> {
+    let mut mappings = std::collections::BTreeMap::<String, Vec<IpAddr>>::new();
+    for raw in field.as_array().into_iter().flatten() {
+        let raw = raw.as_str().ok_or("invalid host")?;
+        let entry = raw
+            .strip_suffix(')')
+            .and_then(|r| r.split_once(" (pass: "))
+            .map_or(raw, |(entry, _)| entry);
+        let h = crate::resolver::parse_host(entry).map_err(|e| e.to_string())?;
+        mappings.entry(h.name).or_default().push(h.addr);
+    }
+    Ok(serde_json::json!(mappings))
+}
+
 fn read(path: &Path) -> Result<Input, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
@@ -65,13 +83,7 @@ fn read(path: &Path) -> Result<Input, String> {
             return Err(format!("invalid policy field {key}"));
         }
         if key == "hosts" {
-            let mut mappings = std::collections::BTreeMap::<String, Vec<IpAddr>>::new();
-            for raw in field.as_array().into_iter().flatten() {
-                let h = crate::resolver::parse_host(raw.as_str().ok_or("invalid host")?)
-                    .map_err(|e| e.to_string())?;
-                mappings.entry(h.name).or_default().push(h.addr);
-            }
-            field = serde_json::json!(mappings);
+            field = host_mappings(&field)?;
         } else if let Some(items) = field.as_array_mut() {
             items.sort_by_key(Value::to_string);
         }

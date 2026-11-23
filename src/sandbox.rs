@@ -2465,7 +2465,10 @@ fn bind_resolver_files(plan: &Plan, files: &SandboxFiles) -> Result<(), String> 
     if Path::new("/etc/hosts").exists() {
         bind_contents("/etc/hosts", "hosts", &files.hosts)?;
     } else if !plan.hosts.is_empty() {
-        return Err("--host needs /etc/hosts to exist on this system to bind over it".into());
+        return Err(
+            "--host and --pass-hosts need /etc/hosts to exist on this system to bind over it"
+                .into(),
+        );
     }
     if fs::metadata("/etc/resolv.conf").is_ok() {
         bind_contents("/etc/resolv.conf", "resolv.conf", &files.resolv)?;

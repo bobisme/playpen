@@ -7,6 +7,7 @@ mod preview;
 use event_pipe::EventPipe;
 
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Write as _;
 use std::net::IpAddr;
@@ -18,7 +19,9 @@ use discovery::Format;
 use time::OffsetDateTime;
 
 use crate::approval::{Approval, EndsAt, parse_allow, parse_literal_addr};
-use crate::pass::{self, FromPass, MIN_RECHECK_INTERVAL, NamedDestination, RECHECK_INTERVAL};
+use crate::pass::{
+    self, FromPass, MIN_RECHECK_INTERVAL, NamedDestination, PassHosts, RECHECK_INTERVAL,
+};
 use crate::report::{Outcome, PassReport, Report, StartupEvidence, text_summary};
 use crate::resolver::{HostEntry, check_hosts, parse_host};
 use crate::sandbox::{self, CommandStatus, Events, Plan, RunError};
@@ -74,6 +77,10 @@ enum Cmd {
         /// With --pass: only the destination with this label. Repeatable.
         #[arg(long = "only", value_name = "LABEL")]
         only: Vec<String>,
+        /// With --pass: accepted as by run. Host names change no rule, so the
+        /// output is the same.
+        #[arg(long, requires = "pass")]
+        pass_hosts: bool,
     },
     /// Check that this machine can run playpen, and say exactly what is missing.
     #[command(display_order = 1, after_help = discovery::DOCTOR)]
@@ -183,6 +190,11 @@ struct RunArgs {
         value_name = "NAME=ADDR"
     )]
     host: Vec<String>,
+    /// With --pass: make the hostname of each selected single-address destination
+    /// resolve to its address inside the sandbox. Looks nothing up, grants nothing;
+    /// --host for the same name wins.
+    #[arg(help_heading = "Network policy", long, requires = "pass")]
+    pass_hosts: bool,
     /// When the approval ends (RFC 3339 with offset); the command is stopped
     /// then. With --pass it can only be earlier than the pass's window end.
     #[arg(help_heading = "Network policy", long, value_name = "RFC3339")]
@@ -296,7 +308,9 @@ fn dispatch(cmd: Cmd, format: Format) -> i32 {
         Cmd::PolicyTest(args) => policy_test::run(&args, format),
         Cmd::Plan(args) => preview::print(&args, format),
         Cmd::Compare { before, after } => crate::compare::run_formatted(&before, &after, format),
-        Cmd::Rules { allow, pass, only } => rules(&allow, pass.as_deref(), &only, format),
+        Cmd::Rules {
+            allow, pass, only, ..
+        } => rules(&allow, pass.as_deref(), &only, format),
         Cmd::Doctor { mode } => crate::doctor::run_formatted(mode, format),
         Cmd::Qualify { list: true, .. } => crate::qualification::list(format),
         Cmd::Qualify {
@@ -463,13 +477,43 @@ struct Checked {
     fixture: Option<crate::fixture::Fixture>,
     new_session: bool,
     approval: Approval,
+    /// `--host`.
     hosts: Vec<HostEntry>,
+    /// What `--pass-hosts` takes from the pass; `None` without it.
+    pass_hosts: Option<PassHosts>,
     lo_addrs: Vec<IpAddr>,
     from_pass: Option<FromPass>,
     /// Every exposed path, canonical (`--expose` and `--display`).
     exposed: Vec<PathBuf>,
     /// The display sockets among them.
     display: Vec<PathBuf>,
+}
+
+impl Checked {
+    /// The entries from `--pass-hosts` (none without it).
+    fn pass_entries(&self) -> &[pass::PassHost] {
+        self.pass_hosts.as_ref().map_or(&[], |p| &p.entries)
+    }
+
+    /// Every name that resolves inside: the `--host` entries, then those
+    /// from `--pass-hosts`.
+    fn all_hosts(&self) -> Vec<HostEntry> {
+        self.hosts
+            .iter()
+            .cloned()
+            .chain(self.pass_entries().iter().map(|p| p.entry.clone()))
+            .collect()
+    }
+
+    /// The same as text for the start line and the plan: `NAME=ADDR`, and
+    /// `NAME=ADDR (pass: LABEL, ...)` for an entry from the pass.
+    fn host_texts(&self) -> Vec<String> {
+        self.hosts
+            .iter()
+            .map(|h| format!("{}={}", h.name, h.addr))
+            .chain(self.pass_entries().iter().map(ToString::to_string))
+            .collect()
+    }
 }
 
 /// `--expose` and `--display`, checked: every path exists, none lies in a
@@ -535,6 +579,7 @@ fn check_pass(args: &RunArgs, path: &Path, now: OffsetDateTime) -> Result<FromPa
         from_pass.approval.ends_at = Some(until);
     }
     from_pass.watch.require_enforced = args.require_enforced;
+    from_pass.watch.pass_hosts = args.pass_hosts;
     if let Some(ms) = args.pass_recheck_ms {
         from_pass.watch.interval =
             Duration::from_millis(ms).clamp(MIN_RECHECK_INTERVAL, RECHECK_INTERVAL);
@@ -542,9 +587,15 @@ fn check_pass(args: &RunArgs, path: &Path, now: OffsetDateTime) -> Result<FromPa
     Ok(from_pass)
 }
 
-/// Every `--host` address must be in a destination of the pass that is in
-/// use. A host name the pass mentions grants nothing.
-fn check_pass_hosts(hosts: &[HostEntry], from_pass: &FromPass) -> Result<(), String> {
+/// Every `--host` address, and every address `--pass-hosts` took from the
+/// pass, must be in a destination of the pass that is in use. A host name
+/// the pass mentions grants nothing. `pass_hosts`: the option was given, so
+/// the refusal does not suggest it.
+fn check_pass_hosts(
+    hosts: &[HostEntry],
+    from_pass: &FromPass,
+    pass_hosts: bool,
+) -> Result<(), String> {
     for h in hosts {
         if !from_pass.approval.covers_addr(h.addr) {
             return Err(format!(
@@ -554,7 +605,7 @@ fn check_pass_hosts(hosts: &[HostEntry], from_pass: &FromPass) -> Result<(), Str
                 h.addr,
                 from_pass.identity.labels.join(", "),
                 from_pass.approval.edge_hint(h.addr),
-                hostname_hint(&from_pass.named, &[])
+                hostname_hint(&from_pass.named, &[], !pass_hosts)
             ));
         }
     }
@@ -562,16 +613,28 @@ fn check_pass_hosts(hosts: &[HostEntry], from_pass: &FromPass) -> Result<(), Str
 }
 
 /// Names the pass mentions that no `--host` maps: they are not resolved.
-fn hostname_hint(named: &[NamedDestination], hosts: &[HostEntry]) -> String {
-    let unmapped: Vec<String> = named
+/// With `suggest_pass_hosts`, also says that `--pass-hosts` maps the ones
+/// on a single address.
+fn hostname_hint(
+    named: &[NamedDestination],
+    hosts: &[HostEntry],
+    suggest_pass_hosts: bool,
+) -> String {
+    let unmapped: Vec<&NamedDestination> = named
         .iter()
         .filter(|n| {
             !hosts
                 .iter()
                 .any(|h| h.name.eq_ignore_ascii_case(&n.hostname))
         })
+        .collect();
+    if unmapped.is_empty() {
+        return String::new();
+    }
+    let list: Vec<String> = unmapped
+        .iter()
         .map(|n| {
-            let addr = if n.single {
+            let addr = if n.address.is_some() {
                 n.destination.clone()
             } else {
                 format!("ADDR-IN-{}", n.destination)
@@ -579,14 +642,15 @@ fn hostname_hint(named: &[NamedDestination], hosts: &[HostEntry]) -> String {
             format!("--host {}={addr} (destination {})", n.hostname, n.label)
         })
         .collect();
-    if unmapped.is_empty() {
-        String::new()
+    let option = if suggest_pass_hosts && unmapped.iter().any(|n| n.address.is_some()) {
+        "; --pass-hosts maps the name of each single-address destination to its address"
     } else {
-        format!(
-            "; host names in the pass grant nothing and are not resolved; if the tool needs them, map them with {}",
-            unmapped.join(", ")
-        )
-    }
+        ""
+    };
+    format!(
+        "; host names in the pass grant nothing and are not resolved; if the tool needs them, map them with {}{option}",
+        list.join(", ")
+    )
 }
 
 fn check(args: &RunArgs) -> Result<Checked, String> {
@@ -629,8 +693,18 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
     for h in &args.host {
         hosts.push(parse_host(h).map_err(|e| e.to_string())?);
     }
+    let mut pass_hosts = None;
     match &from_pass {
-        Some(p) => check_pass_hosts(&hosts, p)?,
+        Some(p) => {
+            check_pass_hosts(&hosts, p, args.pass_hosts)?;
+            if args.pass_hosts {
+                let taken = pass::pass_hosts(&p.named, &hosts);
+                let entries: Vec<HostEntry> =
+                    taken.entries.iter().map(|h| h.entry.clone()).collect();
+                check_pass_hosts(&entries, p, true)?;
+                pass_hosts = Some(taken);
+            }
+        }
         None => check_hosts(&hosts, &approval).map_err(|e| e.to_string())?,
     }
     let mut lo_addrs = Vec::new();
@@ -648,6 +722,7 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
         new_session: new_session(args),
         approval,
         hosts,
+        pass_hosts,
         lo_addrs,
         from_pass,
         exposed,
@@ -767,7 +842,29 @@ fn start_line(c: &Checked, network: bool, landlock: bool, private_tty: bool) -> 
     } else {
         ""
     };
-    format!("{line}{}{session}", sockets_clause(c, landlock))
+    format!(
+        "{line}{}{session}{}",
+        sockets_clause(c, landlock),
+        start_notes(c)
+    )
+}
+
+/// The NOTE lines that follow the start line, each starting with a newline.
+fn start_notes(c: &Checked) -> String {
+    let mut out = c
+        .from_pass
+        .as_ref()
+        .filter(|p| !p.name_limited.is_empty())
+        .map_or_else(String::new, |p| {
+            format!(
+                "\nplaypen: NOTE: the pass approves these destinations only for the listed host names: {}. playpen filters addresses and ports and cannot see the name inside a request, so it does NOT enforce this; the command must send only those names",
+                p.name_limited.join("; ")
+            )
+        });
+    for note in c.pass_hosts.iter().flat_map(|p| &p.notes) {
+        let _ = write!(out, "\nplaypen: NOTE: {note}");
+    }
+    out
 }
 
 fn start_line_net(c: &Checked, network: bool) -> String {
@@ -775,36 +872,28 @@ fn start_line_net(c: &Checked, network: bool) -> String {
         || "with no time limit".to_owned(),
         |e| format!("until {}", e.to_rfc3339()),
     );
-    let names = if c.hosts.is_empty() {
-        "no DNS".to_owned()
-    } else {
-        let list: Vec<String> = c
-            .hosts
-            .iter()
-            .map(|h| format!("{}={}", h.name, h.addr))
-            .collect();
-        format!("no DNS, names {}", list.join(", "))
-    };
+    let mut names = String::from("no DNS");
+    let list = c.host_texts();
+    if !list.is_empty() {
+        names.push_str(", names ");
+        names.push_str(&list.join(", "));
+    }
+    for r in c.pass_hosts.iter().flat_map(|p| &p.replaced) {
+        let _ = write!(names, "; --host {} replaces {r}", r.entry.name);
+    }
     if network {
         let list: Vec<String> = c.approval.rules().iter().map(ToString::to_string).collect();
         let (under, hint) = c.from_pass.as_ref().map_or_else(Default::default, |p| {
-            (
-                format!("under {}: ", pass::describe(&p.identity)),
-                hostname_hint(&p.named, &c.hosts),
-            )
+            let hint = if c.pass_hosts.is_some() {
+                // The notes below say why a name is not mapped.
+                String::new()
+            } else {
+                hostname_hint(&p.named, &c.hosts, true)
+            };
+            (format!("under {}: ", pass::describe(&p.identity)), hint)
         });
-        let limited = c
-            .from_pass
-            .as_ref()
-            .filter(|p| !p.name_limited.is_empty())
-            .map_or_else(String::new, |p| {
-                format!(
-                    "\nplaypen: NOTE: the pass approves these destinations only for the listed host names: {}. playpen filters addresses and ports and cannot see the name inside a request, so it does NOT enforce this; the command must send only those names",
-                    p.name_limited.join("; ")
-                )
-            });
         format!(
-            "playpen: {under}allowing only {} {until} ({names}); everything else is dropped{hint}{limited}",
+            "playpen: {under}allowing only {} {until} ({names}); everything else is dropped{hint}",
             list.join(", ")
         )
     } else {
@@ -979,6 +1068,9 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         .iter()
         .map(ToString::to_string)
         .collect();
+    report
+        .hosts
+        .extend(checked.pass_entries().iter().map(ToString::to_string));
     for path in &args.hide {
         if explicitly_missing(path) {
             eprintln!(
@@ -1047,10 +1139,11 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         Vec::new()
     };
     let grant_counters = crate::grant_use::counter_count(&checked.approval, args.report_grant_use);
+    let hosts = checked.all_hosts();
     let plan = Plan {
         fixture: checked.fixture,
         approval: checked.approval,
-        hosts: checked.hosts,
+        hosts,
         network: !args.no_network,
         grant_counters,
         lo_addrs: checked.lo_addrs,

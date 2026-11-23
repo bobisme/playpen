@@ -159,3 +159,53 @@ fn json_run_refusal_is_a_report_even_without_a_file() {
     assert_eq!(json(&shareable.stdout)["schema"], "playpen-shareable-v1");
     assert!(!String::from_utf8_lossy(&shareable.stdout).contains("private-invalid"));
 }
+
+#[test]
+fn pass_hosts_is_listed_and_without_pass_is_a_usage_error() {
+    for name in ["run", "plan", "rules"] {
+        let help = json(&invoke(&["help", name, "--format", "json"], None).stdout);
+        let arg = help["arguments"]
+            .as_array()
+            .expect("arguments")
+            .iter()
+            .find(|a| a["long"] == "pass-hosts")
+            .cloned()
+            .unwrap_or_else(|| panic!("{name}: no --pass-hosts in {help}"));
+        assert_eq!(arg["takes_value"], false, "{name}");
+        assert!(
+            arg["help"].as_str().is_some_and(|h| h.contains("--pass")),
+            "{name}: {arg}"
+        );
+    }
+    let marker = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("pass-hosts-ran-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let marker = marker.to_str().expect("path");
+    for args in [
+        &["run", "--pass-hosts", "--no-network", "--", "touch", marker][..],
+        &[
+            "plan",
+            "--pass-hosts",
+            "--allow",
+            "192.0.2.1:443/tcp",
+            "--",
+            "true",
+        ][..],
+        &["rules", "--pass-hosts", "--allow", "192.0.2.1:443/tcp"][..],
+    ] {
+        let out = invoke(args, None);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert_eq!(out.stdout, b"", "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--pass <FILE>"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut machine = args.to_vec();
+        machine.insert(0, "--json");
+        let out = invoke(&machine, None);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert_eq!(json(&out.stderr)["error"]["type"], "invalid-arguments");
+    }
+    assert!(!std::path::Path::new(marker).exists(), "the command ran");
+}

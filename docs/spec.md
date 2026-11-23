@@ -135,9 +135,9 @@ and exits 2.
 ### 4.1 `playpen run`
 
 ```text
-playpen run --pass FILE [--only LABEL]... [--host NAME=ADDR]...
-            [--until RFC3339] [SOCKETS] [--format text|pretty|json]
-            [--report FILE] -- COMMAND [ARGS...]
+playpen run --pass FILE [--only LABEL]... [--pass-hosts]
+            [--host NAME=ADDR]... [--until RFC3339] [SOCKETS]
+            [--format text|pretty|json] [--report FILE] -- COMMAND [ARGS...]
 playpen run [--allow SPEC]... [--host NAME=ADDR]... [--until RFC3339]
             [--no-network] [SOCKETS] [--format text|pretty|json]
             [--report FILE] -- COMMAND [ARGS...]
@@ -227,7 +227,11 @@ destination, a changed `hostname`, `name`, `reference`, comment, or a
 destination not in use) prints once per new digest that the run continues
 under the rules loaded at start. Nothing an edit adds applies to the
 running command: the ruleset in the kernel is never changed after start,
-and the end time is never moved later. If the pass is rejected by the
+and the end time is never moved later. With `--pass-hosts`, a changed,
+added or removed `hostname` of a single-address destination in use is such
+an edit too: it changes no rule, so the run continues, and `/etc/hosts`
+keeps the names written at start. The notice then says ``the hostname of
+destination `LABEL` changed``. If the pass is rejected by the
 re-read just before the command starts, the run stops with `nothing was
 run` (exit 1, like an end time that passes during set-up).
 
@@ -275,13 +279,44 @@ addresses of a listed network (section 6.1) are not covered. With `--pass`, `ADD
 the address or network of a destination in use (after `--only`), for at
 least one port; otherwise playpen refuses, naming the labels in use.
 
-A destination's `hostname` in the pass is informational: it grants nothing
-and playpen never uses it to fill `/etc/hosts`. When a destination in use
-has a `hostname` that no `--host` maps, the start line (and a `--host`
-refusal) ends with `host names in the pass grant nothing and are not
-resolved; if the tool needs them, map them with --host NAME=ADDR
-(destination LABEL)`; for a network destination `ADDR` is written
-`ADDR-IN-NETWORK`.
+A destination's `hostname` in the pass is informational: it grants nothing,
+and playpen uses it to fill `/etc/hosts` only with `--pass-hosts`. Without
+`--pass-hosts`, when a destination in use has a `hostname` that no `--host`
+maps, the start line (and a `--host` refusal) ends with `host names in the
+pass grant nothing and are not resolved; if the tool needs them, map them
+with --host NAME=ADDR (destination LABEL)`; for a network destination
+`ADDR` is written `ADDR-IN-NETWORK`. When one of them is a single address,
+the start line adds `; --pass-hosts maps the name of each single-address
+destination to its address`.
+
+**`--pass-hosts`** (needs `--pass`; without it, a usage error, exit 2).
+For each destination in use (after `--only`) that has a `hostname` and is
+a single address, `/etc/hosts` gets the line `ADDR NAME`, after the
+`--host` lines. `NAME` is the `hostname` in lower case. playpen looks
+nothing up and adds no rule: the name and the address both come from the
+destination the owner wrote, so the address is one the pass approves.
+
+- Two destinations with the same `hostname` give that name both addresses.
+  Two destinations with the same `hostname` and the same address give one
+  line.
+- A destination without a `hostname` is skipped. So is a network
+  destination with one; the start line is then followed by ``playpen:
+  NOTE: --pass-hosts does not map NAME: destination `LABEL` is a network
+  (NETWORK), not one address. If the tool needs the name, map it with
+  --host NAME=ADDR-IN-NETWORK``. A `hostname` that `--host` would refuse
+  (hallpass also accepts `_`) is skipped with a NOTE that says so.
+- A `--host` for the same name (compared in lower case) wins: the pass's
+  entries for that name are left out, and the names clause of the start
+  line says `--host NAME replaces NAME=ADDR (pass: LABEL)`. No NOTE is
+  printed for a network destination whose name a `--host` maps.
+- The start line, the plan's `hosts` and the report's `hosts` list each
+  entry taken from the pass as `NAME=ADDR (pass: LABEL[, LABEL]...)`, after
+  the `--host` entries. Without `--pass-hosts` the start line ends with the
+  hint above instead.
+- The allow list, the ruleset and `playpen rules` are the same with and
+  without `--pass-hosts`.
+- A mid-run edit of a `hostname` does not stop the run (see the re-read
+  rules above).
 
 A destination's `names` in the pass (the only host names the owner approved
 on that address) is **not enforced**: playpen filters addresses and ports
@@ -402,14 +437,17 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   `no network, loopback only, ...`. With `--pass` the line starts `under
   pass ID ("NAME", owner "OWNER", sha256:DIGEST, window ends TIME,
   destinations LABEL, ...): allowing only ...` and may continue with the
-  `hostname` hint above. It says nothing about ceilings. Then, always,
+  `hostname` hint above. With `--pass-hosts` the names include the entries
+  from the pass (`NAME=ADDR (pass: LABEL)`) and any `; --host NAME replaces
+  ...`. It says nothing about ceilings. Then, always,
   `; host Unix sockets: none reachable` (with `--without-landlock`: `;
   host Unix sockets: hidden under /run, /tmp, /var/tmp and the runtime
   directory only (--without-landlock); sockets elsewhere stay reachable`),
   then `; exposed: PATH, ...` when `--expose` was given, `; display
   exposed: PATH, ...` with `--display`, and `; the command runs in its own
   session, without a controlling terminal` in detached mode, or
-  `; private controlling terminal` with `--private-tty`;
+  `; private controlling terminal` with `--private-tty`. The NOTE lines
+  about `names` and about `--pass-hosts` follow it, one per line;
 - when the end time is reached: what happened and that SIGKILL follows;
 - with `--pass`, when a re-read finds a harmless edit: `the pass was edited
   (now sha256:...); nothing this run uses changed, so the command continues
@@ -489,7 +527,10 @@ exposures. It leaves the report path untouched. Availability of helpers,
 namespace setup and installation of the filter are determined at launch.
 Command arguments and paths use JSON strings for UTF-8 and an object with a
 `unix_bytes` array for other byte sequences. Grant order is canonical; host
-mapping and argument order are preserved.
+mapping and argument order are preserved. With `--pass-hosts` the plan has
+`"pass_hosts": true`, and `hosts` lists the entries from the pass after the
+`--host` ones. Without it the field is absent, so plans without the option
+keep their digest.
 
 The top-level `digest` is SHA-256 of the compact JSON encoding of the v1
 plan (object keys in lexical order). Give it to `run --expect-plan DIGEST`
@@ -504,7 +545,8 @@ lifetimes.
 
 ```text
 playpen rules [--allow SPEC]... [--format text|pretty|json]
-playpen rules --pass FILE [--only LABEL]... [--format text|pretty|json]
+playpen rules --pass FILE [--only LABEL]... [--pass-hosts]
+              [--format text|pretty|json]
 ```
 
 Prints the ruleset that `run` would load for these rules. Sends nothing,
@@ -515,7 +557,8 @@ printed on stdout). An empty `--allow` list is allowed here and prints the
 ruleset that allows nothing. With `--pass`, the pass is loaded and checked
 exactly as by `run` (window included: an expired, not-yet-valid or revoked
 pass is refused), and `--allow` beside it, `--only` without it, and an
-unknown label are refused.
+unknown label are refused. `--pass-hosts` is accepted as by `run` and
+changes nothing in the output: host names add no rule.
 
 ### 4.4 `playpen doctor`
 
@@ -648,7 +691,7 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `message` | string or null | why, for anything but `"ran"` |
 | `command` | array of strings | the command line |
 | `allowed` | array of strings | approved specs (canonical form once parsed; as typed when refused; with `--pass`, the rules from the pass once loaded) |
-| `hosts` | array of strings | `--host` entries as given |
+| `hosts` | array of strings | `--host` entries as given; then, with `--pass-hosts` and once the pass is loaded, each entry taken from the pass as `NAME=ADDR (pass: LABEL[, LABEL]...)` |
 | `until` | string or null | end time (RFC 3339 UTC once parsed; as typed when refused); with `--pass`, `valid_until` or the earlier `--until` |
 | `network` | `"pasta"` or `"none"` | |
 | `exit_code` | integer or null | the command's exit status |
@@ -737,7 +780,8 @@ stops can themselves disclose information, including timing-related behavior.
 
 `playpen compare BEFORE AFTER [--format json]` reads full 0.1.0 reports as
 inert data (at most 1 MiB each). It compares effective grants, network, host
-mappings, exposed sockets, display and socket guard independently of observed
+mappings (an entry from `--pass-hosts` counts as its `NAME=ADDR`), exposed
+sockets, display and socket guard independently of observed
 blocked endpoint tuples. Packet counts do not themselves trigger changes.
 Policy differences are shown before the observations. A newly observed tuple
 requires a complete baseline; a no-longer-observed tuple requires a complete
@@ -756,8 +800,9 @@ destination restricts names or any pass-wide application ceiling is present.
 The full report's `enforcement_coverage` identifies packet and time filtering
 and lists selected labels and ceiling names requiring external enforcement,
 including on this refusal. Informational `hostname` is not a restriction;
-`--host` does not enforce request names. A strict run rechecks the pass and
-stops using the existing grace period if unsupported terms become applicable.
+`--host` and `--pass-hosts` do not enforce request names. A strict run
+rechecks the pass and stops using the existing grace period if unsupported
+terms become applicable.
 The plan digest includes the strict option and coverage.
 
 ### Offline policy examples
@@ -990,7 +1035,8 @@ and `PID` is C.
 ## 7. Files the command sees differently
 
 - `/etc/hosts`: `127.0.0.1` and `::1` as `localhost` (plus the machine's
-  host name if it is a valid host name), then one line per `--host`.
+  host name if it is a valid host name), then one line per `--host`, then
+  one line per entry from `--pass-hosts`.
 - `/etc/resolv.conf`: comments and `options timeout:1 attempts:1`, no
   nameserver. (Not bound if the host has none.)
 - `/etc/nsswitch.conf`: the host's file with its `hosts:` line replaced by

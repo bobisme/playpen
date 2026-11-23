@@ -1566,6 +1566,49 @@ fn compare_reports_uses_endpoints_and_requires_complete_evidence() {
 }
 
 #[test]
+fn compare_reads_a_pass_hosts_entry_as_its_mapping() {
+    let dir = tmpdir("compare-hosts");
+    let old = dir.join("old.json");
+    let new = dir.join("new.json");
+    let base = serde_json::json!({"playpen_version":"0.1.0", "outcome":"ran", "allowed":["192.0.2.1:80/tcp"], "network":"pasta", "hosts":["app.example.test=192.0.2.1"], "exposed":[], "socket_guard":"landlock", "display":false, "dropped":{"packets":0,"destinations_truncated":false,"destinations":[]}});
+    let save = |path: &Path, v: &serde_json::Value| {
+        std::fs::write(path, v.to_string()).unwrap_or_else(|e| panic!("{e}"));
+    };
+    let args = [
+        "compare",
+        old.to_str().unwrap_or(""),
+        new.to_str().unwrap_or(""),
+        "--format",
+        "json",
+    ];
+    save(&old, &base);
+    let mut other = base;
+    for (hosts, policy, status) in [
+        (
+            serde_json::json!(["app.example.test=192.0.2.1 (pass: web)"]),
+            "same",
+            0,
+        ),
+        (
+            serde_json::json!(["app.example.test=192.0.2.2 (pass: web)"]),
+            "changed",
+            2,
+        ),
+    ] {
+        other["hosts"] = hosts;
+        save(&new, &other);
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(status), "{}", text(&out.stderr));
+        let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        assert_eq!(result["policy"], policy);
+    }
+    other["hosts"] = serde_json::json!(["app.example.test=192.0.2.1 (other)"]);
+    save(&new, &other);
+    assert_eq!(run(&args).status.code(), Some(2));
+    assert!(text(&run(&args).stderr).contains("invalid"));
+}
+
+#[test]
 fn grant_use_reports_first_match_without_changing_admissions() {
     require_sandbox!();
     let dir = tmpdir("grant-use");

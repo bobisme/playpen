@@ -273,6 +273,10 @@ fn pass_destinations_are_reachable_and_nothing_else_and_the_report_names_the_pas
         start.contains("--host app.example.test=192.0.2.1"),
         "{start}"
     );
+    assert!(
+        start.contains("--pass-hosts maps the name of each single-address destination"),
+        "{start}"
+    );
 
     let json = report(&rep);
     assert_eq!(json["outcome"], "ran");
@@ -1102,4 +1106,360 @@ fn grant_use_preserves_pass_labels_for_each_port_range() {
     assert_eq!(rows[0]["rule"], "192.0.2.1:9101/tcp");
     assert_eq!(rows[1]["label"], "web");
     assert_eq!(rows[1]["rule"], "192.0.2.1:9103-9104/tcp");
+}
+
+/// `sip` and `v6` with a `hostname` each, beside `web`'s.
+fn named_sip() -> String {
+    SIP.replace(
+        "ports = 5060",
+        "ports = 5060\nhostname = \"sip.example.test\"",
+    )
+}
+
+fn named_v6() -> String {
+    V6.replace(
+        "ports = 9301",
+        "ports = 9301\nhostname = \"lab.example.test\"",
+    )
+}
+
+/// The addresses `getent hosts` printed for `name`, in order.
+fn getent(stdout: &str, name: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            let addr = words.next()?;
+            words.any(|w| w == name).then(|| addr.to_owned())
+        })
+        .collect()
+}
+
+fn start_line(stderr: &str) -> &str {
+    stderr
+        .lines()
+        .find(|l| l.contains("allowing only"))
+        .unwrap_or_default()
+}
+
+fn on_path(tool: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
+}
+
+#[test]
+fn pass_hosts_map_the_pass_names_and_curl_by_name_reaches_a_local_listener() {
+    require_sandbox!();
+    if !on_path("curl") || !on_path("getent") {
+        eprintln!("SKIPPED: curl or getent is not installed");
+        return;
+    }
+    let dir = tmpdir("pass-hosts");
+    let pass = new_pass(&dir, &valid_pass(&[WEB, &named_sip(), &named_v6()]));
+    let rep = dir.join("report.json");
+    let log = dir.join("listen.out");
+    let _ = std::fs::remove_file(&log);
+    // The listener is on a documentation address on the sandbox's own lo,
+    // so nothing leaves the machine. It closes each connection at once, so
+    // curl gets no HTTP answer; the listener records that it connected.
+    let script = format!(
+        r"getent hosts app.example.test; getent hosts sip.example.test
+getent hosts lab.example.test || echo lab-unresolved
+{BIN} probe listen 192.0.2.1:9101/tcp --ms 2000 >> {listen} &
+i=0
+until grep -q listening {listen} 2>/dev/null; do
+  i=$((i+1)); [ $i -gt 200 ] && exit 9; sleep 0.02
+done
+curl -q -sS --noproxy '*' --max-time 3 -o /dev/null -w 'curl reached %{{remote_ip}}:%{{remote_port}}\n' http://app.example.test:9101/
+wait",
+        listen = s(&log)
+    );
+    let mut args = vec![
+        "run",
+        "--pass",
+        s(&pass),
+        "--pass-hosts",
+        "--report",
+        s(&rep),
+    ];
+    args.extend_from_slice(LO);
+    args.extend_from_slice(&["--", "sh", "-c", &script]);
+    let out = run(&args);
+    let (stdout, err) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert_eq!(
+        getent(&stdout, "app.example.test"),
+        ["192.0.2.1"],
+        "{stdout}"
+    );
+    assert_eq!(
+        getent(&stdout, "sip.example.test"),
+        ["192.0.2.2"],
+        "{stdout}"
+    );
+    assert!(stdout.contains("lab-unresolved"), "{stdout}");
+    assert!(
+        stdout.contains("curl reached 192.0.2.1:9101"),
+        "{stdout}\n{err}"
+    );
+    let accepted = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(accepted.contains("\"accepted\""), "{accepted}");
+
+    let start = start_line(&err);
+    assert!(
+        start.contains(
+            "(no DNS, names app.example.test=192.0.2.1 (pass: web), sip.example.test=192.0.2.2 (pass: sip))"
+        ),
+        "{start}"
+    );
+    assert!(!start.contains("map them with"), "{start}");
+    assert!(start.contains("host Unix sockets"), "{start}");
+    assert!(
+        err.contains(
+            "playpen: NOTE: --pass-hosts does not map lab.example.test: destination `v6` is a network (2001:db8::/120)"
+        ),
+        "{err}"
+    );
+    let json = report(&rep);
+    assert_eq!(
+        json["hosts"],
+        serde_json::json!([
+            "app.example.test=192.0.2.1 (pass: web)",
+            "sip.example.test=192.0.2.2 (pass: sip)"
+        ])
+    );
+    // No grant is added.
+    assert_eq!(
+        json["allowed"],
+        serde_json::json!([
+            "192.0.2.1:9101/tcp",
+            "192.0.2.1:9103-9104/tcp",
+            "192.0.2.2:5060/udp",
+            "[2001:db8::/120]:9301/tcp"
+        ])
+    );
+}
+
+#[test]
+fn pass_hosts_follow_only_an_explicit_host_wins_and_a_shared_name_gets_both() {
+    require_sandbox!();
+    let dir = tmpdir("pass-hosts-only");
+    let pass = new_pass(&dir, &valid_pass(&[WEB, &named_sip()]));
+    let rep = dir.join("report.json");
+    let lookup =
+        "getent hosts sip.example.test; getent hosts app.example.test || echo app-unresolved";
+    let out = run(&[
+        "run",
+        "--pass",
+        s(&pass),
+        "--only",
+        "sip",
+        "--pass-hosts",
+        "--report",
+        s(&rep),
+        "--",
+        "sh",
+        "-c",
+        lookup,
+    ]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        getent(&stdout, "sip.example.test"),
+        ["192.0.2.2"],
+        "{stdout}"
+    );
+    assert!(stdout.contains("app-unresolved"), "{stdout}");
+    assert_eq!(
+        report(&rep)["hosts"],
+        serde_json::json!(["sip.example.test=192.0.2.2 (pass: sip)"])
+    );
+
+    // --host for a name the pass maps wins, and the start line says so.
+    let out = run(&[
+        "run",
+        "--pass",
+        s(&pass),
+        "--pass-hosts",
+        "--host",
+        "APP.example.test=192.0.2.2",
+        "--report",
+        s(&rep),
+        "--",
+        "getent",
+        "ahosts",
+        "app.example.test",
+    ]);
+    let (stdout, err) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(stdout.contains("192.0.2.2"), "{stdout}");
+    assert!(!stdout.contains("192.0.2.1"), "{stdout}");
+    let start = start_line(&err);
+    assert!(
+        start.contains(
+            "names app.example.test=192.0.2.2, sip.example.test=192.0.2.2 (pass: sip); --host app.example.test replaces app.example.test=192.0.2.1 (pass: web))"
+        ),
+        "{start}"
+    );
+    assert_eq!(
+        report(&rep)["hosts"],
+        serde_json::json!([
+            "APP.example.test=192.0.2.2",
+            "sip.example.test=192.0.2.2 (pass: sip)"
+        ])
+    );
+
+    // Two destinations with the same hostname give that name both addresses.
+    let web2 = WEB
+        .replace("label = \"web\"", "label = \"web2\"")
+        .replace("192.0.2.1", "192.0.2.3");
+    write_pass(&pass, &valid_pass(&[WEB, &web2]));
+    let out = run(&[
+        "run",
+        "--pass",
+        s(&pass),
+        "--pass-hosts",
+        "--",
+        BIN,
+        "probe",
+        "resolve",
+        "app.example.test",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let resolved: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    assert_eq!(
+        resolved["addresses"],
+        serde_json::json!(["192.0.2.1", "192.0.2.3"]),
+        "{resolved}"
+    );
+}
+
+#[test]
+fn rules_are_the_same_with_and_without_pass_hosts() {
+    let dir = tmpdir("pass-hosts-rules");
+    let pass = new_pass(&dir, &valid_pass(&[WEB, &named_sip(), &named_v6()]));
+    for extra in [&[][..], &["--only", "sip"][..], &["--format", "json"][..]] {
+        let mut without = vec!["rules", "--pass", s(&pass)];
+        without.extend_from_slice(extra);
+        let mut with = without.clone();
+        with.push("--pass-hosts");
+        let (a, b) = (run(&without), run(&with));
+        assert_eq!(a.status.code(), Some(0), "{}", text(&a.stderr));
+        assert_eq!(b.status.code(), Some(0), "{}", text(&b.stderr));
+        assert_ne!(a.stdout, b"");
+        assert_eq!(text(&a.stdout), text(&b.stdout), "{extra:?}");
+    }
+}
+
+#[test]
+fn a_hostname_edit_mid_run_keeps_the_names_loaded_at_start() {
+    require_sandbox!();
+    let dir = tmpdir("pass-hosts-edit");
+    let before = valid_pass(&[WEB]);
+    let pass = new_pass(&dir, &before);
+    let rep = dir.join("report.json");
+    let child = spawn(&[
+        "run",
+        "--pass",
+        s(&pass),
+        "--pass-hosts",
+        "--pass-recheck-ms",
+        RECHECK_MS,
+        "--report",
+        s(&rep),
+        "--",
+        "sh",
+        "-c",
+        "sleep 1.2; getent hosts app.example.test; getent hosts www.example.test || echo www-unresolved",
+    ]);
+    std::thread::sleep(Duration::from_millis(400));
+    write_pass(
+        &pass,
+        &before.replace("app.example.test", "www.example.test"),
+    );
+    let out = child.wait_with_output().unwrap_or_else(|e| panic!("{e}"));
+    let (stdout, err) = (text(&out.stdout), text(&out.stderr));
+    // The existing rule for an edit that changes no rule: the run
+    // continues, with a notice, under what was loaded at start.
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains("the hostname of destination `web` changed"),
+        "{err}"
+    );
+    assert!(err.contains("/etc/hosts keeps the names"), "{err}");
+    assert_eq!(
+        getent(&stdout, "app.example.test"),
+        ["192.0.2.1"],
+        "{stdout}"
+    );
+    assert!(stdout.contains("www-unresolved"), "{stdout}");
+    let json = report(&rep);
+    assert_eq!(json["stopped_by_pass"], false);
+    assert_eq!(
+        json["hosts"],
+        serde_json::json!(["app.example.test=192.0.2.1 (pass: web)"])
+    );
+}
+
+#[test]
+fn plan_and_pin_cover_pass_hosts() {
+    let dir = tmpdir("pass-hosts-plan");
+    let pass = new_pass(&dir, &valid_pass(&[WEB, &named_sip()]));
+    let plan = |extra: &[&str]| {
+        let mut args = vec!["plan", "--format", "json", "--pass", s(&pass)];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", "true"]);
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap_or_default()
+    };
+    let without = plan(&[]);
+    let with = plan(&["--pass-hosts"]);
+    assert!(without["plan"].get("pass_hosts").is_none(), "{without}");
+    assert_eq!(without["plan"]["hosts"], serde_json::json!([]));
+    assert_eq!(with["plan"]["pass_hosts"], true);
+    assert_eq!(
+        with["plan"]["hosts"],
+        serde_json::json!([
+            "app.example.test=192.0.2.1 (pass: web)",
+            "sip.example.test=192.0.2.2 (pass: sip)"
+        ])
+    );
+    assert_eq!(with["plan"]["allowed"], without["plan"]["allowed"]);
+    assert_ne!(with["digest"], without["digest"]);
+    let only = plan(&["--pass-hosts", "--only", "web"]);
+    assert_eq!(
+        only["plan"]["hosts"],
+        serde_json::json!(["app.example.test=192.0.2.1 (pass: web)"])
+    );
+
+    // A digest reviewed with the option does not admit a run without it,
+    // nor the other way round.
+    for (digest, extra) in [(&with, &[][..]), (&without, &["--pass-hosts"][..])] {
+        let mut args = vec![
+            "run",
+            "--expect-plan",
+            digest["digest"].as_str().unwrap_or(""),
+            "--pass",
+            s(&pass),
+        ];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", "true"]);
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("differs from current scope"));
+    }
+    if skip_reason().is_none() {
+        let out = run(&[
+            "run",
+            "--expect-plan",
+            with["digest"].as_str().unwrap_or(""),
+            "--pass",
+            s(&pass),
+            "--pass-hosts",
+            "--",
+            "true",
+        ]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    }
 }
