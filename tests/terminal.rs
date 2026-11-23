@@ -93,7 +93,10 @@ fn inherited_descriptors_do_not_reach_the_command() {
     let tcp = TcpStream::connect(listener.local_addr().unwrap_or_else(|e| panic!("{e}")))
         .unwrap_or_else(|e| panic!("{e}"));
     let udp = UdpSocket::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("{e}"));
-    let (pipe_r, _pipe_w) = nix::unistd::pipe().unwrap_or_else(|e| panic!("{e}"));
+    // Close-on-exec like the others: only the copies `with_fds` makes are
+    // for the child, and no child of another test may keep these.
+    let (pipe_r, _pipe_w) =
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap_or_else(|e| panic!("{e}"));
     let extra = [
         file.as_raw_fd(),
         unix_a.as_raw_fd(),
@@ -327,35 +330,63 @@ impl Pty {
         Some(pty)
     }
 
+    /// A new pseudo-terminal of 24 rows and 80 columns: (master, slave).
+    ///
+    /// Both ends are opened close-on-exec in the same call that makes
+    /// them. Tests run in parallel threads, and a child another test
+    /// starts between an open and a later `FD_CLOEXEC` would keep this
+    /// terminal's master. A process that holds the master of its own
+    /// terminal never sees it hang up: that kept `playpen run` trees of
+    /// failed tests alive for days.
     fn pair() -> (File, OwnedFd) {
-        use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-
-        let mut master: libc::c_int = -1;
-        let mut slave: libc::c_int = -1;
+        // SAFETY: open takes a NUL-terminated path; the result is checked.
+        let master = unsafe {
+            libc::open(
+                c"/dev/ptmx".as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(
+            master >= 0,
+            "open /dev/ptmx: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: the descriptor was just opened and is owned by nothing else.
+        let master = unsafe { File::from_raw_fd(master) };
+        // SAFETY: grantpt and unlockpt take a live master descriptor.
+        let unlocked = unsafe {
+            libc::grantpt(master.as_raw_fd()) == 0 && libc::unlockpt(master.as_raw_fd()) == 0
+        };
+        assert!(
+            unlocked,
+            "unlock the PTY: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: TIOCGPTPEER opens the slave of a live master with the
+        // given flags and returns a new descriptor; the result is checked.
+        let slave = unsafe {
+            libc::ioctl(
+                master.as_raw_fd(),
+                libc::TIOCGPTPEER,
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(
+            slave >= 0,
+            "open the PTY slave: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: the descriptor was just opened and is owned by nothing else.
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         let size = libc::winsize {
             ws_row: 24,
             ws_col: 80,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        // SAFETY: openpty writes two descriptors into the locals and reads
-        // the window size; a null name and termios are allowed.
-        let rc = unsafe {
-            libc::openpty(
-                &raw mut master,
-                &raw mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                &raw const size,
-            )
-        };
-        assert_eq!(rc, 0, "openpty failed");
-        // SAFETY: both descriptors were just returned by openpty and are
-        // owned by nothing else.
-        let (master, slave) = unsafe { (File::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-        fcntl(&master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).expect("close PTY master on exec");
-        fcntl(&slave, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
-            .expect("close original PTY slave on exec");
+        // SAFETY: TIOCSWINSZ reads one winsize struct from a live local.
+        let rc = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &raw const size) };
+        assert_eq!(rc, 0, "TIOCSWINSZ failed");
         (master, slave)
     }
 
@@ -364,12 +395,28 @@ impl Pty {
         cmd.stdin(clone(slave))
             .stdout(clone(slave))
             .stderr(clone(slave));
-        // SAFETY: setsid and ioctl are async-signal-safe; the hook makes
-        // the pseudo-terminal the shell's controlling terminal.
+        // SAFETY: setsid, ioctl and signal are async-signal-safe; the hook
+        // makes the pseudo-terminal the shell's controlling terminal.
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                // As a terminal emulator starts its shell. A test binary
+                // started as a background job of a script inherits SIGINT
+                // and SIGQUIT ignored, and the shell would pass that on to
+                // every command: Ctrl-C would then stop nothing.
+                for sig in [
+                    libc::SIGHUP,
+                    libc::SIGINT,
+                    libc::SIGQUIT,
+                    libc::SIGTSTP,
+                    libc::SIGTTIN,
+                    libc::SIGTTOU,
+                ] {
+                    if libc::signal(sig, libc::SIG_DFL) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });
@@ -424,9 +471,64 @@ impl Pty {
             }
             assert!(
                 Instant::now() < end,
-                "timed out waiting for {needle:?}; terminal shows: {rest:?}"
+                "timed out waiting for {needle:?}; terminal shows: {rest:?}; before that: {:?}",
+                text(&self.seen[..self.at])
             );
             self.read_for(Duration::from_millis(100));
+        }
+    }
+
+    /// Waits up to 10 s for each of `needles` after the last match, in any
+    /// order, and continues after the one that came last. Output that
+    /// reaches the terminal by two routes, such as the private terminal
+    /// relay and a pipe through `cat`, can arrive either way round.
+    fn expect_each(&mut self, needles: &[&str]) {
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            let rest = text(&self.seen[self.at..]);
+            let ends: Option<Vec<usize>> = needles
+                .iter()
+                .map(|needle| rest.find(needle).map(|pos| pos + needle.len()))
+                .collect();
+            if let Some(last) = ends.and_then(|ends| ends.into_iter().max()) {
+                self.at += last;
+                return;
+            }
+            assert!(
+                Instant::now() < end,
+                "timed out waiting for each of {needles:?}; terminal shows: {rest:?}; before that: {:?}",
+                text(&self.seen[..self.at])
+            );
+            self.read_for(Duration::from_millis(100));
+        }
+    }
+
+    /// Waits up to 10 s until the terminal passes Ctrl-C and Ctrl-Z on as
+    /// bytes (`ISIG` is off) instead of signalling its foreground job.
+    /// Reading meanwhile keeps the output flowing.
+    fn expect_keys_as_bytes(&mut self) {
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            // SAFETY: tcgetattr fills the struct on success, which is
+            // checked; on the master it reads the slave's settings.
+            let isig = unsafe {
+                let mut settings = std::mem::MaybeUninit::<libc::termios>::uninit();
+                assert_eq!(
+                    libc::tcgetattr(self.master.as_raw_fd(), settings.as_mut_ptr()),
+                    0,
+                    "tcgetattr on the PTY master"
+                );
+                settings.assume_init().c_lflag & libc::ISIG != 0
+            };
+            if !isig {
+                return;
+            }
+            assert!(
+                Instant::now() < end,
+                "the terminal still turns control keys into signals; terminal shows: {:?}",
+                text(&self.seen[self.at..])
+            );
+            self.read_for(Duration::from_millis(10));
         }
     }
 
@@ -459,10 +561,83 @@ impl Pty {
     }
 }
 
+/// When a test ends, passed or failed (a timed-out `expect` panics), its
+/// shell and everything the shell started are killed and gone before the
+/// test returns.
+///
+/// Killing the shell alone is not enough: the shell gives each job a
+/// process group of its own, and once the shell is gone a stopped or
+/// background `playpen run` gets no hangup signal from the terminal.
+/// Everything playpen starts on the host stays in the shell's session; the
+/// command may make a session of its own, but only inside the sandbox's PID
+/// namespace, which ends with the sandbox's init.
 impl Drop for Pty {
     fn drop(&mut self) {
+        let Ok(shell) = i32::try_from(self.child.id()) else {
+            return;
+        };
+        // Unreaped, the shell keeps its PID, and so the session number,
+        // from being reused while the session is emptied.
         let _ = self.child.kill();
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = session_and_descendants(shell);
+            if left.is_empty() {
+                break;
+            }
+            if Instant::now() >= end {
+                eprintln!("processes of the test's terminal are still there: {left:?}");
+                break;
+            }
+            for pid in left {
+                // SAFETY: kill takes plain integers; the PIDs are positive.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let _ = self.child.wait();
+    }
+}
+
+/// The processes in session `sid`, without its leader `sid`, and their
+/// descendants. A process whose parent has died is still in the session;
+/// one that made a session of its own is found by its parent.
+fn session_and_descendants(sid: i32) -> Vec<i32> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    // (pid, parent, session) of every process.
+    let all: Vec<(i32, i32, i32)> = dir
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // After the name: state, parent, process group, session.
+            let mut fields = stat.rsplit_once(") ")?.1.split(' ');
+            let parent = fields.nth(1)?.parse().ok()?;
+            let session = fields.nth(1)?.parse().ok()?;
+            Some((pid, parent, session))
+        })
+        .collect();
+    // Not by the leader's PID as a parent: once the leader is reaped, that
+    // PID can belong to an unrelated process.
+    let mut found: Vec<i32> = all
+        .iter()
+        .filter(|&&(pid, _, session)| session == sid && pid != sid)
+        .map(|&(pid, _, _)| pid)
+        .collect();
+    loop {
+        let more: Vec<i32> = all
+            .iter()
+            .filter(|&&(pid, parent, _)| {
+                pid != sid && found.contains(&parent) && !found.contains(&pid)
+            })
+            .map(|&(pid, _, _)| pid)
+            .collect();
+        if more.is_empty() {
+            return found;
+        }
+        found.extend(more);
     }
 }
 
@@ -1033,7 +1208,9 @@ fn private_tty_inner_job_control_keeps_the_outer_output_pipeline_running() {
     t.expect("private-test> ");
     t.send("sleep 30 | sh -c 'echo nested-\"pipeline-ready\"; cat'\n");
     t.expect("nested-pipeline-ready");
-    t.read_for(Duration::from_millis(100));
+    // The relay looks at the private terminal every 20 ms. Until it has
+    // seen the nested job there, Ctrl-Z would stop the outer cat as well.
+    t.expect_keys_as_bytes();
     t.send("\x1a");
     let stopped = t.expect("Stopped");
     assert!(!stopped.contains("command exited"), "{stopped:?}");
@@ -1049,17 +1226,18 @@ fn private_tty_inner_job_control_keeps_the_outer_output_pipeline_running() {
     t.send("fg\n");
     // Bash prints the fg command line on stdout. Do not wait for that
     // line, since a stopped cat would hide the final output witness too.
-    t.read_for(Duration::from_millis(150));
+    // Wait instead until the relay passes Ctrl-C to the nested job.
+    t.expect_keys_as_bytes();
     t.send("\x03");
     t.expect("private-test> ");
     t.send("echo fg-\"status=$?\" >&2\n");
     t.expect("fg-status=130\r\n");
     t.expect("private-test> ");
     // This marker originates on the inner shell's stdout, which reaches
-    // the host only through the outer pipeline's cat.
+    // the host only through the outer pipeline's cat. The next prompt
+    // comes through the relay, and can be shown before the marker.
     t.send("echo through-\"outer-cat\"\n");
-    t.expect("through-outer-cat");
-    t.expect("private-test> ");
+    t.expect_each(&["through-outer-cat", "private-test> "]);
     t.send("exit 0\n");
     t.expect("command exited with status 0");
     t.expect("$ ");

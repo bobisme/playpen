@@ -333,10 +333,10 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&sock);
         assert!(listener.is_ok());
         let all = find_sockets(std::slice::from_ref(&dir), &[], 1000);
-        assert_eq!(all, Ok(vec![sock.clone()]));
+        assert_eq!(all, Ok(vec![sock]));
         let skipped = find_sockets(std::slice::from_ref(&dir), &[dir.join("a")], 1000);
         assert_eq!(skipped, Ok(vec![]));
         assert!(find_sockets(std::slice::from_ref(&dir), &[], 1).is_err());
-        let _ = fs::remove_file(&sock);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
