@@ -386,16 +386,25 @@ host and run both in it:
 unshare --user --map-root-user --net sh -c '
   ip link set lo up
   ip link add host0 type dummy && ip addr add 192.0.2.10/24 dev host0
+  ip addr add 2001:db8:1::10/64 dev host0 nodad
   ip link set host0 up && ip route add default via 192.0.2.1
+  ip -6 route add default via 2001:db8:1::1 dev host0
   ip link add svc0 type dummy && ip addr add 198.51.100.7/32 dev svc0
+  ip addr add 2001:db8:2::7/128 dev svc0 nodad
   ip link set svc0 up
   my-test-service --listen 198.51.100.7:8080 &
+  my-test-service --listen "[2001:db8:2::7]:8080" &
+  sleep 1
   unshare --user --map-user='"$(id -u)"' --map-group='"$(id -g)"' \
-    playpen run --allow 198.51.100.7:8080/tcp -- my-client http://198.51.100.7:8080/
+    playpen run --allow 198.51.100.7:8080/tcp --allow "[2001:db8:2::7]:8080/tcp" -- \
+    my-client http://198.51.100.7:8080/ "http://[2001:db8:2::7]:8080/"
 '
 ```
 
 Nothing leaves the machine: a dummy interface discards what is sent to it.
+host0 needs its own IPv6 address and route: pasta gives the sandbox an IPv6
+address taken from the host, and without them it takes svc0's, so the service
+would be the sandbox's own.
 Do not run playpen inside `playpen run`; the inner one cannot start.
 
 ## Requirements
