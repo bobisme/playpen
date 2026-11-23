@@ -1513,6 +1513,17 @@ fn parent(
                 Signal::SIGWINCH if job == JobControl::PrivateTerminal => {
                     pass_on(&down_w, sig);
                 }
+                // The kernel's SIGHUP goes to a whole process group: the
+                // terminal's foreground group when the session leader
+                // exits, a stopped job's group when the shell's death
+                // leaves it orphaned (see `leave_caller_job`). The command
+                // has its copy if it is still in P's group; a shell inside
+                // has a group of its own, and I passes it on to that.
+                Signal::SIGHUP
+                    if info.ssi_code == SI_KERNEL && job == JobControl::CallerTerminal =>
+                {
+                    pass_on_group_sent(&down_w, sig);
+                }
                 // An attached foreground workload receives the terminal's
                 // signal directly. Detached helpers have already left this
                 // group, so P is the single route into a new session.
@@ -1715,8 +1726,9 @@ fn group_sent(
 /// passing on a signal sent to P alone loses it.
 ///
 /// W is a child of P that stays in P's group and does nothing but report
-/// the signals it receives. I leaves the group once the command is forked.
-/// A signal P receives is then
+/// the signals it receives. I leaves the group, and the caller's session,
+/// once the command is forked (see [`leave_caller_job`]). A signal P
+/// receives is then
 ///
 /// - for P alone when W did not receive it: passed on;
 /// - for the group when W received it and I did not: the command has its
@@ -1724,13 +1736,16 @@ fn group_sent(
 /// - for playpen's processes one by one when W and I both received it, as
 ///   `killall playpen` or `kill $(pidof playpen)` send it: passed on. W and
 ///   I look the same to such a sender (same name, same command line,
-///   neither dumpable); only the process group tells them apart.
+///   neither dumpable); only the process group and the session (and so the
+///   controlling terminal) tell them apart.
 ///
 /// W is forked after I, so its PID is the higher one. A sender that walks
 /// `/proc` reaches I before W in ascending order and P last in descending
 /// order; either way I's copy exists by the time P has W's report and its
-/// own signal. What is left is a sender that signals P and W, by PID, and
-/// not I: that signal is taken for a group's and not passed on.
+/// own signal. What is left is a sender that signals P and W and not I: by
+/// PID, or by name within P's group, session or terminal (`pkill -g`, `-s`
+/// or `-t` with `playpen`). That signal is taken for a group's and not
+/// passed on.
 struct Witness {
     pid: Pid,
     /// Write end: one [`SYNC`] per question. Closing it ends W.
@@ -2446,6 +2461,33 @@ fn make_process_group() -> Result<(), String> {
         .map_err(|e| format!("cannot create a process group: {e}"))
 }
 
+/// I, in an attached job, once it has forked the command into the caller's
+/// process group: leaves that group, and the caller's session as well.
+///
+/// Out of the group, so that a signal for the whole group reaches the
+/// command and not I; P's witness relies on that (see [`Witness`]).
+///
+/// Out of the session, so that I does not keep the group from being
+/// orphaned. When the shell dies, the kernel sends SIGHUP and SIGCONT to
+/// each of its jobs that is stopped and left orphaned: no member has a
+/// parent in another process group of the same session. The command's
+/// parent is I. Were I still in the session, a run stopped with Ctrl-Z
+/// whose shell is killed would never be continued: P stopped, the sandbox
+/// frozen, for ever. Outside the session, I stands where the host's init
+/// stands for a job without playpen. One difference is left: a process
+/// group the command itself makes is orphaned from the start, not once the
+/// shell is gone (docs/DESIGN.md, "A stopped run whose shell dies").
+///
+/// `setsid` cannot fail here (I leads no group, and no group has I's PID);
+/// if it did, I would at least leave the group. If I cannot leave even
+/// that, P takes every signal for one sent to playpen's processes one by
+/// one and passes it on.
+fn leave_caller_job() {
+    if nix::unistd::setsid().is_err() {
+        let _ = make_process_group();
+    }
+}
+
 // ---------------------------------------------------------------- S ----
 
 fn stage_s(
@@ -2555,14 +2597,11 @@ fn stage_i(
         ForkResult::Parent { child } => child,
     };
     // The command shares the caller's process group, which it got from I.
-    // I leaves it now, so that a signal for the whole group reaches the
-    // command and not I; P's witness relies on that (see `Witness`). From
-    // inside, that group has no number: both read 0 here. If I cannot
-    // leave, P takes every signal for one sent to playpen's processes one
-    // by one and passes it on.
+    // I leaves it now (see `leave_caller_job`). From inside, that group has
+    // no number: both read 0 here.
     let shared_group = (job == JobControl::CallerTerminal).then(|| {
         let group = getpgrp();
-        let _ = make_process_group();
+        leave_caller_job();
         group
     });
     drop(err_w);

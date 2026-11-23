@@ -30,7 +30,9 @@ If you used v0.1, these will be different:
   TCP, connected or not).
 - **At the top level, Ctrl-Z stops the whole sandbox**, and `fg` resumes it. On kernels that
   still allow `TIOCSTI`, the default command runs in its own session without a
-  controlling terminal (section 4.1, `--new-session`).
+  controlling terminal (section 4.1, `--new-session`). A stopped run whose
+  shell is killed is continued and sent SIGHUP, as a stopped job without
+  playpen is (section 4.1).
 - **The start line** has new clauses about host sockets, exposed paths and
   the session; **the report** has the new fields `socket_guard`,
   `exposed`, `display`, `new_session` and `private_tty`.
@@ -557,6 +559,19 @@ ruleset's time rule does not wait for either: from the end second on, a
 command that still runs while playpen is stopped reaches nothing but
 loopback. A pass revoked while playpen is stopped is not seen until
 playpen runs again.
+
+When the shell that started playpen dies while the run is stopped, and
+sends its jobs no SIGHUP (it was killed, for example), the run gets what a
+stopped job gets without playpen, in every terminal mode: once the shell's
+death leaves playpen's process group orphaned, the kernel sends the group
+SIGHUP and SIGCONT. playpen continues the processes it stopped, the
+command receives SIGHUP, and the run ends when the command does. A command
+that ignores SIGHUP runs on. A shell inside, which has a process group of
+its own, gets the SIGHUP from playpen. For this, in an attached run the
+sandbox's init leaves the caller's session. So a process group that the
+command itself makes is orphaned from the start: a read from the terminal
+in that group's background fails with EIO instead of stopping (for
+example under `timeout` without `--foreground`; section 8).
 
 **`--report FILE`**. Write the JSON report to `FILE`, for every outcome,
 refusals by policy included. The file is created (truncated) before
@@ -1729,19 +1744,23 @@ other processes in its PID namespace. Signal routing depends on the job:
 | Attached to the caller's terminal | Workload PID | The kernel delivers the workload's copy; P forwards one only if the workload has left P's group |
 
 In an attached job P has a second child, the witness W, in its own process
-group, and I leaves that group once the command is forked. A signal P
-receives from `kill` was sent to the whole group when W received it too
-and I did not; to P alone when W did not; to playpen's processes one by
-one (`killall playpen`) when both did. P forwards the last two. A signal
-sent to P and W by PID, and not to I, is taken for the group's and is not
-forwarded. Without W (it could not be started, or stopped answering) P
-forwards every signal, so a workload in P's group gets a group's signal
-twice.
+group, and I leaves that group, and the caller's session, once the command
+is forked. A signal P receives from `kill` was sent to the whole group
+when W received it too and I did not; to P alone when W did not; to
+playpen's processes one by one (`killall playpen`) when both did. P
+forwards the last two. A signal sent to P and W and not to I (by PID, or
+by name within P's group, session or terminal) is taken for the group's
+and is not forwarded. Without W (it could not be started, or stopped
+answering) P forwards every signal, so a workload in P's group gets a
+group's signal twice.
 
 The supervisor's controlling terminal determines the default even when
 stdin, stdout and stderr are redirected. In an attached job the kernel
 delivers terminal-generated signals to the foreground group directly. In a
-new session P forwards those signals. Standard signals of the same kind can
+new session P forwards those signals. In an attached job P forwards a
+SIGHUP from the kernel (the session leader exited, or the shell's death
+orphaned P's group with a stopped member) as a group's signal: only if the
+workload has left P's group. Standard signals of the same kind can
 coalesce while pending. With a private terminal, a nested foreground job
 receives its keyboard interrupts and stops through that terminal.
 On a top-level SIGTSTP, P asks I to stop every
@@ -2104,8 +2123,16 @@ Not guarded against, or known limits:
   Operation not permitted; playpen cannot run inside playpen, or inside
   another sandbox that locks its mounts; nothing was run`;
 - when the command shares its caller's terminal process group, a signal
-  sent by PID to playpen and to its witness process, and not to the
-  sandbox's init, does not reach the command (section 5);
+  sent to playpen and to its witness process, and not to the sandbox's
+  init, does not reach the command: one sent by PID, or by name within
+  playpen's process group, session or terminal (`pkill -g`, `-s` or `-t`
+  with `playpen`) (section 5);
+- in an attached run, a process group the command itself makes (for
+  example `timeout` without `--foreground` makes one) is orphaned from the
+  start, because the sandbox's init is not in the caller's session: a read
+  from the terminal in that group's background fails with EIO instead of
+  stopping, and SIGTSTP, SIGTTIN and SIGTTOU with their default action do
+  nothing there (section 4.1);
 - When SIGSTOP reaches playpen itself, its deadline and pass checks pause.
   The sandbox init begins freezing the command when it observes 5 seconds
   of silence (section 4.1). The ruleset's time rule does not pause: from

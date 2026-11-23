@@ -684,6 +684,145 @@ fn ctrl_z_stops_the_whole_sandbox_and_fg_resumes_it() {
     assert_eq!(t.status(), "130");
 }
 
+/// The name and state letter of `pid` (from `/proc/PID/stat`), or `None`
+/// once it is gone.
+fn name_and_state(pid: i32) -> Option<(String, char)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (name, rest) = stat.split_once(" (")?.1.rsplit_once(") ")?;
+    Some((name.to_owned(), rest.chars().next()?))
+}
+
+/// Each of `pids` with its name and state letter, for a failure message.
+fn described(pids: &[i32]) -> String {
+    let named: Vec<String> = pids
+        .iter()
+        .map(|&pid| match name_and_state(pid) {
+            Some((name, state)) => format!("{pid} {name} {state}"),
+            None => format!("{pid} (gone)"),
+        })
+        .collect();
+    named.join(", ")
+}
+
+/// Kills the shell of `t` with SIGKILL, as `kill -9` or a crashed terminal
+/// emulator would, and returns its PID. The shell is left unreaped, so that
+/// its PID, and so its session number, is not reused while the test looks
+/// at the session; the Pty's Drop reaps it.
+fn kill_shell(t: &Pty) -> i32 {
+    let shell = i32::try_from(t.child.id()).expect("shell PID");
+    // SAFETY: kill takes plain integers; the PID is the test's own child.
+    let rc = unsafe { libc::kill(shell, libc::SIGKILL) };
+    assert_eq!(rc, 0, "kill the shell: {}", std::io::Error::last_os_error());
+    shell
+}
+
+/// The processes of the killed `shell`'s session and their descendants
+/// that are still there after up to 10 s. The terminal is read meanwhile,
+/// so that nothing blocks writing to it.
+fn left_after_shell(t: &mut Pty, shell: i32) -> Vec<i32> {
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = session_and_descendants(shell);
+        if left.is_empty() || Instant::now() >= end {
+            return left;
+        }
+        t.read_for(Duration::from_millis(100));
+    }
+}
+
+/// Without playpen, a job stopped with Ctrl-Z is sent SIGHUP and SIGCONT by
+/// the kernel when its shell dies and leaves its process group orphaned. A
+/// run is such a job, attached or in a session of its own: the hangup ends
+/// the command, and the whole playpen tree goes with it.
+#[test]
+fn a_stopped_run_ends_when_its_shell_is_killed() {
+    for mode in ["", "--new-session ", "--private-tty "] {
+        require_pty!(t);
+        t.send(&format!(
+            "$P run --no-network {mode}-- sh -c 'echo st\"\"arted; while :; do sleep 1; done'\n"
+        ));
+        t.expect("started");
+        t.send("\x1a");
+        t.expect("Stopped");
+        let shell = kill_shell(&t);
+        t.expect("command was killed by signal 1\r\n");
+        let left = left_after_shell(&mut t, shell);
+        assert!(
+            left.is_empty(),
+            "{mode:?}: 10 s after its shell was killed, the stopped run is still there: {}; terminal shows: {:?}",
+            described(&left),
+            text(&t.seen[t.at..])
+        );
+    }
+}
+
+/// The same with a command that ignores SIGHUP: as without playpen, it is
+/// continued, and runs on. Nothing in the run stays stopped.
+#[test]
+fn a_stopped_attached_run_that_ignores_hangups_runs_on_when_its_shell_is_killed() {
+    require_pty!(t);
+    t.send(
+        "$P run --no-network -- sh -c 'trap \"\" HUP; while :; do echo t\"\"ick; sleep 0.2; done'\n",
+    );
+    t.expect("tick");
+    t.send("\x1a");
+    t.expect("Stopped");
+    let _ = t.quiet_for(Duration::from_millis(300));
+    let while_stopped = t.quiet_for(Duration::from_millis(500));
+    assert!(
+        !while_stopped.contains("tick"),
+        "the command ran while playpen was stopped: {while_stopped:?}"
+    );
+    let shell = kill_shell(&t);
+    t.expect("tick");
+    t.expect("tick");
+    let end = Instant::now() + Duration::from_secs(2);
+    loop {
+        let stopped: Vec<i32> = session_and_descendants(shell)
+            .into_iter()
+            .filter(|&pid| name_and_state(pid).is_some_and(|(_, state)| state == 'T'))
+            .collect();
+        if stopped.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < end,
+            "still stopped after the shell was killed: {}",
+            described(&stopped)
+        );
+        t.read_for(Duration::from_millis(50));
+    }
+    let after = t.quiet_for(Duration::from_millis(300));
+    assert!(!after.contains("command was killed"), "{after:?}");
+}
+
+/// A shell inside has a process group of its own, so the kernel's hangup
+/// for playpen's group does not reach it; playpen passes it on. Ctrl-Z at
+/// its prompt stops nothing (the shell ignores it), so playpen is stopped
+/// with SIGTSTP from outside, as `kill -TSTP` would.
+#[test]
+fn a_stopped_attached_run_of_a_shell_ends_when_the_outer_shell_is_killed() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    require_pty!(t);
+    t.send("$P run --no-network -- bash --norc --noprofile -i\n");
+    t.expect("host Unix sockets");
+    t.expect("$ ");
+    let supervisor = playpen_processes(t.child.id())[0].0;
+    kill(Pid::from_raw(supervisor), Signal::SIGTSTP).expect("stop playpen");
+    t.expect("Stopped");
+    let shell = kill_shell(&t);
+    t.expect("command was killed by signal 1\r\n");
+    let left = left_after_shell(&mut t, shell);
+    assert!(
+        left.is_empty(),
+        "10 s after the outer shell was killed, the stopped run is still there: {}; terminal shows: {:?}",
+        described(&left),
+        text(&t.seen[t.at..])
+    );
+}
+
 #[test]
 fn a_terminal_resize_reaches_the_command() {
     require_pty!(t);
@@ -885,21 +1024,19 @@ fn attached_and_new_session_pid_and_group_signals_have_one_delivery() {
     }
 }
 
-/// The processes named `playpen` in this session, as (PID, process group),
-/// in ascending PID order: the supervisor first.
+/// The processes named `playpen` in this session and below it, as (PID,
+/// process group), in ascending PID order: the supervisor first. The
+/// sandbox's init has left the session, and is found as a child of S.
 fn playpen_processes(session: u32) -> Vec<(i32, i32)> {
-    let mut found: Vec<(i32, i32)> = std::fs::read_dir("/proc")
-        .expect("list /proc")
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+    let session = i32::try_from(session).expect("session number");
+    let mut found: Vec<(i32, i32)> = session_and_descendants(session)
+        .into_iter()
         .filter_map(|pid| {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
             let (head, tail) = stat.rsplit_once(") ")?;
-            let mut fields = tail.split(' ');
-            // After the name: state, parent, process group, session.
-            let group: i32 = fields.nth(2)?.parse().ok()?;
-            let in_session = fields.next()?.parse() == Ok(session);
-            (in_session && head.split_once('(')?.1 == "playpen").then_some((pid, group))
+            // After the name: state, parent, process group.
+            let group: i32 = tail.split(' ').nth(2)?.parse().ok()?;
+            (head.split_once('(')?.1 == "playpen").then_some((pid, group))
         })
         .collect();
     found.sort_unstable();

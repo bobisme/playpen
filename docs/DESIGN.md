@@ -396,6 +396,8 @@ SIGTTOU are blocked in it). A shell inside (`playpen run -- bash -i`) takes
 the terminal for its own jobs; Ctrl-Z then suspends its foreground job, as
 usual. The test `ctrl_z_stops_the_whole_sandbox_and_fg_resumes_it` uses a
 child in its own session; with the freeze disabled, it fails (checked).
+When the shell dies while the run is stopped, nothing calls `fg`; see "A
+stopped run whose shell dies" below.
 
 **SIGSTOP sent to playpen directly** (`kill -STOP`) cannot be caught, so P
 cannot ask for the freeze first. A watchdog covers it: P sends I one byte a
@@ -476,7 +478,8 @@ group-targeted send.
 Two processes make the difference visible. A witness (W), a child of the
 supervisor forked once init exists, stays in the supervisor's group and
 reports each signal it receives. Init (I) leaves that group as soon as it
-has forked the command. The supervisor then reads a signal sent with
+has forked the command, and the caller's session too (see "A stopped run
+whose shell dies" below). The supervisor then reads a signal sent with
 `kill` this way:
 
 | W received it | I received it | It was sent to | The supervisor |
@@ -488,9 +491,10 @@ has forked the command. The supervisor then reads a signal sent with
 The last row is `killall playpen`, `pkill playpen` or `kill $(pidof
 playpen)`. Those reach W, but they reach I too, because the two look the
 same to them: same name, same command line, neither dumpable (so neither
-shows its executable). Only the process group differs. A sender that takes
-everything (`kill -1`, a control group, a session) also reaches both; the
-command then gets its own copy and the passed-on one, as before.
+shows its executable). Only the process group and the session (and so the
+controlling terminal) differ. A sender that takes everything (`kill -1`, a
+control group) also reaches both; the command then gets its own copy and
+the passed-on one, as before.
 
 The supervisor reads W's reports before its own signals in each turn of
 its loop, asks W to report what it has (and waits for the answer) when a
@@ -508,11 +512,15 @@ with job control makes a group of its own). I leaving the group also
 settles `kill 0` inside the sandbox: it reaches the command's group, which
 is the caller's, and used to reach I, which passed it on a second time.
 
-What is left: a sender that signals the supervisor and W by PID and not I.
-That signal is taken for a group's and is not passed on. It takes a
-hand-made list of PIDs. If W cannot be had (the fork fails, it is killed,
-it does not answer within a second), the supervisor passes on every signal
-as it did before.
+What is left: a sender that signals the supervisor and W and not I. That
+signal is taken for a group's and is not passed on. It takes a hand-made
+list of PIDs, or a sender that picks playpen's processes by name within
+the supervisor's group, session or terminal: `pkill -g PGID playpen`, and,
+since I left the session, `pkill -s SID playpen` and `pkill -t pts/N
+playpen`. Measured with 5 sends of each: the command got none; before I
+left the session, `-s` and `-t` reached it 5 times of 5 and `-g` never.
+If W cannot be had (the fork fails, it is killed, it does not answer
+within a second), the supervisor passes on every signal as it did before.
 
 Tests: `attached_and_new_session_pid_and_group_signals_have_one_delivery`,
 `attached_signal_for_each_playpen_process_has_one_delivery` (upwards and
@@ -526,6 +534,70 @@ signal delivery but moves the other pipeline stages into the background. A
 sibling with SIGTTIN blocked then gets EIO on a keyboard read that would
 have succeeded in the original foreground job, and need not produce any
 signal that Playpen could use to hand the terminal back.
+
+**A stopped run whose shell dies.** A shell that is killed (`kill -9`, a
+terminal emulator that crashed) sends its jobs no SIGHUP. Without playpen,
+a job stopped with Ctrl-Z ends all the same: when the shell's death leaves
+the job's process group orphaned (no member has a parent in another
+process group of the same session) and a member is stopped, the kernel
+sends the group SIGHUP and SIGCONT. An attached run stayed stopped
+instead, P in state T and the sandbox frozen, until someone killed it. The
+command is in P's group, its parent is I, and I was in another group of
+the same session, so the group never became orphaned. With a new session
+or a private terminal the command is not in P's group, and the run ended
+as it should.
+
+Now I leaves the caller's session (`setsid`), not only its group, once it
+has forked the command. When the shell dies, the group is orphaned, and
+the kernel's SIGHUP and SIGCONT reach every process in it, the command
+among them. P reads SIGCONT and has I continue what it froze, as after
+`fg`. The command ends on its SIGHUP; one that ignores SIGHUP runs on, as
+it does without playpen (checked by hand: `sh -c 'trap "" HUP; ...'`
+stopped at a bash prompt, bash killed, and the job runs again). A shell
+inside (`-- bash -i`) has a group of its own, which the kernel's SIGHUP
+does not reach: P passes a SIGHUP from the kernel on as one sent to its
+whole group, and I passes it on only if the command has left the group.
+So the command gets one copy either way.
+
+Other ways were looked at. I cannot see P: the `/proc` I sees shows only
+the sandbox. C could read P's state and P's parent from `/proc` every
+second, and send the group SIGHUP and SIGCONT once the shell is gone and P
+is stopped. That copies the kernel's rule by polling. It sees only the
+links it is told to look at (P's shell can be a script in the same group,
+whose own shell is the one that dies), and it has to find the moment the
+group became orphaned, which is when the kernel acts; a job stopped later
+in an orphaned group is left alone. Watching the terminal for a hangup
+does not see a killed shell while the terminal emulator keeps the
+terminal open, as the tests do.
+
+What I's own session changes besides:
+
+- To the kernel, I now stands where the host's init stands for a job
+  without playpen: outside the session. So a process group that the
+  command itself makes, with the command in it, is orphaned from the
+  start; without playpen it is orphaned only once the shell is gone. In
+  such a group a stop signal with its default action (SIGTSTP, SIGTTIN,
+  SIGTTOU) does nothing, and a read from the terminal in the background
+  fails with EIO instead of stopping. Shells with job control ignore those
+  signals, and the groups they make for their jobs have the shell as
+  parent, in the session, so job control inside works as before
+  (`job_control_works_in_a_shell_inside`,
+  `nested_interactive_pipeline_can_stop_background_foreground_and_interrupt`).
+  `timeout` without `--foreground` makes such a group: in `playpen run --
+  timeout 4 sh -c 'read x'` the read now fails with EIO at once, where it
+  used to hang until `timeout` ended the command (measured; without
+  playpen, `timeout` leads the shell's foreground job and the read gets
+  what is typed).
+- A sender that picks playpen's processes by name within the caller's
+  session or terminal no longer reaches I (see "What is left" above).
+
+Tests: `a_stopped_run_ends_when_its_shell_is_killed` (attached,
+`--new-session` and `--private-tty`),
+`a_stopped_attached_run_that_ignores_hangups_runs_on_when_its_shell_is_killed`
+and `a_stopped_attached_run_of_a_shell_ends_when_the_outer_shell_is_killed`.
+Without the change, the three attached cases fail (checked); with I out of
+the session but P ignoring the kernel's SIGHUP, the last one fails
+(checked). The other two modes passed before the change as well.
 
 ## AppArmor
 
