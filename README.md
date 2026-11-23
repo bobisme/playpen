@@ -87,11 +87,8 @@ or its process group. Playpen forwards them to the workload group. Redirecting
 stdio alone does not make a terminal job headless.
 
 At a terminal, the default preserves shell pipelines, `fg`/`bg` and
-`/dev/tty`. Signal the playpen **PID** when you need a single delivery.
-An explicit signal to the **group** can also reach the command directly,
-giving it a second copy. For automation that allocates a terminal and signals
-the whole group, use `--new-session`. The command keeps its standard streams
-and gives up its controlling terminal.
+`/dev/tty`. Send signals to the playpen PID or to its process group; the
+command gets one copy either way. `killall playpen` also delivers one copy.
 
 ### Run an interactive shell with single signal delivery
 
@@ -213,6 +210,30 @@ playpen run --no-network --fixture items.json -- sh -c 'curl -qsS --noproxy "*" 
 ```
 
 The client prints `[]`. Each run has a private listener and an ephemeral port.
+
+### Reach a test service on this machine
+
+The sandbox gets this host's network address, so a service listening on
+that address is not reachable from inside: the connection stays in the
+sandbox, and playpen prints a NOTE that says so. Give the service an
+address the sandbox does not have. Without privileges, build a throwaway
+host and run both in it:
+
+```sh
+unshare --user --map-root-user --net sh -c '
+  ip link set lo up
+  ip link add host0 type dummy && ip addr add 192.0.2.10/24 dev host0
+  ip link set host0 up && ip route add default via 192.0.2.1
+  ip link add svc0 type dummy && ip addr add 198.51.100.7/32 dev svc0
+  ip link set svc0 up
+  my-test-service --listen 198.51.100.7:8080 &
+  unshare --user --map-user='"$(id -u)"' --map-group='"$(id -g)"' \
+    playpen run --allow 198.51.100.7:8080/tcp -- my-client http://198.51.100.7:8080/
+'
+```
+
+Nothing leaves the machine: a dummy interface discards what is sent to it.
+Do not run playpen inside `playpen run`; the inner one cannot start.
 
 ## Requirements
 

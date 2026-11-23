@@ -269,20 +269,69 @@ to the host terminal may emit a newline without a carriage return. At
 teardown the relay drains pending
 output and restores the caller's terminal settings.
 
-**Attached jobs.** A group signal sent with `kill` can reach both the
-supervisor and the workload. Linux supplies the sender's PID and UID to the
-supervisor for both PID-targeted and group-targeted sends. Suppressing the
-forward could lose a signal sent to the supervisor alone. The shared group
-also lets other pipeline stages read the real terminal and lets a command
-open `/dev/tty` with redirected stdin. For single delivery in this mode,
-address the supervisor PID.
+**Attached jobs.** The command shares the supervisor's process group. That
+is what lets other pipeline stages read the real terminal and lets a
+command open `/dev/tty` with redirected stdin. It also means that a signal
+sent to the group with `kill` reaches the command directly, and the
+supervisor as well. Passing that one on gave the command a second copy.
+Not passing on a signal that was sent to the supervisor alone loses it.
+The supervisor has to tell the two apart, and nothing in the signal does:
+Linux reports the same sender PID and UID for a PID-targeted and a
+group-targeted send.
 
-Giving the terminal to a separate workload group fixes signal delivery but
-also moves the other pipeline stages into the background. A sibling with
-SIGTTIN blocked then gets EIO on a keyboard read that would have succeeded
-in the original foreground job. It need not produce any signal that Playpen
-could use to hand the terminal back. The shared-terminal acceptance test
-must therefore cover both signal counts and input at a sibling stage.
+Two processes make the difference visible. A witness (W), a child of the
+supervisor forked once init exists, stays in the supervisor's group and
+reports each signal it receives. Init (I) leaves that group as soon as it
+has forked the command. The supervisor then reads a signal sent with
+`kill` this way:
+
+| W received it | I received it | It was sent to | The supervisor |
+| --- | --- | --- | --- |
+| no | either | the supervisor alone | passes it on |
+| yes | no | the whole group | does not: the command has its copy |
+| yes | yes | playpen's processes, one by one | passes it on |
+
+The last row is `killall playpen`, `pkill playpen` or `kill $(pidof
+playpen)`. Those reach W, but they reach I too, because the two look the
+same to them: same name, same command line, neither dumpable (so neither
+shows its executable). Only the process group differs. A sender that takes
+everything (`kill -1`, a control group, a session) also reaches both; the
+command then gets its own copy and the passed-on one, as before.
+
+The supervisor reads W's reports before its own signals in each turn of
+its loop, asks W to report what it has (and waits for the answer) when a
+signal of its own has no report beside it, and drops reports that met no
+signal. So a report is matched only with a signal that was pending at the
+same time, however late the supervisor runs (after Ctrl-Z, for example).
+When W received the signal it asks I the same question. W is younger than
+I, so its PID is the higher one: a sender walking `/proc` upwards reaches I
+before W, and one walking downwards reaches the supervisor last. Either
+way I's copy exists by the time it is asked.
+
+For a group's signal the supervisor still tells I, with a byte that says
+so, and I passes it on if the command is no longer in the group (a shell
+with job control makes a group of its own). I leaving the group also
+settles `kill 0` inside the sandbox: it reaches the command's group, which
+is the caller's, and used to reach I, which passed it on a second time.
+
+What is left: a sender that signals the supervisor and W by PID and not I.
+That signal is taken for a group's and is not passed on. It takes a
+hand-made list of PIDs. If W cannot be had (the fork fails, it is killed,
+it does not answer within a second), the supervisor passes on every signal
+as it did before.
+
+Tests: `attached_and_new_session_pid_and_group_signals_have_one_delivery`,
+`attached_signal_for_each_playpen_process_has_one_delivery` (upwards and
+downwards), `attached_group_signal_reaches_a_shell_that_left_the_group`
+and `attached_group_signal_from_inside_has_one_delivery`. Each fails when
+the part it covers is removed (checked: I's report ignored, the byte for a
+group's signal dropped by I, I left in the group).
+
+Giving the terminal to a separate workload group was tried first. It fixes
+signal delivery but moves the other pipeline stages into the background. A
+sibling with SIGTTIN blocked then gets EIO on a keyboard read that would
+have succeeded in the original foreground job, and need not produce any
+signal that Playpen could use to hand the terminal back.
 
 ## AppArmor
 
@@ -479,6 +528,59 @@ matter for safety:
    is gone, and it exits, which kills everything in the PID namespace
    (`killing_playpen_kills_the_sandbox`). What a killed playpen leaves
    behind is the small directory of pasta's PID file.
+
+## The host's own addresses
+
+pasta configures the sandbox's interface from the host's (`--config-net`):
+it takes the interface that has the default route and copies its addresses
+and routes. Inside the sandbox the host's address on that interface is
+therefore the sandbox's own. A connection to it is delivered inside the
+sandbox and never reaches pasta. Approving exactly that address opens
+nothing on the host: the filter accepts the packet, nothing listens
+inside, the command gets "connection refused", and no drop is counted.
+A service on the host that listens on that address (a test fixture, for
+example) cannot be reached this way.
+
+playpen does not know which addresses pasta will copy until pasta has run,
+so it looks afterwards. Once pasta is attached, C lists the addresses of
+the namespace and reports each one that a rule approves on its own. The
+supervisor prints a NOTE that names it. A network rule that merely
+contains the address is not reported, and neither is an address playpen
+put on `lo` itself (`--lo-addr`). The run goes on, because the approval
+may list other destinations.
+
+To reach a service on this host with the filter on, have the service
+listen on an address the sandbox does not have:
+
+- **Another address of the host**, on a second interface (a bridge, a VPN
+  link, a dummy interface an administrator added). pasta connects to it
+  from the host, where it is local. The approval names that address.
+- **A throwaway host, without privileges.** Make a user and network
+  namespace (`unshare --user --map-root-user --net`). In it, add a dummy
+  interface with an address and the default route, and a second dummy
+  interface with the service's address. Start the service, then run
+  playpen as the caller's own user again (`unshare --user
+  --map-user=UID --map-group=GID playpen run ...`). pasta copies the first
+  interface; the service's address stays outside the sandbox. Nothing can
+  leave the machine, because a dummy interface discards what is sent to
+  it. `tests/gateway.rs` builds this in a dozen lines of shell;
+  `a_host_service_is_reached_at_an_address_the_sandbox_does_not_have`
+  reaches a listener at the second address and is refused at the copied
+  one.
+
+Two things that do not work:
+
+- **playpen inside playpen.** The inner one has to mount (`/proc`, private
+  mounts), and Landlock, which the outer one applies to the command,
+  refuses every mount: `cannot make mounts private: EPERM`. (With
+  `--without-landlock` on the outer run the inner one starts; checked.)
+  Put the service and the program that runs playpen side by side in the
+  throwaway host instead.
+- **Mapping the address.** pasta's `--map-guest-addr` makes another
+  address inside stand for the host's. The command would then have to
+  connect to an address that is not the approved one, and the filter
+  would have to approve that one. `--map-host-loopback` stays `none` (see
+  the table below).
 
 ## Leaks considered
 

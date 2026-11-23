@@ -877,7 +877,17 @@ other processes in its PID namespace. Signal routing depends on the job:
 | No controlling terminal | Workload's current process group | P forwards one copy |
 | `--new-session` (explicit or automatic) | Workload's initial session process group | P forwards one copy |
 | `--private-tty` | Private terminal foreground group | P forwards one copy |
-| Attached to the caller's terminal | Workload PID | A workload still in P's group can receive both the direct and forwarded copies |
+| Attached to the caller's terminal | Workload PID | The kernel delivers the workload's copy; P forwards one only if the workload has left P's group |
+
+In an attached job P has a second child, the witness W, in its own process
+group, and I leaves that group once the command is forked. A signal P
+receives from `kill` was sent to the whole group when W received it too
+and I did not; to P alone when W did not; to playpen's processes one by
+one (`killall playpen`) when both did. P forwards the last two. A signal
+sent to P and W by PID, and not to I, is taken for the group's and is not
+forwarded. Without W (it could not be started, or stopped answering) P
+forwards every signal, so a workload in P's group gets a group's signal
+twice.
 
 The supervisor's controlling terminal determines the default even when
 stdin, stdout and stderr are redirected. In an attached job the kernel
@@ -1048,8 +1058,16 @@ Not guarded against, or known limits:
   messages; its atomic generation guarantee concerns ruleset updates. It
   does not specify an atomic cross-counter snapshot or a version range for
   one, so no supported nft version is claimed to provide that guarantee;
-- a signal sent to playpen's whole process group reaches the command
-  twice when the command shares its caller's terminal process group (section 5);
+- an approval of this host's own address, on the interface pasta copies
+  into the sandbox, does not reach the host: inside, that address is the
+  sandbox's. playpen prints a NOTE at the start when a rule approves such
+  an address on its own. A local service has to listen on an address the
+  sandbox does not have (DESIGN.md, "The host's own addresses");
+- playpen does not run inside playpen: Landlock refuses the inner one's
+  mounts;
+- when the command shares its caller's terminal process group, a signal
+  sent by PID to playpen and to its witness process, and not to the
+  sandbox's init, does not reach the command (section 5);
 - When SIGSTOP reaches playpen itself, its deadline and pass checks pause.
   The sandbox init begins freezing the command when it observes 5 seconds
   of silence (section 4.1).

@@ -13,6 +13,8 @@
 //!           │   daemon sockets; forwards signals, reaps orphans.
 //!           └─ X   nested user namespace mapped back to the caller's own
 //!                  uid/gid, no capabilities, no_new_privs; execs the command.
+//!  └─ W   only when the command shares the caller's terminal job: stays
+//!         in P's process group and reports the signals it is sent.
 //! ```
 //!
 //! `pasta` is started by P after C reports the ruleset is loaded and
@@ -29,6 +31,8 @@
 //! stopped. The signals P passes on to the command travel on this pipe
 //! too, one byte each (see [`signal_byte`]). This distinguishes forwarded
 //! signals from copies received by helpers in the caller's process group.
+//! When the command shares that group, a signal sent to the whole group has
+//! reached the command already; [`Witness`] says how P tells.
 //! P also sends `b` every second. When I hears nothing from P for
 //! [`SILENCE_LIMIT`] (P was stopped with SIGSTOP, which it cannot catch,
 //! or is stuck), I freezes the sandbox by itself until P is heard again.
@@ -83,6 +87,18 @@ const FORWARDED: [Signal; 7] = [
 /// `si_code` of signals the kernel generated itself, for example a terminal's
 /// Ctrl-C. In attached mode the terminal already signals its foreground job.
 const SI_KERNEL: i32 = 0x80;
+
+/// `si_code` of a signal sent with `kill(2)`, the only call that can address
+/// a whole process group.
+const SI_USER: i32 = 0;
+
+/// How long a signal I received from outside its PID namespace counts
+/// against a group send, from the moment P read I's report.
+const CONTROL_WINDOW: Duration = Duration::from_millis(500);
+
+/// How long P waits for W or I to answer [`SYNC`]. Without an answer P
+/// passes the signal on, as it did before there was a witness.
+const SYNC_LIMIT: Duration = Duration::from_secs(1);
 
 /// Everything the sandbox needs to know. Built and checked by the CLI.
 #[derive(Debug, Clone)]
@@ -189,6 +205,9 @@ pub trait Events {
     fn starting(&mut self);
     /// The approval ended; the command is being stopped.
     fn until_reached(&mut self);
+    /// Approved addresses that turned out to be the sandbox's own: pasta
+    /// gave them to its interface, so connections to them stay inside.
+    fn own_addresses(&mut self, _addresses: &[IpAddr]) {}
     /// A re-read of the pass found an edit that changes nothing in use.
     fn pass_edited(&mut self, message: &str);
     /// A re-read of the pass withdrew the approval; the command is being
@@ -388,6 +407,16 @@ const BEAT: u8 = b'b';
 /// the whole playpen invocation.
 const PRIVATE_TSTP: u8 = b'z';
 
+/// Byte P sends W and I: report every signal received so far, then answer.
+const SYNC: u8 = b'q';
+
+/// Byte W answers [`SYNC`] with, after its reports.
+const SYNCED: u8 = b'k';
+
+/// Added to a [`signal_byte`] when P's whole process group was sent the
+/// signal: I passes it on only if the command has left that group.
+const GROUP_SENT: u8 = 0x10;
+
 /// How often P tells I that it is running.
 const BEAT_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -410,6 +439,20 @@ fn signal_byte(sig: Signal) -> Option<u8> {
 /// The signal a byte from P stands for, if it is one of [`signal_byte`]'s.
 fn byte_signal(byte: u8) -> Option<Signal> {
     FORWARDED.get(usize::from(byte).checked_sub(1)?).copied()
+}
+
+/// The place of a [`signal_byte`] in [`FORWARDED`].
+fn byte_index(byte: u8) -> Option<usize> {
+    usize::from(byte)
+        .checked_sub(1)
+        .filter(|at| *at < FORWARDED.len())
+}
+
+/// The signal a byte from P stands for when it carries [`GROUP_SENT`].
+fn byte_group_signal(byte: u8) -> Option<Signal> {
+    (byte & 0xf0 == GROUP_SENT)
+        .then(|| byte_signal(byte & 0x0f))
+        .flatten()
 }
 
 /// P asks I to pass `sig` on to the command.
@@ -780,6 +823,14 @@ struct ParentState {
     grant_packets: Vec<Option<u64>>,
     ready: bool,
     eof: bool,
+    /// Approved addresses C found on the sandbox's own interfaces.
+    own: Vec<IpAddr>,
+    /// [`SYNC`] bytes sent to I, and how many it has answered.
+    asked: u64,
+    synced: u64,
+    /// When P read I's report of a signal from outside its PID namespace,
+    /// by place in [`FORWARDED`].
+    outside: [Option<Instant>; FORWARDED.len()],
 }
 
 impl ParentState {
@@ -795,6 +846,13 @@ impl ParentState {
             "init" => self.init = rest.parse::<i32>().ok().map(Pid::from_raw),
             "statuserr" => self.status_error = Some(rest.to_owned()),
             "private-tstp" => self.private_tstp = Some(rest == "outer"),
+            "own" => self.own = rest.split(' ').filter_map(|a| a.parse().ok()).collect(),
+            "synced" => self.synced += 1,
+            "outside" => {
+                if let Some(at) = rest.parse().ok().and_then(byte_index) {
+                    self.outside[at] = Some(Instant::now());
+                }
+            }
             "started" => self.started = true,
             "exit" => self.status = rest.parse().ok().map(CommandStatus::Exited),
             "signal" => self.status = rest.parse().ok().map(CommandStatus::Signaled),
@@ -992,8 +1050,15 @@ fn parent(
     let mut terminal_failure: Option<String> = None;
     let mut next_recheck = watch.as_ref().map(|w| Instant::now() + w.interval);
     let mut next_beat = Instant::now();
+    let mut witness: Option<Witness> = None;
+    let mut witness_due = job == JobControl::CallerTerminal;
     while !st.eof {
         let now = Instant::now();
+        // W must be newer than I: see `Witness`.
+        if witness_due && let Some(init) = st.init {
+            witness_due = false;
+            witness = Witness::start(init);
+        }
         if let Some(tty) = private_tty.as_mut()
             && terminal_failure.is_none()
             && let Err(e) = tty.relay.check()
@@ -1050,20 +1115,33 @@ fn parent(
                 .clamp(1, 10_000),
         )
         .unwrap_or(10_000);
-        let mut fds = [
-            PollFd::new(up_r.as_fd(), PollFlags::POLLIN),
-            PollFd::new(sigfd.as_fd(), PollFlags::POLLIN),
-        ];
-        match poll(&mut fds, PollTimeout::from(ms)) {
-            Ok(_) | Err(Errno::EINTR) => {}
-            Err(e) => {
-                return Err(RunError::Failed(format!("poll failed: {e}")));
+        let up_ready = {
+            let mut fds = vec![
+                PollFd::new(up_r.as_fd(), PollFlags::POLLIN),
+                PollFd::new(sigfd.as_fd(), PollFlags::POLLIN),
+            ];
+            if let Some(w) = &witness {
+                fds.push(PollFd::new(w.answers.as_fd(), PollFlags::POLLIN));
             }
-        }
-        let up_ready = fds[0].revents().is_some_and(|r| !r.is_empty());
-        let sig_ready = fds[1].revents().is_some_and(|r| !r.is_empty());
+            match poll(&mut fds, PollTimeout::from(ms)) {
+                Ok(_) | Err(Errno::EINTR) => {}
+                Err(e) => {
+                    return Err(RunError::Failed(format!("poll failed: {e}")));
+                }
+            }
+            fds[0].revents().is_some_and(|r| !r.is_empty())
+        };
         if up_ready {
             st.pump(up_r);
+        }
+        if !st.own.is_empty() {
+            events.own_addresses(&std::mem::take(&mut st.own));
+        }
+        // W's reports are read before P's own signals. A signal for the
+        // whole group is pending here by the time W can have reported it,
+        // so a report with no signal of P's own beside it is not a group's.
+        if let Some(w) = witness.as_mut() {
+            w.absorb();
         }
         if st.private_tstp.take() == Some(true) {
             if let Some(tty) = private_tty.as_mut()
@@ -1073,57 +1151,71 @@ fn parent(
             }
             suspend(&down_w);
         }
-        if sig_ready {
-            while let Ok(Some(info)) = sigfd.read_signal() {
-                let Ok(sig) = Signal::try_from(i32::try_from(info.ssi_signo).unwrap_or(0)) else {
-                    continue;
-                };
-                match sig {
-                    Signal::SIGCHLD | Signal::SIGTTIN | Signal::SIGTTOU => {}
-                    // Signals are read only after "go"; I reads the bytes
-                    // once its loop runs, even if they come before that.
-                    Signal::SIGTSTP
-                        if job == JobControl::PrivateTerminal && info.ssi_code == SI_KERNEL =>
+        // Read whether or not poll saw a signal: one that came after poll
+        // returned belongs with the reports of W's just read.
+        while let Ok(Some(info)) = sigfd.read_signal() {
+            let Ok(sig) = Signal::try_from(i32::try_from(info.ssi_signo).unwrap_or(0)) else {
+                continue;
+            };
+            match sig {
+                Signal::SIGCHLD | Signal::SIGTTIN | Signal::SIGTTOU => {}
+                // Signals are read only after "go"; I reads the bytes
+                // once its loop runs, even if they come before that.
+                Signal::SIGTSTP
+                    if job == JobControl::PrivateTerminal && info.ssi_code == SI_KERNEL =>
+                {
+                    send_byte(&down_w, PRIVATE_TSTP);
+                }
+                Signal::SIGTSTP => {
+                    if let Some(tty) = private_tty.as_mut()
+                        && let Err(e) = tty.relay.pause()
                     {
-                        send_byte(&down_w, PRIVATE_TSTP);
+                        terminal_failure =
+                            Some(format!("cannot pause private terminal relay: {e}"));
                     }
-                    Signal::SIGTSTP => {
-                        if let Some(tty) = private_tty.as_mut()
-                            && let Err(e) = tty.relay.pause()
-                        {
-                            terminal_failure =
-                                Some(format!("cannot pause private terminal relay: {e}"));
-                        }
-                        suspend(&down_w);
-                    }
-                    Signal::SIGCONT => {
-                        if let Some(tty) = private_tty.as_mut()
-                            && let Err(e) = tty.relay.resume()
-                        {
-                            terminal_failure =
-                                Some(format!("cannot resume private terminal relay: {e}"));
-                        }
-                        send_byte(&down_w, THAW);
-                    }
-                    Signal::SIGWINCH
-                        if job == JobControl::PrivateTerminal && info.ssi_code == SI_KERNEL =>
+                    suspend(&down_w);
+                }
+                Signal::SIGCONT => {
+                    if let Some(tty) = private_tty.as_mut()
+                        && let Err(e) = tty.relay.resume()
                     {
-                        if let Some(tty) = private_tty.as_mut()
-                            && let Err(e) = tty.relay.resize()
-                        {
-                            terminal_failure = Some(format!("cannot resize private terminal: {e}"));
-                        }
+                        terminal_failure =
+                            Some(format!("cannot resume private terminal relay: {e}"));
                     }
-                    Signal::SIGWINCH if job == JobControl::PrivateTerminal => {
+                    send_byte(&down_w, THAW);
+                }
+                Signal::SIGWINCH
+                    if job == JobControl::PrivateTerminal && info.ssi_code == SI_KERNEL =>
+                {
+                    if let Some(tty) = private_tty.as_mut()
+                        && let Err(e) = tty.relay.resize()
+                    {
+                        terminal_failure = Some(format!("cannot resize private terminal: {e}"));
+                    }
+                }
+                Signal::SIGWINCH if job == JobControl::PrivateTerminal => {
+                    pass_on(&down_w, sig);
+                }
+                // An attached foreground workload receives the terminal's
+                // signal directly. Detached helpers have already left this
+                // group, so P is the single route into a new session.
+                _ if info.ssi_code == SI_KERNEL && job == JobControl::CallerTerminal => {}
+                // Sent with kill(2) while the command shares P's group: to
+                // P alone, or to the group and so to the command as well.
+                _ if info.ssi_code == SI_USER && job == JobControl::CallerTerminal => {
+                    if group_sent(sig, &mut witness, &mut st, up_r, &down_w) {
+                        pass_on_group_sent(&down_w, sig);
+                    } else {
                         pass_on(&down_w, sig);
                     }
-                    // An attached foreground workload receives the terminal's
-                    // signal directly. Detached helpers have already left this
-                    // group, so P is the single route into a new session.
-                    _ if info.ssi_code == SI_KERNEL && job == JobControl::CallerTerminal => {}
-                    _ => pass_on(&down_w, sig),
                 }
+                _ => pass_on(&down_w, sig),
             }
+        }
+        // A report of W's that met no signal of P's is dropped here, so it
+        // cannot be taken for part of a later send.
+        if witness.as_mut().is_some_and(Witness::forget) {
+            witness = None;
         }
         if terminal_failure.is_some() && shutdown.started.is_none() {
             shutdown.request(Instant::now());
@@ -1131,6 +1223,7 @@ fn parent(
         }
     }
     drop(down_w);
+    drop(witness);
     let _ = waitpid(child, None);
     if let Some(tty) = private_tty.take()
         && let Err(e) = tty.stop()
@@ -1229,6 +1322,280 @@ fn stop_command(init: Option<Pid>, child: Pid, down_w: &OwnedFd) {
     }
 }
 
+/// P asks I to pass `sig` on to the command only if the command has left
+/// P's process group: the whole group was sent this signal.
+fn pass_on_group_sent(down_w: &OwnedFd, sig: Signal) {
+    if let Some(b) = signal_byte(sig) {
+        send_byte(down_w, b | GROUP_SENT);
+    }
+}
+
+/// True when the signal P just read was sent to P's whole process group,
+/// so the kernel has given every member its own copy.
+///
+/// That is when W received it too and I, outside the group, did not. A
+/// sender that picks playpen's processes one by one (`killall playpen`)
+/// reaches I as well, and the command not at all: P passes that on.
+fn group_sent(
+    sig: Signal,
+    witness: &mut Option<Witness>,
+    st: &mut ParentState,
+    up_r: &OwnedFd,
+    down_w: &OwnedFd,
+) -> bool {
+    let Some(at) = signal_byte(sig).and_then(byte_index) else {
+        return false;
+    };
+    let Some(w) = witness.as_mut() else {
+        return false;
+    };
+    if !w.saw(at) {
+        return false;
+    }
+    let fresh =
+        |st: &ParentState| st.outside[at].is_some_and(|read| read.elapsed() < CONTROL_WINDOW);
+    if fresh(st) {
+        return false;
+    }
+    // I may hold a report it has not written yet.
+    send_byte(down_w, SYNC);
+    st.asked += 1;
+    let deadline = Instant::now() + SYNC_LIMIT;
+    while st.synced < st.asked {
+        if st.eof || !wait_readable(up_r, deadline) {
+            return false;
+        }
+        st.pump(up_r);
+    }
+    !fresh(st)
+}
+
+// ---------------------------------------------------------------- W ----
+
+/// P's side of W, the witness for signals sent to P's whole process group.
+///
+/// `kill(-pgid)` gives each member of the group a copy, and nothing in a
+/// copy says whether it was sent to the group or to one process. When the
+/// command shares P's group (an attached terminal job), P has to know:
+/// passing a group's signal on gives the command a second copy, not
+/// passing on a signal sent to P alone loses it.
+///
+/// W is a child of P that stays in P's group and does nothing but report
+/// the signals it receives. I leaves the group once the command is forked.
+/// A signal P receives is then
+///
+/// - for P alone when W did not receive it: passed on;
+/// - for the group when W received it and I did not: the command has its
+///   copy (I passes it on all the same if the command left the group);
+/// - for playpen's processes one by one when W and I both received it, as
+///   `killall playpen` or `kill $(pidof playpen)` send it: passed on. W and
+///   I look the same to such a sender (same name, same command line,
+///   neither dumpable); only the process group tells them apart.
+///
+/// W is forked after I, so its PID is the higher one. A sender that walks
+/// `/proc` reaches I before W in ascending order and P last in descending
+/// order; either way I's copy exists by the time P has W's report and its
+/// own signal. What is left is a sender that signals P and W, by PID, and
+/// not I: that signal is taken for a group's and not passed on.
+struct Witness {
+    pid: Pid,
+    /// Write end: one [`SYNC`] per question. Closing it ends W.
+    ask: Option<OwnedFd>,
+    /// Read end, non-blocking: a [`signal_byte`] per signal W received,
+    /// [`SYNCED`] per question.
+    answers: OwnedFd,
+    asked: u64,
+    answered: u64,
+    /// Reports read in this turn of P's loop, by place in [`FORWARDED`].
+    seen: [bool; FORWARDED.len()],
+    lost: bool,
+}
+
+impl Witness {
+    /// Forks W. `None` when it cannot be had; P then passes on every
+    /// signal, as it does for a job without a witness.
+    fn start(init: Pid) -> Option<Self> {
+        let (ask_r, ask_w) = pipe2(OFlag::O_CLOEXEC).ok()?;
+        let (answers_r, answers_w) = pipe2(OFlag::O_CLOEXEC).ok()?;
+        fcntl(answers_r.as_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).ok()?;
+        let parent = getpid();
+        match fork_checked().ok()? {
+            ForkResult::Child => witness_main(parent, &ask_r, &answers_w),
+            ForkResult::Parent { child } => {
+                let witness = Self {
+                    pid: child,
+                    ask: Some(ask_w),
+                    answers: answers_r,
+                    asked: 0,
+                    answered: 0,
+                    seen: [false; FORWARDED.len()],
+                    lost: false,
+                };
+                // PIDs wrapped around between the two forks: the order
+                // the type relies on does not hold.
+                (child > init).then_some(witness)
+            }
+        }
+    }
+
+    /// Reads what W has written.
+    fn absorb(&mut self) {
+        let mut buf = [0u8; 64];
+        loop {
+            match read(&self.answers, &mut buf) {
+                Ok(0) => self.lost = true,
+                Ok(n) => {
+                    for &b in &buf[..n] {
+                        if b == SYNCED {
+                            self.answered += 1;
+                        } else if let Some(at) = byte_index(b) {
+                            self.seen[at] = true;
+                        }
+                    }
+                    continue;
+                }
+                Err(Errno::EINTR) => continue,
+                Err(Errno::EAGAIN) => {}
+                Err(_) => self.lost = true,
+            }
+            return;
+        }
+    }
+
+    /// True when W received the signal at `at` in [`FORWARDED`] no later
+    /// than now. Uses the report up.
+    fn saw(&mut self, at: usize) -> bool {
+        self.absorb();
+        if !self.seen[at] {
+            self.sync();
+        }
+        std::mem::take(&mut self.seen[at])
+    }
+
+    /// Has W report every signal it has received so far.
+    fn sync(&mut self) {
+        let sent = self.ask.as_ref().is_some_and(|ask| {
+            loop {
+                match nix::unistd::write(ask, &[SYNC]) {
+                    Err(Errno::EINTR) => {}
+                    wrote => return wrote == Ok(1),
+                }
+            }
+        });
+        if !sent {
+            self.lost = true;
+        }
+        self.asked += 1;
+        let deadline = Instant::now() + SYNC_LIMIT;
+        while self.answered < self.asked && !self.lost {
+            if wait_readable(&self.answers, deadline) {
+                self.absorb();
+            } else {
+                self.lost = true;
+            }
+        }
+    }
+
+    /// Drops the reports left over. True when W is of no use any more.
+    const fn forget(&mut self) -> bool {
+        self.seen = [false; FORWARDED.len()];
+        self.lost
+    }
+}
+
+impl Drop for Witness {
+    fn drop(&mut self) {
+        self.ask.take();
+        let _ = kill(self.pid, Signal::SIGKILL);
+        while waitpid(self.pid, None) == Err(Errno::EINTR) {}
+    }
+}
+
+/// W. Never returns into P's code: this process is a copy of P and must
+/// not run its destructors (one of them stops pasta) or flush its buffers.
+fn witness_main(parent: Pid, ask: &OwnedFd, answers: &OwnedFd) -> ! {
+    let code = i32::from(witness_loop(parent, ask, answers).is_err());
+    // SAFETY: `_exit` takes no pointers and only ends this process.
+    unsafe { libc::_exit(code) }
+}
+
+fn witness_loop(parent: Pid, ask: &OwnedFd, answers: &OwnedFd) -> Result<(), String> {
+    die_with_parent(parent)?;
+    // As I is: a sender that selects by executable must find both or neither.
+    prctl::set_dumpable(false).map_err(|e| format!("PR_SET_DUMPABLE: {e}"))?;
+    // P's descriptors, among them the pipe whose closing tells I that P
+    // is gone, and the caller's standard streams.
+    close_fds_except(&[ask.as_raw_fd(), answers.as_raw_fd()])?;
+    let mut set = SigSet::empty();
+    for s in FORWARDED {
+        set.add(s);
+    }
+    // Blocked already: the mask is P's.
+    let sigfd = SignalFd::with_flags(&set, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)
+        .map_err(|e| format!("cannot create signalfd: {e}"))?;
+    loop {
+        let mut fds = [
+            PollFd::new(sigfd.as_fd(), PollFlags::POLLIN),
+            PollFd::new(ask.as_fd(), PollFlags::POLLIN),
+        ];
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(_) | Err(Errno::EINTR) => {}
+            Err(e) => return Err(format!("poll failed: {e}")),
+        }
+        let mut questions = 0;
+        if fds[1].revents().is_some_and(|r| !r.is_empty()) {
+            let mut b = [0u8; 16];
+            match read(ask, &mut b) {
+                Ok(0) => return Ok(()),
+                Ok(n) => questions = n,
+                Err(Errno::EINTR) => {}
+                Err(e) => return Err(format!("read failed: {e}")),
+            }
+        }
+        // After the question, so the answer covers every signal sent
+        // before P asked.
+        let mut out = Vec::new();
+        while let Ok(Some(info)) = sigfd.read_signal() {
+            let sig = i32::try_from(info.ssi_signo)
+                .ok()
+                .and_then(|n| Signal::try_from(n).ok());
+            if info.ssi_code == SI_USER
+                && let Some(b) = sig.and_then(signal_byte)
+            {
+                out.push(b);
+            }
+        }
+        out.resize(out.len() + questions, SYNCED);
+        let mut rest = &out[..];
+        while !rest.is_empty() {
+            match nix::unistd::write(answers, rest) {
+                Ok(n) => rest = &rest[n..],
+                Err(Errno::EINTR) => {}
+                Err(e) => return Err(format!("write failed: {e}")),
+            }
+        }
+    }
+}
+
+/// Closes every descriptor of this process but `keep`.
+fn close_fds_except(keep: &[RawFd]) -> Result<(), String> {
+    let entries =
+        fs::read_dir("/proc/self/fd").map_err(|e| format!("cannot list /proc/self/fd: {e}"))?;
+    let fds: Vec<RawFd> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok()))
+        .filter(|fd| !keep.contains(fd))
+        .collect();
+    for fd in fds {
+        // SAFETY: only called in W, which never again uses, or drops, any
+        // of the objects it inherited that own these descriptors: it ends
+        // with `_exit`. The listing's own descriptor is closed already;
+        // closing its number again fails with EBADF.
+        unsafe { libc::close(fd) };
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- C ----
 
 fn die_with_parent(parent: Pid) -> Result<(), String> {
@@ -1284,6 +1651,14 @@ fn stage_c(
         Ok(1) if go[0] == GO => {}
         _ => exit_now(0),
     }
+    // pasta is attached and has configured the namespace.
+    if plan.network {
+        let own = own_approved_addresses(plan);
+        if !own.is_empty() {
+            let list: Vec<String> = own.iter().map(ToString::to_string).collect();
+            write_line(up_w, &format!("own {}", list.join(" ")));
+        }
+    }
     // This process holds every capability over the network namespace. It
     // stayed dumpable only so pasta (same user, outside) could open its
     // /proc/PID/ns entries; pasta is attached now and no command exists
@@ -1308,6 +1683,37 @@ fn stage_c(
     }
     report_counters(&plan.nft, grant_counters, up_w);
     Ok(())
+}
+
+/// The addresses approved on their own that belong to an interface of this
+/// network namespace.
+///
+/// pasta gives the sandbox the addresses of the host's interface it copies,
+/// so a destination that is one of them is local here: a connection to it
+/// never reaches pasta, and so never the host. Addresses playpen itself put
+/// on `lo` (`--lo-addr`) are meant to be local and are left out.
+fn own_approved_addresses(plan: &Plan) -> Vec<IpAddr> {
+    let Ok(interfaces) = nix::ifaddrs::getifaddrs() else {
+        return Vec::new();
+    };
+    let mut own: Vec<IpAddr> = interfaces
+        .filter_map(|interface| {
+            let address = interface.address?;
+            address
+                .as_sockaddr_in()
+                .map(|v4| IpAddr::V4(v4.ip()))
+                .or_else(|| address.as_sockaddr_in6().map(|v6| IpAddr::V6(v6.ip())))
+        })
+        .filter(|ip| !plan.lo_addrs.contains(ip))
+        .filter(|ip| {
+            let alone =
+                |rule: &crate::approval::AllowRule| rule.net.is_single() && rule.net.addr() == *ip;
+            plan.approval.rules().iter().any(alone)
+        })
+        .collect();
+    own.sort_unstable();
+    own.dedup();
+    own
 }
 
 fn nft_command(nft: &Path) -> Command {
@@ -1544,6 +1950,17 @@ fn stage_i(
         }
         ForkResult::Parent { child } => child,
     };
+    // The command shares the caller's process group, which it got from I.
+    // I leaves it now, so that a signal for the whole group reaches the
+    // command and not I; P's witness relies on that (see `Witness`). From
+    // inside, that group has no number: both read 0 here. If I cannot
+    // leave, P takes every signal for one sent to playpen's processes one
+    // by one and passes it on.
+    let shared_group = (job == JobControl::CallerTerminal).then(|| {
+        let group = getpgrp();
+        let _ = make_process_group();
+        group
+    });
     drop(err_w);
     let mut msg = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -1563,7 +1980,7 @@ fn stage_i(
         return Err(String::from_utf8_lossy(&msg).trim().to_owned());
     }
     write_line(up_w, "started");
-    match init_loop(child, job, private_fds, &sigfd, up_w, down_r) {
+    match init_loop(child, job, shared_group, private_fds, &sigfd, up_w, down_r) {
         Ok(code) => Ok(code),
         Err(msg) => {
             write_line(up_w, &format!("statuserr {msg}"));
@@ -1577,10 +1994,18 @@ fn stage_i(
 /// the command ended.
 ///
 /// PID 1 also accepts signals sent to it by processes in its own PID
-/// namespace. Signals from outside the namespace use P's control pipe.
+/// namespace. Signals from outside the namespace use P's control pipe;
+/// with `shared_group` (the group the command was started in, which I has
+/// left) I tells P of the ones it receives all the same, because they show
+/// that a sender reached playpen's processes one by one.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one event loop; splitting it would scatter its state"
+)]
 fn init_loop(
     child: Pid,
     job: JobControl,
+    shared_group: Option<Pid>,
     private_fds: Option<PrivateTtyFds>,
     sigfd: &SignalFd,
     up_w: &OwnedFd,
@@ -1615,6 +2040,7 @@ fn init_loop(
             Err(e) => return Err(format!("poll failed: {e}")),
         }
         let from_p = fds[1].revents().is_some_and(|r| !r.is_empty());
+        let mut syncs = 0;
         if from_p {
             let mut b = [0u8; 16];
             match read(down_r, &mut b) {
@@ -1639,6 +2065,7 @@ fn init_loop(
                     }
                     for &byte in &b[..n] {
                         match byte {
+                            SYNC => syncs += 1,
                             FREEZE => {
                                 asked = true;
                                 freeze(&mut frozen);
@@ -1662,6 +2089,13 @@ fn init_loop(
                             _ => {
                                 if let Some(sig) = byte_signal(byte) {
                                     job.forward(child, sig, private_fds);
+                                } else if let Some(sig) = byte_group_signal(byte)
+                                    && nix::unistd::getpgid(Some(child)).ok() != shared_group
+                                {
+                                    // The group was sent this signal, and
+                                    // the command is not in it any more
+                                    // (a shell with job control).
+                                    job.forward(child, sig, private_fds);
                                 }
                             }
                         }
@@ -1680,24 +2114,40 @@ fn init_loop(
             }
             freeze(&mut frozen);
         }
-        let info = match sigfd.read_signal() {
-            Ok(Some(info)) => info,
-            Ok(None) | Err(Errno::EINTR | Errno::EAGAIN) => continue,
-            Err(e) => return Err(format!("signalfd read failed: {e}")),
-        };
-        let Ok(sig) = Signal::try_from(i32::try_from(info.ssi_signo).unwrap_or(0)) else {
-            continue;
-        };
-        if sig != Signal::SIGCHLD {
-            // Job-control signals are P's business (freeze and thaw).
-            // A sender outside this PID namespace shows as pid 0.
-            if FORWARDED.contains(&sig) && info.ssi_code != SI_KERNEL && info.ssi_pid > 1 {
-                job.forward(child, sig, private_fds);
+        // Every signal there is, so that the answer to P's SYNC covers
+        // all that were sent before P asked.
+        loop {
+            let info = match sigfd.read_signal() {
+                Ok(Some(info)) => info,
+                Ok(None) | Err(Errno::EINTR | Errno::EAGAIN) => break,
+                Err(e) => return Err(format!("signalfd read failed: {e}")),
+            };
+            let Ok(sig) = Signal::try_from(i32::try_from(info.ssi_signo).unwrap_or(0)) else {
+                continue;
+            };
+            if sig == Signal::SIGCHLD {
+                if reap(child, up_w) {
+                    return Ok(0);
+                }
+                continue;
             }
-            continue;
+            // Job-control signals are P's business (freeze and thaw).
+            if !FORWARDED.contains(&sig) || info.ssi_code == SI_KERNEL {
+                continue;
+            }
+            // A sender outside this PID namespace shows as pid 0.
+            if info.ssi_pid > 1 {
+                job.forward(child, sig, private_fds);
+            } else if shared_group.is_some()
+                && info.ssi_code == SI_USER
+                && info.ssi_pid == 0
+                && let Some(b) = signal_byte(sig)
+            {
+                write_line(up_w, &format!("outside {b}"));
+            }
         }
-        if reap(child, up_w) {
-            return Ok(0);
+        for _ in 0..syncs {
+            write_line(up_w, "synced");
         }
     }
 }
@@ -2377,11 +2827,32 @@ mod tests {
         for sig in FORWARDED {
             let b = signal_byte(sig);
             assert_eq!(b.and_then(byte_signal), Some(sig));
-            assert!(b.is_some_and(|b| ![FREEZE, THAW, GO, PRIVATE_TSTP].contains(&b)));
+            let group = b.map(|b| b | GROUP_SENT);
+            assert_eq!(group.and_then(byte_group_signal), Some(sig));
+            assert_eq!(group.and_then(byte_signal), None);
+            assert_eq!(b.and_then(byte_group_signal), None);
+            for b in [b, group] {
+                let others = [FREEZE, THAW, GO, BEAT, PRIVATE_TSTP, SYNC, SYNCED];
+                assert!(b.is_some_and(|b| !others.contains(&b)));
+            }
         }
         assert_eq!(signal_byte(Signal::SIGKILL), None);
-        for b in [0, 8, FREEZE, THAW, GO, PRIVATE_TSTP] {
+        for b in [
+            0,
+            8,
+            GROUP_SENT,
+            GROUP_SENT | 8,
+            FREEZE,
+            THAW,
+            GO,
+            BEAT,
+            PRIVATE_TSTP,
+            SYNC,
+            SYNCED,
+        ] {
             assert_eq!(byte_signal(b), None);
+            assert_eq!(byte_group_signal(b), None);
+            assert_eq!(byte_index(b), None);
         }
     }
 
@@ -2399,7 +2870,25 @@ mod tests {
             grant_packets: Vec::new(),
             ready: false,
             eof: false,
+            own: Vec::new(),
+            asked: 0,
+            synced: 0,
+            outside: [None; FORWARDED.len()],
         };
+        st.handle_line("own 192.0.2.10 2001:db8::10 nonsense");
+        let own: Vec<IpAddr> = ["192.0.2.10", "2001:db8::10"]
+            .iter()
+            .filter_map(|a| a.parse().ok())
+            .collect();
+        assert_eq!(st.own, own);
+        st.handle_line("synced");
+        st.handle_line("outside 5");
+        st.handle_line("outside 8");
+        st.handle_line("outside usr1");
+        assert_eq!(st.synced, 1);
+        let reported: Vec<bool> = st.outside.iter().map(Option::is_some).collect();
+        assert_eq!(reported, [false, false, false, false, true, false, false]);
+        assert_eq!(FORWARDED[4], Signal::SIGUSR1);
         st.handle_line("ready");
         st.handle_line("init 4321");
         st.handle_line("started");

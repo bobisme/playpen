@@ -676,12 +676,17 @@ fn redirected_workload_can_use_its_controlling_terminal() {
 }
 
 #[test]
-fn attached_pid_and_new_session_group_signals_have_one_delivery() {
+fn attached_and_new_session_pid_and_group_signals_have_one_delivery() {
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
 
     require_pty!(t);
-    for (option, whole_group) in [("", false), ("--new-session", true)] {
+    for (option, whole_group) in [
+        ("--new-session", false),
+        ("--new-session", true),
+        ("", false),
+        ("", true),
+    ] {
         t.send(&format!(
             "$P run --no-network {option} -- $P probe signals\n"
         ));
@@ -694,12 +699,147 @@ fn attached_pid_and_new_session_group_signals_have_one_delivery() {
             kill(target, Signal::SIGUSR1).expect("signal the foreground test job");
             t.expect("usr1");
             let late = t.quiet_for(Duration::from_millis(200));
-            assert!(!late.contains("usr1"), "duplicate receipt: {late:?}");
+            assert!(
+                !late.contains("usr1"),
+                "duplicate receipt for option={option:?}, whole_group={whole_group}: {late:?}"
+            );
         }
         kill(Pid::from_raw(pgid), Signal::SIGTERM).expect("finish the counter");
         t.expect(r#"{"usr1":4}"#);
         assert_eq!(t.status(), "0");
     }
+}
+
+/// The processes named `playpen` in this session, as (PID, process group),
+/// in ascending PID order: the supervisor first.
+fn playpen_processes(session: u32) -> Vec<(i32, i32)> {
+    let mut found: Vec<(i32, i32)> = std::fs::read_dir("/proc")
+        .expect("list /proc")
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let (head, tail) = stat.rsplit_once(") ")?;
+            let mut fields = tail.split(' ');
+            // After the name: state, parent, process group, session.
+            let group: i32 = fields.nth(2)?.parse().ok()?;
+            let in_session = fields.next()?.parse() == Ok(session);
+            (in_session && head.split_once('(')?.1 == "playpen").then_some((pid, group))
+        })
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+/// A link to the binary under another name, so that a sender choosing
+/// processes named `playpen` does not choose the workload.
+fn renamed_probe(tag: &str) -> std::path::PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("directory for the renamed probe");
+    let link = dir.join("sigcount");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(BIN, &link).expect("link the probe");
+    link
+}
+
+/// `killall playpen` reaches every playpen process and not the command, in
+/// ascending PID order; `kill $(pidof playpen)` in descending order. Both
+/// include the witness in the supervisor's process group, and neither is a
+/// signal for the group: the command gets it from playpen, once.
+#[test]
+fn attached_signal_for_each_playpen_process_has_one_delivery() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    require_pty!(t);
+    let probe = renamed_probe("each-playpen");
+    for descending in [false, true] {
+        t.send(&format!(
+            "$P run --no-network -- {} probe signals\n",
+            probe.display()
+        ));
+        t.expect("ready");
+        let mut helpers = playpen_processes(t.child.id());
+        // P, C, S, I and the witness; the last two after the others.
+        assert_eq!(helpers.len(), 5, "playpen processes: {helpers:?}");
+        let supervisor = helpers[0].0;
+        let in_group = helpers.iter().filter(|h| h.1 == helpers[0].1).count();
+        assert_eq!(in_group, 4, "init leaves the group: {helpers:?}");
+        if descending {
+            helpers.reverse();
+        }
+        for _ in 0..4 {
+            for &(pid, _) in &helpers {
+                kill(Pid::from_raw(pid), Signal::SIGUSR1).expect("signal a playpen process");
+            }
+            t.expect("usr1");
+            let late = t.quiet_for(Duration::from_millis(200));
+            assert!(
+                !late.contains("usr1"),
+                "duplicate receipt, descending={descending}: {late:?}"
+            );
+        }
+        kill(Pid::from_raw(supervisor), Signal::SIGTERM).expect("finish the counter");
+        t.expect(r#"{"usr1":4}"#);
+        assert_eq!(t.status(), "0");
+    }
+    let _ = std::fs::remove_dir_all(probe.parent().expect("probe directory"));
+}
+
+/// A shell with job control inside puts itself in a process group of its
+/// own. A signal for playpen's group then reaches the witness and not the
+/// shell, so playpen still has to pass it on.
+#[test]
+fn attached_group_signal_reaches_a_shell_that_left_the_group() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    if playpen::sandbox::tiocsti_allowed() {
+        eprintln!("SKIPPED: automatic new-session mode has no nested job control");
+        return;
+    }
+    require_pty!(t);
+    t.send("$P run --no-network -- bash --norc --noprofile -i\n");
+    t.expect("host Unix sockets");
+    t.expect("$ ");
+    t.send("trap 'echo got-us\"\"r1' USR1\n");
+    t.expect("$ ");
+    let group = playpen_processes(t.child.id())[0].1;
+    // SAFETY: master is the live master fd for this test's private PTY.
+    let foreground = unsafe { libc::tcgetpgrp(t.master.as_raw_fd()) };
+    assert_ne!(foreground, group, "the inner shell took the terminal");
+    for _ in 0..3 {
+        kill(Pid::from_raw(-group), Signal::SIGUSR1).expect("signal playpen's group");
+        // bash runs the trap when it next reads a line.
+        t.read_for(Duration::from_millis(150));
+        t.send("\n");
+        t.expect("got-usr1");
+        let late = t.quiet_for(Duration::from_millis(200));
+        assert!(!late.contains("got-usr1"), "duplicate receipt: {late:?}");
+    }
+    t.send("exit\n");
+    t.expect("command exited with status 0");
+    assert_eq!(t.status(), "0");
+}
+
+/// `kill 0` inside reaches the command's whole process group, which is the
+/// caller's: the command, playpen and its witness. Init is not in it, and
+/// playpen sees a signal for the group; neither passes it on.
+#[test]
+fn attached_group_signal_from_inside_has_one_delivery() {
+    require_pty!(t);
+    t.send(concat!(
+        "$P run --no-network -- sh -c '(trap \"\" USR1; sleep 0.5; kill -USR1 0; sleep 0.5; ",
+        "kill -USR1 0; sleep 0.5; kill -TERM 0) & exec \"$0\" probe signals' $P\n"
+    ));
+    t.expect("ready");
+    for _ in 0..2 {
+        t.expect("usr1");
+        let late = t.quiet_for(Duration::from_millis(200));
+        assert!(!late.contains("usr1"), "duplicate receipt: {late:?}");
+    }
+    t.expect(r#"{"usr1":2}"#);
+    assert_eq!(t.status(), "0");
 }
 
 #[test]

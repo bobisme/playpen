@@ -700,6 +700,18 @@ impl Events for StderrEvents<'_> {
             sandbox::GRACE.as_secs()
         );
     }
+    fn own_addresses(&mut self, addresses: &[std::net::IpAddr]) {
+        let list: Vec<String> = addresses.iter().map(ToString::to_string).collect();
+        let (verb, it) = if list.len() == 1 {
+            ("is", "it")
+        } else {
+            ("are", "them")
+        };
+        eprintln!(
+            "playpen: NOTE: {} {verb} approved, but the sandbox has the same address on its own interface (it gets this host's addresses), so connections to {it} stay inside the sandbox and do not reach this host. A service on this host is reachable only at an address the sandbox does not have (docs/DESIGN.md, \"The host's own addresses\")",
+            list.join(", ")
+        );
+    }
     fn pass_edited(&mut self, message: &str) {
         eprintln!("playpen: {message}");
     }

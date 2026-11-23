@@ -92,6 +92,10 @@ ip -6 addr add 2001:db8::10/64 dev dummy0 nodad
 ip link set dummy0 up
 ip route add default via 192.0.2.1
 ip -6 route add default via 2001:db8::1 dev dummy0
+# A second address of the fake host, on an interface pasta does not copy.
+ip link add fixture0 type dummy
+ip addr add 198.51.100.7/32 dev fixture0
+ip link set fixture0 up
 "$BIN" probe listen "0.0.0.0:$PORT/tcp" --ms 20000 >"$LOG" &
 L=$!
 "$BIN" probe listen "[::]:$PORT6/tcp" --ms 20000 >"$LOG.v6" &
@@ -107,10 +111,12 @@ kill $L $L6
 exit $rc
 "#;
 
-/// Inside the sandbox: show pasta's configuration, then try the gateway.
+/// Inside the sandbox: show pasta's configuration, then try the targets.
 const INNER: &str = r#"#!/bin/sh
 cat /proc/net/route /proc/net/ipv6_route
-exec "$1" probe reach --try "192.0.2.1:$2/tcp" --try "[2001:db8::1]:$3/tcp"
+bin="$1"; shift
+for target do shift; set -- "$@" --try "$target"; done
+exec "$bin" probe reach "$@"
 "#;
 
 /// A pasta that drops `--map-host-loopback none`, as if playpen forgot it.
@@ -135,9 +141,23 @@ struct Outcome {
 }
 
 fn run_in_fake_host(name: &str, allow: &[&str], pasta: Option<&Path>) -> Outcome {
+    let gw4 = format!("192.0.2.1:{PORT}/tcp");
+    let gw6 = format!("[2001:db8::1]:{PORT6}/tcp");
+    run_in_fake_host_trying(name, allow, pasta, &[&gw4, &gw6])
+}
+
+/// Runs playpen in the fake host with `allow` approved and has the probe
+/// inside try each of `targets`.
+fn run_in_fake_host_trying(
+    name: &str,
+    allow: &[&str],
+    pasta: Option<&Path>,
+    targets: &[&str],
+) -> Outcome {
     let dir = tmpdir();
-    let outer = write_script(&dir, "outer.sh", OUTER);
-    let inner = write_script(&dir, "inner.sh", INNER);
+    // Per run: the tests in this file run at the same time.
+    let outer = write_script(&dir, &format!("{name}-outer.sh"), OUTER);
+    let inner = write_script(&dir, &format!("{name}-inner.sh"), INNER);
     let log = dir.join(format!("{name}.listener"));
     let rep = dir.join(format!("{name}.report.json"));
     let _ = std::fs::remove_file(&rep);
@@ -157,7 +177,8 @@ fn run_in_fake_host(name: &str, allow: &[&str], pasta: Option<&Path>) -> Outcome
         .arg(&rep)
         .args(["--", "sh"])
         .arg(&inner)
-        .args([BIN, PORT, PORT6]);
+        .arg(BIN)
+        .args(targets);
     if let Some(p) = pasta {
         cmd.env("PLAYPEN_PASTA", p);
     }
@@ -274,4 +295,50 @@ fn the_gateway_is_not_the_host_loopback() {
             o.report
         );
     }
+}
+
+/// A service on the host is reachable from the sandbox at an address the
+/// sandbox does not have, and not at the one pasta copies into it: that
+/// address is the sandbox's own, the connection stays inside, and playpen
+/// says so. The first is the way to test against a local service with the
+/// filter on.
+#[test]
+fn a_host_service_is_reached_at_an_address_the_sandbox_does_not_have() {
+    if let Some(why) = skip_reason() {
+        eprintln!("SKIPPED: {why}");
+        return;
+    }
+    // The fake host's listener is on its wildcard address, so it answers
+    // for both of the fake host's addresses.
+    let other = format!("198.51.100.7:{PORT}/tcp");
+    let o = run_in_fake_host_trying("other-address", &[&other], None, &[&other]);
+    assert!(reached(&o, &other), "{} {}", o.inside, o.stderr);
+    assert!(
+        o.listener.contains("accepted\":\""),
+        "the fake host's listener got no connection: {}",
+        o.listener
+    );
+    assert!(!o.stderr.contains("NOTE"), "{}", o.stderr);
+    assert_eq!(o.report["dropped"]["packets"], 0, "{}", o.report);
+
+    let copied = format!("192.0.2.10:{PORT}/tcp");
+    let o = run_in_fake_host_trying("copied-address", &[&copied], None, &[&copied]);
+    assert!(!reached(&o, &copied), "{} {}", o.inside, o.stderr);
+    assert!(o.inside.contains("Connection refused"), "{}", o.inside);
+    assert!(
+        o.listener.contains("listening") && !o.listener.contains("accepted\":\""),
+        "the fake host's listener got a connection: {}",
+        o.listener
+    );
+    assert!(
+        o.stderr
+            .contains("NOTE: 192.0.2.10 is approved, but the sandbox has the same address"),
+        "{}",
+        o.stderr
+    );
+
+    // A network that merely contains the copied address is no mistake.
+    let network = format!("192.0.2.0/24:{PORT}/tcp");
+    let o = run_in_fake_host_trying("network", &[&network], None, &[&copied]);
+    assert!(!o.stderr.contains("NOTE"), "{}", o.stderr);
 }
