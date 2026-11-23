@@ -475,6 +475,52 @@ fn run_cmd_then(
     (out, started.elapsed(), report(&rep))
 }
 
+/// playpen stopped (SIGSTOP) from before the pass's end until after it:
+/// when it continues, the end time and the pass's expiry are both due. The
+/// end time wins, as for an expiry playpen saw on time.
+#[test]
+fn a_pass_that_expired_while_playpen_was_stopped_is_stopped_by_until() {
+    require_sandbox!();
+    let dir = tmpdir("sigstop-expiry");
+    let pass = new_pass(
+        &dir,
+        &pass_text(&hours(-1), &secs_from_now(5), false, &[WEB]),
+    );
+    let rep = dir.join("report.json");
+    let child = spawn(&[
+        "run",
+        "--pass",
+        s(&pass),
+        "--pass-recheck-ms",
+        RECHECK_MS,
+        "--report",
+        s(&rep),
+        "--",
+        "sleep",
+        "30",
+    ]);
+    let pid = child.id().to_string();
+    let signal = |sig: &str| {
+        let st = Command::new("kill").args([sig, &pid]).status();
+        assert!(st.is_ok_and(|s| s.success()), "kill {sig}");
+    };
+    // Stopped about 3 s before the end, continued about 1.5 s after it: less
+    // than the 5 s of silence after which the sandbox's init freezes the
+    // command.
+    std::thread::sleep(Duration::from_secs(2));
+    signal("-STOP");
+    std::thread::sleep(Duration::from_millis(4500));
+    signal("-CONT");
+    let out = child.wait_with_output().unwrap_or_else(|e| panic!("{e}"));
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 15), "{err}");
+    let json = report(&rep);
+    assert_eq!(json["stopped_by_until"], true, "{err}\n{json}");
+    assert_eq!(json["stopped_by_pass"], false, "{err}\n{json}");
+    assert!(err.contains("the approval ended at"), "{err}");
+    assert!(!err.contains("no longer permits"), "{err}");
+}
+
 #[test]
 fn revoking_the_pass_stops_the_command() {
     require_sandbox!();

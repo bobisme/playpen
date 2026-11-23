@@ -78,3 +78,29 @@ fn events_separate_child_status_and_survive_a_full_pipe() {
     assert_eq!(full.stdout, b"child");
     assert_eq!(full.status.code(), Some(2));
 }
+
+#[test]
+fn a_regular_file_is_refused_with_the_workaround() {
+    let path = std::env::temp_dir().join(format!("playpen-events-{}.jsonl", std::process::id()));
+    let file = File::create(&path).expect("file");
+    let raw = file.as_raw_fd();
+    let mut cmd = Command::new(BIN);
+    cmd.args(["run", "--events-fd", "42", "--no-network", "--", "true"]);
+    // SAFETY: dup2 and fcntl are async-signal-safe. file remains live until spawn.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(raw, 42) < 0 || libc::fcntl(42, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().expect("CLI");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("requires the write end of a pipe"), "{err}");
+    assert!(err.contains("42> >(cat > events.jsonl)"), "{err}");
+    assert!(err.contains("nothing was run"), "{err}");
+    assert_eq!(std::fs::metadata(&path).expect("stat").len(), 0);
+    let _ = std::fs::remove_file(&path);
+}

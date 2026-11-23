@@ -41,7 +41,9 @@ impl EventPipe {
             .is_fifo()
             || flags & OFlag::O_ACCMODE != OFlag::O_WRONLY
         {
-            return Err("--events-fd requires the write end of a pipe".into());
+            return Err(format!(
+                "--events-fd requires the write end of a pipe; to write the records to a file, give it a pipe to cat: {fd}> >(cat > events.jsonl)"
+            ));
         }
         fcntl(&file, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|e| e.to_string())?;
         fcntl(&file, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map_err(|e| e.to_string())?;

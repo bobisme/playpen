@@ -1333,6 +1333,21 @@ fn parent(
             next_beat = now + BEAT_INTERVAL;
         }
         let mut wake = next_beat;
+        // The end time is checked before the pass is read again: when both
+        // are due (playpen was stopped across the end), the end time wins.
+        if let Some(d) = deadline
+            && shutdown.started.is_none()
+        {
+            if d.passed(now, time::OffsetDateTime::now_utc()) {
+                // The time rule refuses this traffic from the end second on;
+                // the cut also covers a monotonic deadline that comes first.
+                let cut = cut_egress(&mut st, up_r, &control_w);
+                events.until_reached(&cut);
+                stop_after_cut(&cut, st.init, child, &down_w, &mut shutdown);
+            } else {
+                wake = wake.min(d.monotonic);
+            }
+        }
         if let (Some(w), Some(due)) = (watch.as_mut(), next_recheck)
             && shutdown.started.is_none()
         {
@@ -1352,19 +1367,6 @@ fn parent(
             }
             if let Some(due) = next_recheck {
                 wake = wake.min(due);
-            }
-        }
-        if let Some(d) = deadline
-            && shutdown.started.is_none()
-        {
-            if d.passed(now, time::OffsetDateTime::now_utc()) {
-                // The time rule refuses this traffic from the end second on;
-                // the cut also covers a monotonic deadline that comes first.
-                let cut = cut_egress(&mut st, up_r, &control_w);
-                events.until_reached(&cut);
-                stop_after_cut(&cut, st.init, child, &down_w, &mut shutdown);
-            } else {
-                wake = wake.min(d.monotonic);
             }
         }
         if shutdown.take_kill(now) {

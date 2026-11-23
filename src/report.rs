@@ -308,6 +308,7 @@ pub fn text_summary(r: &Report) -> String {
         (None, None) => {}
     }
     egress_cut_summary(&mut out, r);
+    fail_on_drop_summary(&mut out, r);
     if let Some(n) = r.refused_after_end
         && (n > 0 || r.stopped_by_until || r.stopped_by_pass)
     {
@@ -352,6 +353,31 @@ fn contacts_summary(out: &mut String, r: &Report) {
         }
         (None, None) => {}
     }
+}
+
+/// The line that says why playpen exits 1 under `--fail-on-drop` although
+/// the command exited 0.
+fn fail_on_drop_summary(out: &mut String, r: &Report) {
+    if r.exit_code != Some(0) || r.playpen_exit_status != 1 {
+        return;
+    }
+    let why = match (&r.drop_assertion, &r.dropped) {
+        (Some(DropAssertion::Violated), Some(d)) => format!(
+            "{} packet(s) to unapproved destinations were dropped",
+            d.packets
+        ),
+        (Some(DropAssertion::Violated | DropAssertion::Unknown), _) => {
+            "the drop counters were unknown or unreadable, or inconsistent".to_owned()
+        }
+        (Some(DropAssertion::Pass), _) if r.stopped_by_until || r.stopped_by_pass => {
+            "playpen stopped the command".to_owned()
+        }
+        _ => return,
+    };
+    let _ = writeln!(
+        out,
+        "playpen: exiting with status 1: --fail-on-drop and {why}"
+    );
 }
 
 /// The line for a cut that a dropped packet tripped (`--on-drop`).
@@ -680,6 +706,47 @@ mod tests {
         assert_eq!(r.exit_code, Some(0));
         assert_eq!(crate::cli::apply_drop_assertion(&mut r, 2, true), 2);
         assert_eq!(crate::cli::apply_drop_assertion(&mut r, 0, false), 0);
+    }
+
+    #[test]
+    fn fail_on_drop_says_why_it_exits_1() {
+        let line = |t: &str| {
+            t.lines()
+                .find(|l| l.contains("exiting with status"))
+                .map(str::to_owned)
+        };
+        let mut r = base();
+        r.exit_code = Some(0);
+        r.playpen_exit_status = crate::cli::apply_drop_assertion(&mut r, 0, true);
+        assert_eq!(r.playpen_exit_status, 0);
+        assert_eq!(line(&text_summary(&r)), None);
+        r.dropped = Some(DropSummary {
+            packets: 3,
+            destinations: vec![],
+            destinations_truncated: true,
+        });
+        r.playpen_exit_status = crate::cli::apply_drop_assertion(&mut r, 0, true);
+        assert_eq!(
+            line(&text_summary(&r)).as_deref(),
+            Some(
+                "playpen: exiting with status 1: --fail-on-drop and 3 packet(s) to unapproved destinations were dropped"
+            )
+        );
+        r.dropped = None;
+        r.playpen_exit_status = crate::cli::apply_drop_assertion(&mut r, 0, true);
+        assert_eq!(
+            line(&text_summary(&r)).as_deref(),
+            Some(
+                "playpen: exiting with status 1: --fail-on-drop and the drop counters were unknown or unreadable, or inconsistent"
+            )
+        );
+        // Without --fail-on-drop, and when the command's own status stands,
+        // there is no such line.
+        r.drop_assertion = None;
+        assert_eq!(line(&text_summary(&r)), None);
+        r.drop_assertion = Some(DropAssertion::Unknown);
+        r.exit_code = Some(2);
+        assert_eq!(line(&text_summary(&r)), None);
     }
 
     #[test]

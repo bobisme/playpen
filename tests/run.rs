@@ -1745,6 +1745,18 @@ fn fail_on_drop_changes_wrapper_status_only_when_requested() {
             "{}",
             text(&out.stderr)
         );
+        let err = text(&out.stderr);
+        let why = "playpen: exiting with status 1: --fail-on-drop and ";
+        if enabled {
+            assert!(
+                err.contains(&format!(
+                    "{why}1 packet(s) to unapproved destinations were dropped\n"
+                )),
+                "{err}"
+            );
+        } else {
+            assert!(!err.contains("exiting with status"), "{err}");
+        }
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(report).unwrap_or_default())
                 .unwrap_or_default();
@@ -1763,6 +1775,27 @@ fn fail_on_drop_changes_wrapper_status_only_when_requested() {
             assert!(json.get("drop_assertion").is_none());
         }
     }
+}
+
+#[test]
+fn fail_on_drop_prints_no_reason_when_nothing_was_dropped() {
+    require_sandbox!();
+    let mut args = vec!["run", "--allow", "192.0.2.1:9101/tcp", "--fail-on-drop"];
+    args.extend_from_slice(LO);
+    args.extend_from_slice(&[
+        "--",
+        BIN,
+        "probe",
+        "reach",
+        "--serve",
+        "192.0.2.1:9101/tcp",
+        "--try",
+        "192.0.2.1:9101/tcp",
+    ]);
+    let out = run(&args);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(!err.contains("exiting with status"), "{err}");
 }
 
 #[test]

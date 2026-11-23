@@ -395,8 +395,8 @@ cannot ask for the freeze first. A watchdog covers it: P sends I one byte a
 second on their pipe, and when I has heard nothing for 5 seconds
 (`SILENCE_LIMIT`) it freezes the sandbox the same way, says so on stderr,
 and repeats the freeze every second for anything a pass missed. The next
-byte from P thaws it, and P, running again, looks at the clock and the pass
-before anything else. This also covers a P that is stuck (a pass on a file
+byte from P thaws it, and P, running again, looks at the clock first and then the pass.
+When the end time passed while P was stopped, the pass has usually expired too; the end time wins, so the report says `stopped_by_until` as for any other expiry. This also covers a P that is stuck (a pass on a file
 system that hangs, a stderr nobody reads). Why a heartbeat and not a second
 timer in I: I would enforce the end time but not a revocation, and
 re-reading the pass in I would put a second copy of that judgement in the
@@ -1049,6 +1049,14 @@ and it would make a second run with the same name fail. playpen removes
 it, but only when the name still leads to the file it created.
 
 ## Drops while the command runs
+
+`--events-fd` takes only the write end of a pipe. The reasons are one
+write of at most `PIPE_BUF` bytes per record, which is atomic, and a
+non-blocking pipe, so a slow reader never blocks the supervisor. A regular
+file never blocks, but it has no size limit, a full disk would end the
+stream without notice, and `>` without append shares an offset with other
+writers. We decided to keep the refusal and show the workaround in the
+message: `3> >(cat > events.jsonl)`. `cat` is the reader that keeps up.
 
 Before this, a refused destination was known only from the summary at
 the end. A long command (a build, a test suite, an agent) that hangs on a

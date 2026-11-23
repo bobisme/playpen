@@ -461,7 +461,7 @@ second that it is running. When init hears nothing for 5 seconds
 process in the sandbox itself and prints `playpen itself has been stopped
 or stuck for 5 s ...; the command is paused until playpen continues`. When
 playpen is heard again, init continues the processes it stopped, and
-playpen checks the end time and re-reads the pass if due. Five seconds
+playpen checks the end time first, then re-reads the pass if due. When the end time has passed, the end time wins: the run is `stopped_by_until`, never `stopped_by_pass`, even if the pass has expired too. Five seconds
 is the silence threshold. The time until processes stop also depends on
 Linux scheduling the sandbox init and delivering its stop signals. The
 ruleset's time rule does not wait for either: from the end second on, a
@@ -710,6 +710,12 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   N packet(s) refused after that` (each part only when known), and with
   `stop`, when the command exited 0, `exiting with status 1: with
   --on-drop stop, a run whose cut tripped never exits 0`;
+  then, with `--fail-on-drop`, when the command exited 0 and playpen exits
+  1: `exiting with status 1: --fail-on-drop and N packet(s) to unapproved
+  destinations were dropped`, or `exiting with status 1: --fail-on-drop and
+  the drop counters were unknown or unreadable, or inconsistent`, or
+  `exiting with status 1: --fail-on-drop and playpen stopped the command`
+  (no line when the check passes);
   then `N packet(s) refused after the approval ended` when that count was
   read and is not 0, or playpen stopped the command because the approval
   ended or the pass withdrew it; then, with `--capture`, `packet capture
@@ -804,7 +810,13 @@ At teardown the stub sends the record to C, which sends it to P (section
 
 ### Supervisor lifecycle events
 
-`run --events-fd N` accepts an inherited pipe writer above stderr. Close the
+`run --events-fd N` accepts an inherited pipe writer above stderr. It refuses
+a regular file (`3>events.jsonl`), a terminal and a socket, exits 2, and
+says so with the workaround `3> >(cat > events.jsonl)`. A pipe makes each
+record one write of at most `PIPE_BUF` bytes, which is atomic, and playpen
+never waits for a slow reader: the pipe is non-blocking, and a record that
+does not fit closes the stream. A file would give no such limit on its size
+and no way for playpen to know that a reader keeps up. Close the
 caller's copy after spawning. Read newline-delimited JSON until EOF. For
 example, with Bash process substitution:
 

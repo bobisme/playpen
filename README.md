@@ -245,6 +245,8 @@ that hangs on a refused connection can tell you sooner:
 playpen run --allow 192.0.2.10:443/tcp --live-drops --events-fd 3 -- ./scan 3> >(jq -c .)
 ```
 
+`--events-fd` takes a pipe, not a regular file. To write the records to a file, use `3> >(cat > events.jsonl)`.
+
 While the command runs, playpen reads the drop counter every 2 seconds.
 With `--events-fd`, each new dropped destination gets one `denied` record
 (`address`, `protocol`, `port`, `packets`) within about 2 seconds of its
