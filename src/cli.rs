@@ -184,6 +184,12 @@ enum ProbeCmd {
     Fds,
     /// List interfaces visible in this network namespace.
     Interfaces,
+    /// Read this network namespace's VSOCK mode, create an `AF_VSOCK` socket
+    /// and, with --try PORT, connect it to CID 1 at PORT.
+    Vsock {
+        #[arg(long = "try", value_name = "PORT")]
+        port: Option<u32>,
+    },
     /// Try TIOCSTI on standard input and opening /dev/tty.
     Tty,
     /// Count deliveries of SIGUSR1 until SIGTERM.
@@ -562,6 +568,10 @@ fn probe(what: ProbeCmd) -> i32 {
         }
         ProbeCmd::Interfaces => {
             outln!("{}", crate::probe::interfaces());
+            0
+        }
+        ProbeCmd::Vsock { port } => {
+            outln!("{}", crate::probe::vsock(port));
             0
         }
         ProbeCmd::UnixSend { path } => {
@@ -1072,7 +1082,7 @@ fn enforce_coverage(args: &RunArgs, checked: &Checked) -> Result<(), String> {
 struct StderrEvents<'a> {
     pipe: &'a EventPipe,
     args: &'a RunArgs,
-    start_line: String,
+    start_line: StartLine,
     until: Option<String>,
     /// When the command was released.
     started_at: Option<OffsetDateTime>,
@@ -1080,6 +1090,8 @@ struct StderrEvents<'a> {
     ended_at: Option<OffsetDateTime>,
     /// With `--live-drops`: destinations printed so far.
     live_shown: usize,
+    /// The sandbox's VSOCK mode, once C has found it.
+    vsock: Option<crate::vsock::Mode>,
 }
 
 impl Events for StderrEvents<'_> {
@@ -1097,7 +1109,10 @@ impl Events for StderrEvents<'_> {
 
     fn starting(&mut self) {
         self.pipe.send("starting", &serde_json::Value::Null);
-        sayln!("{}", self.start_line);
+        sayln!("{}", self.start_line.render(self.vsock));
+    }
+    fn vsock(&mut self, mode: crate::vsock::Mode) {
+        self.vsock = Some(mode);
     }
     fn released(&mut self, at: OffsetDateTime) {
         self.started_at = Some(at);
@@ -1246,10 +1261,41 @@ fn sockets_clauses(c: &Checked, args: &RunArgs) -> Vec<String> {
     out
 }
 
-/// The start line: a short first line, then one `playpen:   ` line for each
-/// further clause group, then the NOTE lines. A CI log filtered by the
-/// `playpen:` prefix keeps every line.
-fn start_line(c: &Checked, args: &RunArgs, capture: Option<&Path>) -> String {
+/// The start line, built before the sandbox and printed once it is ready:
+/// a short first line, then one `playpen:   ` line for each further clause
+/// group, then the NOTE lines. A CI log filtered by the `playpen:` prefix
+/// keeps every line.
+struct StartLine {
+    /// The first line, then the clause groups.
+    lines: Vec<String>,
+    /// The NOTE lines, each starting with a newline.
+    notes: String,
+}
+
+impl StartLine {
+    /// The start line as printed. The clause about VM sockets comes last:
+    /// C finds the sandbox's VSOCK mode only once the sandbox's namespace
+    /// exists, after the rest was built.
+    fn render(&self, vsock: Option<crate::vsock::Mode>) -> String {
+        let mut lines = self.lines.clone();
+        if let Some(mode) = vsock {
+            lines.push(mode.clause().to_owned());
+        }
+        let mut out = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                let _ = write!(out, "\n{CLAUSE_PREFIX}");
+            }
+            out.push_str(line);
+        }
+        out.push_str(&self.notes);
+        out
+    }
+}
+
+/// The start line without the clause about VM sockets (see
+/// [`StartLine::render`]).
+fn start_line(c: &Checked, args: &RunArgs, capture: Option<&Path>) -> StartLine {
     let mut lines = start_line_net(c, !args.no_network);
     if let Some(p) = capture {
         lines.push(format!("packet capture: {}", p.display()));
@@ -1281,12 +1327,10 @@ fn start_line(c: &Checked, args: &RunArgs, capture: Option<&Path>) -> String {
     }
     lines.extend(sockets_clauses(c, args));
     lines.extend(c.pass_dir.as_ref().and_then(PassDirView::clause));
-    let mut out = lines.remove(0);
-    for line in lines {
-        let _ = write!(out, "\n{CLAUSE_PREFIX}{line}");
+    StartLine {
+        lines,
+        notes: start_notes(c),
     }
-    out.push_str(&start_notes(c));
-    out
 }
 
 /// The prefix of each start-line clause after the first line.
@@ -1496,6 +1540,7 @@ fn base_report(args: &RunArgs) -> Report {
         } else {
             "landlock"
         },
+        vsock: None,
         exposed: args
             .expose
             .iter()
@@ -1776,6 +1821,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         started_at: None,
         ended_at: None,
         live_shown: 0,
+        vsock: None,
     };
     let grant_labels = if args.report_grant_use {
         checked
@@ -1816,6 +1862,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     let outcome = sandbox::run_with_output(&plan, &mut events, stdout_report, args.private_tty);
     report.started_at = events.started_at.map(crate::report::stamp);
     report.ended_at = events.ended_at.map(crate::report::stamp);
+    report.vsock = events.vsock.map(crate::vsock::Mode::name);
     if let Some(c) = &capture {
         // pasta has exited: the file is complete.
         if report.started_at.is_none() {
@@ -2034,5 +2081,29 @@ mod tests {
         assert!(!only_entries(&dir, &names(&["p.toml", "p.toml.ledger"])));
         assert!(!only_entries(&root.join("missing"), &names(&[])));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_vm_socket_clause_comes_after_the_other_clauses_and_before_the_notes() {
+        let line = StartLine {
+            lines: vec![
+                "playpen: first".into(),
+                "host Unix sockets: none reachable".into(),
+            ],
+            notes: "\nplaypen: NOTE: a note".into(),
+        };
+        assert_eq!(
+            line.render(Some(crate::vsock::Mode::Local)),
+            format!(
+                "playpen: first\n{CLAUSE_PREFIX}host Unix sockets: none reachable\n{CLAUSE_PREFIX}{}\nplaypen: NOTE: a note",
+                crate::vsock::Mode::Local.clause()
+            )
+        );
+        assert_eq!(
+            line.render(None),
+            format!(
+                "playpen: first\n{CLAUSE_PREFIX}host Unix sockets: none reachable\nplaypen: NOTE: a note"
+            )
+        );
     }
 }

@@ -176,6 +176,7 @@ all of them:
 playpen: allowing only 192.0.2.10:443/tcp with no time limit; everything else is dropped
 playpen:   no DNS, names app.example.test=192.0.2.10; lookups recorded
 playpen:   host Unix sockets: none reachable
+playpen:   VM sockets (AF_VSOCK): only the sandbox's own (VSOCK mode local)
 ```
 
 `--allow` accepts a link-local address, because you typed it, and a pass
@@ -507,8 +508,16 @@ Do not run playpen inside `playpen run`; the inner one cannot start.
   needs only `nft`, and the kernel's `dummy` interface driver
   (`CONFIG_DUMMY`) to count what the command sends to other hosts. Without
   the driver, the run says that the drop count is incomplete.
+- Linux 7.0 or later to keep VM sockets (AF_VSOCK) inside the sandbox.
+  On older kernels with VM sockets, the start line says that they are not
+  confined.
 - No root, no setuid helper, no subuid/subgid ranges, no change to host
-  settings. playpen refuses to run as root.
+  settings, with one exception: where the `vsock` module is not loaded,
+  playpen loads it before it builds the sandbox, by creating and closing
+  one AF_VSOCK socket, as any program can. A network namespace that exists
+  when the module is loaded cannot keep VM sockets in, and the command
+  could load it itself from inside. The module stays loaded. playpen
+  refuses to run as root.
 
 Build with a stable Rust toolchain: `cargo build --release`. Run the tests
 with `cargo test`; they need the same requirements and send nothing to any
@@ -527,6 +536,10 @@ sent to it and has both default routes. The check requires a TCP attempt
 to an IPv4 address and a UDP attempt to an IPv6 address to be refused and
 counted. It checks the command’s network privileges and verifies that a private Unix socket
 connects while the host pathname and abstract sockets are unreachable.
+It also checks that the command reads VSOCK mode `local` and cannot
+connect to a VM-socket listener that doctor holds outside the sandbox
+(the check passes, too, where the kernel has no VM sockets). Like every
+run, doctor loads the `vsock` module where it is not loaded.
 Egress mode also uses pasta and tests allowed and denied TCP, UDP and IPv6
 destinations. It reports, for each address family, whether the sandbox has
 this host's default route or one that playpen added because this host has
@@ -604,15 +617,23 @@ playpen guards against:
   network (TCP, UDP) socket as standard input or output, host IPC and
   shared memory, the display server (unless `--display`), and pushing
   input into your terminal for your shell to run later. Each is tested;
-  DESIGN.md has the list, with what stays open.
+  DESIGN.md has the list, with what stays open;
+- VM sockets (AF_VSOCK), on Linux 7.0 and later: the firewall does not see
+  them, but the sandbox's network namespace is in the kernel's VSOCK mode
+  `local`, so the command's VM sockets reach only the sandbox's own, not
+  the hypervisor host from inside a VM, nor the machine's VMs and
+  VM-socket listeners on a host. If the sandbox does not get that mode,
+  nothing is run. The start line and the report (`vsock`) say what the
+  sandbox got (tested).
 
 playpen does not guard against:
 
-- VM sockets (AF_VSOCK). playpen's IP filter and drop counts do not see
-  them. In the kernel's default mode the command reaches the hypervisor
-  host from inside a VM, and the machine's VMs and VM-socket listeners on
-  a host. Linux 7.0 and later can keep them inside a network namespace;
-  playpen does not ask it to;
+- VM sockets on kernels before 7.0, which have no VSOCK mode: there the
+  command reaches the hypervisor, the machine's VMs and VM-socket
+  listeners, and the start line says so (`--hide /dev/vhost-vsock` at
+  least keeps it from acting as a VM). Also VM sockets loaded only after
+  the sandbox started, by root or as a dependency of a module the command
+  loads, where playpen could not load them at the start;
 - other non-IP socket families. playpen does not restrict which families
   the command creates. Before Linux 7.2 (measured on 7.1.4) this includes
   the Qualcomm IPC router (AF_QIPCRTR), whose ports every namespace shares.
@@ -620,7 +641,8 @@ playpen does not guard against:
   not tested;
 - kernel modules loaded by the command: creating a socket of a family
   whose module is not loaded makes the kernel load it, for any user. The
-  module stays loaded;
+  module stays loaded. playpen loads `vsock` this way itself (see
+  [Requirements](#requirements));
 - a kernel exploit, or a bug in nftables, pasta or Landlock;
 - processes started outside playpen;
 - whatever the daemon behind a socket you exposed does for the command;

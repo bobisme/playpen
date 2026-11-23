@@ -1,11 +1,14 @@
-//! `playpen doctor`: checks this machine without changing anything.
+//! `playpen doctor`: checks this machine without changing anything, except
+//! that, like every run, it loads the `vsock` module where it is not loaded
+//! (see [`crate::vsock`]).
 //!
 //! Besides looking for the tools and kernel settings, it runs the real
 //! mechanism once: a sandbox whose only reachable destinations are
 //! documentation addresses added to the sandbox's own `lo`, so no packet can
 //! leave the machine even if something were wrong. It also checks that
 //! every address family has a default route in the sandbox, so that a
-//! packet to any address reaches the firewall (see [`crate::routes`]).
+//! packet to any address reaches the firewall (see [`crate::routes`]), and
+//! that the command's VM sockets reach only the sandbox's own.
 
 use crate::cli::discovery::Format;
 use std::path::Path;
@@ -587,6 +590,90 @@ fn sockets_check() -> Check {
     }
 }
 
+/// A VM-socket listener of the caller in the caller's network namespace, on
+/// a port the kernel picks: the socket and the port. Creating it loads the
+/// `vsock` module where it is not loaded, as `playpen run` does.
+fn vsock_listener() -> Result<(std::os::fd::OwnedFd, u32), nix::errno::Errno> {
+    use nix::sys::socket::{
+        AddressFamily, Backlog, SockFlag, SockType, VsockAddr, bind, getsockname, listen, socket,
+    };
+    use std::os::fd::AsRawFd as _;
+    let fd = socket(
+        AddressFamily::Vsock,
+        SockType::Stream,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    )?;
+    bind(
+        fd.as_raw_fd(),
+        &VsockAddr::new(libc::VMADDR_CID_ANY, libc::VMADDR_PORT_ANY),
+    )?;
+    listen(&fd, Backlog::new(4)?)?;
+    let port = getsockname::<VsockAddr>(fd.as_raw_fd())?.port();
+    Ok((fd, port))
+}
+
+/// VM sockets (`AF_VSOCK`): inside a sandbox, the command reads VSOCK mode
+/// `local`, and cannot connect over the loopback transport (CID 1) to a
+/// listener doctor holds outside; or the kernel offers no VM sockets.
+fn vsock_check(run_args: &[&str]) -> Check {
+    let name = "VM sockets (AF_VSOCK)";
+    let fail = |detail: String| Check {
+        name,
+        ok: false,
+        detail,
+    };
+    // Held until the probe has tried it; a connection that got through
+    // waits in its backlog.
+    let listener = vsock_listener();
+    let port = listener.as_ref().ok().map(|(_, port)| port.to_string());
+    let mut probe = vec!["vsock"];
+    if let Some(port) = port.as_deref() {
+        probe.extend(["--try", port]);
+    }
+    let out = match self_run(run_args, &probe) {
+        Ok(out) => out,
+        Err(e) => return fail(e),
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(out.trim()) else {
+        return fail(format!("unexpected probe output: {out}"));
+    };
+    let socket = v["socket"].as_str().unwrap_or_default();
+    match v["ns_mode"].as_str() {
+        Some("local") => match (&v["connect"]["connected"], port) {
+            (serde_json::Value::Bool(false), Some(port)) => Check {
+                name,
+                ok: true,
+                detail: format!(
+                    "the sandbox has VSOCK mode local: the command's VM sockets reach only the sandbox's own; a listener outside at CID 1 port {port} was not reachable ({})",
+                    v["connect"]["error"].as_str().unwrap_or("refused")
+                ),
+            },
+            (serde_json::Value::Bool(true), Some(port)) => fail(format!(
+                "the sandbox has VSOCK mode local, but the command connected to a listener outside at CID 1 port {port}"
+            )),
+            _ => fail(format!(
+                "the sandbox has VSOCK mode local, but the reach of its VM sockets could not be tried: {}",
+                listener.err().map_or_else(
+                    || format!("the probe could not connect ({socket})"),
+                    |e| format!("no listener outside ({e})")
+                )
+            )),
+        },
+        Some(other) => fail(format!(
+            "the sandbox has VSOCK mode {other}: the command's VM sockets reach the hypervisor, this machine's VMs and VM-socket listeners"
+        )),
+        None if socket == "created" => fail(
+            "not confined: this kernel has no VSOCK namespace mode (Linux 7.0 has it), so the command's VM sockets reach the hypervisor, this machine's VMs and VM-socket listeners; --hide /dev/vhost-vsock at least keeps it from acting as a VM".into(),
+        ),
+        None => Check {
+            name,
+            ok: true,
+            detail: format!("the command cannot create VM sockets ({socket})"),
+        },
+    }
+}
+
 /// Runs every check and prints the result. Returns the exit status.
 #[must_use]
 pub fn run(mode: Mode, json: bool) -> i32 {
@@ -630,12 +717,14 @@ pub(crate) fn run_formatted(mode: Mode, format: Format) -> i32 {
                 offline_interfaces_check(),
                 privs_check(nft, true),
                 sockets_check(),
+                vsock_check(&["--no-network"]),
             ],
             Mode::Egress => vec![
                 reach_check(),
                 routes_check(),
                 privs_check(nft, false),
                 sockets_check(),
+                vsock_check(SANDBOX),
             ],
         };
         for check in executed {
@@ -656,12 +745,14 @@ pub(crate) fn run_formatted(mode: Mode, format: Format) -> i32 {
                 "offline loopback only",
                 "command cannot change the network",
                 "host Unix sockets unreachable",
+                "VM sockets (AF_VSOCK)",
             ],
             Mode::Egress => &[
                 "allowed reached, others blocked",
                 "default routes",
                 "command cannot change the network",
                 "host Unix sockets unreachable",
+                "VM sockets (AF_VSOCK)",
             ],
         };
         for name in skipped {

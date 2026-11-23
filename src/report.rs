@@ -131,6 +131,12 @@ pub struct Report {
     /// (`--without-landlock`: hidden under `/run`, `/tmp`, `/var/tmp` and
     /// the runtime directory only).
     pub socket_guard: &'static str,
+    /// The sandbox's VSOCK mode, as playpen read it in the sandbox's
+    /// network namespace (see [`crate::vsock::Mode::name`]): `"local"`,
+    /// `"unavailable"`, `"not_confined"`, or `"global"` when the run
+    /// stopped for it; null when no sandbox namespace was made. Never in
+    /// the shareable report.
+    pub vsock: Option<&'static str>,
     /// Host paths the command was let reach (`--expose` and `--display`),
     /// canonical once checked; as typed when refused.
     pub exposed: Vec<String>,
@@ -509,6 +515,7 @@ mod tests {
             lookups: Some(Lookups::default()),
             lookups_error: None,
             socket_guard: "landlock",
+            vsock: Some("local"),
             exposed: vec![],
             display: false,
             new_session: false,

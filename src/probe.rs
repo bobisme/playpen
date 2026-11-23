@@ -43,6 +43,38 @@ pub fn interfaces() -> String {
     json!({"interfaces": names, "default_routes": routes}).to_string()
 }
 
+/// `probe vsock`: what the command finds of VM sockets.
+///
+/// `ns_mode` is this network namespace's VSOCK mode, null when the kernel
+/// shows none; `socket` is `"created"` or why an `AF_VSOCK` stream socket
+/// could not be created. With `try_port`, `connect` says whether a stream
+/// connection to CID 1 (`VMADDR_CID_LOCAL`, the loopback transport) at that
+/// port was made, and the error when not; null otherwise.
+#[must_use]
+pub fn vsock(try_port: Option<u32>) -> String {
+    let ns_mode = fs::read_to_string("/proc/sys/net/vsock/ns_mode")
+        .ok()
+        .map(|t| t.trim().to_owned());
+    let created = socket(
+        AddressFamily::Vsock,
+        SockType::Stream,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    );
+    let connected = match (&created, try_port) {
+        (Ok(fd), Some(port)) => {
+            let to = nix::sys::socket::VsockAddr::new(libc::VMADDR_CID_LOCAL, port);
+            Some(match connect(fd.as_raw_fd(), &to) {
+                Ok(()) => json!({"connected": true}),
+                Err(e) => json!({"connected": false, "error": e.to_string()}),
+            })
+        }
+        _ => None,
+    };
+    let socket = created.map_or_else(|e| e.to_string(), |_| "created".to_owned());
+    json!({"ns_mode": ns_mode, "socket": socket, "connect": connected}).to_string()
+}
+
 /// Parses a probe target.
 ///
 /// # Errors

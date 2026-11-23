@@ -87,6 +87,16 @@ If you used v0.1, these will be different:
   anyway, with a NOTE (section 4.1). The start line has a `pass
   directory:` clause, the report has `pass.directory`, and the plan has
   `pass_dir_writable` when the option is given.
+- **VM sockets (AF_VSOCK) stay inside the sandbox.** The sandbox's
+  network namespace is created in VSOCK mode `local` (section 5, step 4),
+  so the command's VM sockets no longer reach the hypervisor, the
+  machine's VMs or VM-socket listeners. Where the `vsock` module is not
+  loaded, playpen loads it first, by creating and closing one AF_VSOCK
+  socket (step 3); this is the one change to the host that playpen makes.
+  A sandbox that does not get mode `local` on a kernel that has the mode
+  is not run. The start line has a new last clause about VM sockets, the
+  report has the new field `vsock`, and `doctor` has the new check `VM
+  sockets (AF_VSOCK)`. The plan is unchanged.
 
 ## 1. Purpose and non-goals
 
@@ -177,8 +187,16 @@ written as JSON to `--report FILE` (section 4.5).
 - `pasta` (passt package), unless `--no-network`. Found the same way, with
   `PLAYPEN_PASTA`.
 - Not running as root (playpen refuses).
+- For VM sockets kept inside the sandbox: Linux 7.0 or later, with the
+  `vsock` module loaded, or loadable by its autoload. A kernel with VM
+  sockets that cannot confine them runs the command and says so (section
+  8); a kernel without VM sockets needs nothing.
 
-No setuid helper, no subuid/subgid ranges, no host setting changes.
+No setuid helper, no subuid/subgid ranges, no host setting changes, with
+one exception: where `vsock` is not loaded, playpen loads it by creating
+one AF_VSOCK socket, as any process can (section 5, step 3). A network
+namespace that exists when the module is loaded stays `global`, and the
+command could otherwise load it itself, from inside the sandbox.
 
 ## 4. Commands
 
@@ -880,7 +898,18 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   - with `--pass`, unless its directory is hidden already, `pass
     directory: DIR (hidden from the command)`, `(read-only for the
     command)` or `(writable by the command, --pass-dir-writable)` (see
-    "The pass inside the sandbox").
+    "The pass inside the sandbox");
+  - always, last, the VM sockets as C found them in the sandbox's network
+    namespace (section 5, step 4; the report's `vsock`): `VM sockets
+    (AF_VSOCK): only the sandbox's own (VSOCK mode local)`; on a kernel
+    that cannot create them, `VM sockets (AF_VSOCK): none, this kernel
+    cannot create them`; on a kernel with VM sockets and no VSOCK
+    namespace mode (before Linux 7.0), `VM sockets (AF_VSOCK): NOT
+    confined, this kernel has no VSOCK namespace mode (Linux 7.0 has it):
+    the command can reach the hypervisor, this machine's VMs and their
+    VM-socket listeners; --hide /dev/vhost-vsock at least keeps it from
+    acting as a VM`. A sandbox in mode `global` is not run, so it has no
+    start line.
 
   The start line says nothing about ceilings. The NOTE lines follow it, one
   per line, each starting `playpen: NOTE:`: the ceilings the pass sets and
@@ -1171,7 +1200,7 @@ command and verifies (`offline loopback only`) that the sandbox has only
 a TCP attempt to `192.0.2.1` port 9 and a UDP attempt to `2001:db8::1`
 port 9 are refused and counted. Both modes require user
 namespaces, a working `nft`, and Landlock ABI 9 or later, and run local
-privilege and Unix-socket checks. Egress mode additionally requires `pasta`
+privilege, Unix-socket and VM-socket checks. Egress mode additionally requires `pasta`
 and tests approved TCP, UDP, and IPv6 destinations against blocked ones.
 
 For example:
@@ -1189,7 +1218,9 @@ Probe entries say `executed` or `untested`; untested entries include the
 preflight reason. For example, an absent pasta makes egress `unavailable` and
 its egress probes `untested`, while offline can still be tested successfully.
 
-The egress checks, without changing any host setting:
+The egress checks, without changing any host setting, except that, like
+every run, they load the `vsock` module where it is not loaded (section 5,
+step 3):
 
 1. user namespace settings (section 3). The AppArmor restriction setting is
    informational: a per-binary profile may permit playpen, so live namespace
@@ -1217,7 +1248,19 @@ The egress checks, without changing any host setting:
    capabilities;
 8. a third sandbox (`--no-network`) that must reach its own private Unix
    socket and must fail to connect to the host pathname and abstract sockets
-   doctor creates. Doctor requires one structured result for each endpoint.
+   doctor creates. Doctor requires one structured result for each endpoint;
+9. `VM sockets (AF_VSOCK)`: doctor listens on a VM socket (any port, in
+   the caller's network namespace), and a fourth sandbox (with pasta; under
+   `--mode offline`, `--no-network`) runs `probe vsock --try PORT`, which
+   reads the sandbox's `/proc/sys/net/vsock/ns_mode` and connects to CID 1
+   (the loopback transport) at that port. `ok` when the command reads
+   `local` and does not connect, or when the command cannot create an
+   AF_VSOCK socket at all. `FAIL` when it connects, when the run is
+   refused because the sandbox is not `local` (the detail is the
+   refusal), and on a kernel with VM sockets and no VSOCK namespace mode
+   (before Linux 7.0; runs go ahead there, and the start line says that VM
+   sockets are not confined). Such a kernel also lacks Landlock ABI 9
+   (Linux 7.1), so there the check is normally `untested`.
 
 Pretty output labels each check `ok` or `FAIL`. Text output places the check name first. Unrun checks are marked
 `untested`. Exit status 0 when the selected mode is demonstrated, 1
@@ -1322,6 +1365,7 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `contacted_error` | string or null | present only with `--report-contacts`: why the record of contacted destinations could not be read |
 | `refused_after_end` | integer or null | packets the command sent that the firewall refused because the approval had ended: by the time rule from the end second on, or by the cut once playpen stopped the command (section 6.1). Not part of `dropped`, not unapproved destinations, and not judged by `--fail-on-drop`. Null when the counters could not be read. With `--on-drop` and a tripped cut, the time rule's packets only, and null also when the `cut` counter could not be read: every packet the cut refused came after the trip and is in `egress_cut.refused` |
 | `socket_guard` | `"landlock"` or `"mounts_only"` | how host Unix sockets were kept from the command; `"mounts_only"` with `--without-landlock` |
+| `vsock` | `"local"`, `"unavailable"`, `"not_confined"`, `"global"`, or null | the VM sockets (AF_VSOCK) of the sandbox, as C read `/proc/sys/net/vsock/ns_mode` in the sandbox's network namespace (section 5, step 4): `"local"`, they reach only VM sockets of the sandbox; `"unavailable"`, the kernel cannot create them; `"not_confined"`, the kernel has them and no VSOCK namespace mode (before Linux 7.0); `"global"`, the sandbox did not get mode `local` and nothing was run (`outcome: "not_started"`). Null when no sandbox namespace was made (a refusal before step 4). Not in the shareable report |
 | `exposed` | array of strings | every exposed path (`--expose` and `--display`), canonical once checked; the `--expose` values as typed when refused |
 | `private_tty` | bool | whether the caller requested a private controlling terminal |
 | `live_drops` | bool | `--live-drops` was given: new dropped destinations were printed on stderr while the command ran. `dropped` is read at teardown either way |
@@ -1671,7 +1715,7 @@ Not part of the stable interface, hidden from `--help`:
 - `run --lo-addr ADDR` adds `ADDR` to the sandbox's `lo` before the
   ruleset is loaded. Used by tests and `doctor` to have destinations that
   exist only inside the sandbox.
-- `playpen probe reach|privs|resolve|dns|unix|unix-send|unix-recv-fd|stdout-reconnect|fds|tty|signals|listen|send|interfaces` are the checks
+- `playpen probe reach|privs|resolve|dns|unix|unix-send|unix-recv-fd|stdout-reconnect|fds|tty|signals|listen|send|interfaces|vsock` are the checks
   run inside the sandbox by `doctor` and the tests (`interfaces` prints
   the interface names and, in `default_routes`, the interfaces with an
   IPv4 and an IPv6 default route; `privs` tries the changes of 4.4, check
@@ -1680,7 +1724,11 @@ Not part of the stable interface, hidden from `--help`:
   reports connections to a TCP listener, `listen ADDR:PORT/udp` each
   datagram with its payload and the wall-clock time in nanoseconds;
   `dns [--tcp] HEX` sends one DNS message to the stub and describes the
-  reply).
+  reply; `vsock [--try PORT]` prints `ns_mode` (the namespace's VSOCK
+  mode, or null), `socket` (`"created"`, or why an AF_VSOCK stream socket
+  could not be created) and `connect` (with `--try`, whether a connection
+  to CID 1 at `PORT` was made, and the error when not), as 4.4, check 9
+  uses them).
 - `playpen probe send ADDR:PORT/udp [--every-ms MS]` sends the datagram
   `1`, `2`, ... every `MS` milliseconds (default 50) until killed, and
   prints one JSON line per attempt: `seq`, the wall-clock time `at_ns`
@@ -1707,11 +1755,36 @@ Each step either succeeds or stops the run with a message that ends
    namespace) and not root; Landlock ABI 9 unless `--without-landlock`.
    Mark every descriptor above 2 close-on-exec. Block the forwarded
    signals, SIGCHLD and the job-control signals (SIGTSTP, SIGCONT,
-   SIGTTIN, SIGTTOU), to be read from a signalfd.
+   SIGTTIN, SIGTTOU), to be read from a signalfd. Then, before any
+   sandbox namespace exists, **load `vsock` where it is not loaded**: when
+   `/proc/sys/net/vsock/` is absent, P creates one AF_VSOCK stream socket
+   and closes it at once, which makes the kernel load the module (the
+   autoload any process can trigger; no `modprobe`, no privilege). P notes
+   what the kernel offers: the VSOCK namespace mode (the directory exists
+   now), VM sockets without the mode (the socket was created and the
+   directory is still absent: before Linux 7.0), or no VM sockets (the
+   socket could not be created). Nothing here stops the run.
 4. **C: create the user and network namespaces.** Fork a child C. C sets
    "die with parent", unshares a user and a network namespace, and maps
    root inside to the caller (`setgroups` denied, single-id uid and gid
-   maps). It brings `lo` up through netlink and adds any `--lo-addr`.
+   maps). This network namespace is an intermediate one: where
+   `/proc/sys/net/vsock/child_ns_mode` exists, C writes `local` to it (a
+   write that fails is not an error yet, and when this namespace is
+   `local` already its children are `local` anyway). Then C unshares a
+   second network namespace, the sandbox's, and leaves the intermediate
+   one, which no process or file holds and the kernel frees. Everything
+   from here on (`lo`, the ruleset, the discard interface, pasta, D, S, I,
+   X and the command) is in the sandbox's namespace. C reads
+   `/proc/sys/net/vsock/ns_mode` there and tells P the mode (the report's
+   `vsock`): `local`; `unavailable` when the file is absent and P found no
+   VM sockets; `not_confined` when it is absent and P found VM sockets
+   without the mode; `global` for anything else (the value `global`,
+   another value, a file that cannot be read, or a file that was there
+   for P and is gone, since a module loaded again later would leave the
+   namespace `global`). `global` stops the run, with the reason the write
+   failed when it did (P also refuses a "ready" without a mode, or with
+   `global`). C then brings `lo` up through netlink and adds any
+   `--lo-addr`.
 5. **C: load the ruleset** by running `nft -f -` with the ruleset on
    stdin. A non-zero exit stops the run.
 6. **C: verify the ruleset.** Compare `nft --json list table inet playpen`
@@ -1742,7 +1815,9 @@ Each step either succeeds or stops the run with a message that ends
    `uncounted WHY` and goes on, and P prints the NOTE of 4.1 after the
    start line. Only then does C report "ready".
 7. **P: attach pasta** (unless `--no-network`) to C's namespaces with the
-   options in section 6.3, and wait for it to exit 0 (it daemonizes after
+   options in section 6.3 (pasta is given C's PID, so it joins C's user
+   namespace and the network namespace C is in: the sandbox's, not the
+   intermediate one), and wait for it to exit 0 (it daemonizes after
    configuring the namespace). Failure stops the run. With `--capture`, P
    checks that pasta wrote the pcap header into the capture file. P
    checks the end time has not passed while setting up and, with
@@ -2092,32 +2167,47 @@ file, or changing the pass's directory (within the limits below), and the
 command reaching the
 host's network through a host daemon's Unix socket, an inherited
 descriptor, a socket on standard input or output, host IPC, the display
-server (unless `--display`) or the terminal's input queue.
+server (unless `--display`) or the terminal's input queue. Also the
+command's VM sockets (AF_VSOCK) reaching the hypervisor, the machine's VMs
+or VM-socket listeners outside the sandbox, on kernels with a VSOCK
+namespace mode (Linux 7.0 and later): the sandbox's network namespace has
+mode `local`
+([`ns_mode`](https://docs.kernel.org/admin-guide/sysctl/net.html#ns-mode)),
+and a run whose namespace did not get it is not started (section 5, steps
+3 and 4).
 
 Not guarded against, or known limits:
 
-- non-IP socket families, including AF_VSOCK. The nft table filters IPv4
-  and IPv6, and Landlock separately guards pathname Unix sockets. Playpen
-  checks inherited descriptors but does not impose a family allowlist on new
-  sockets. An AF_VSOCK socket of the command reaches the hypervisor host
-  from a VM, and the machine's VMs and VSOCK listeners from a host, unless
-  the sandbox's network namespace has VSOCK mode `local`
-  ([`ns_mode`](https://docs.kernel.org/admin-guide/sysctl/net.html#ns-mode),
-  Linux 7.0 and later). The command can also act as a VM through
-  `/dev/vhost-vsock`, which systemd's udev rules make mode 0666. A new
-  namespace takes its mode from the creator's
-  [`child_ns_mode`](https://docs.kernel.org/admin-guide/sysctl/net.html#child-ns-mode).
-  Playpen does not set it, so the sandbox has the caller's, which is
-  `global` unless an administrator wrote `local`. A namespace that exists
-  when the `vsock` module is loaded is `global`. Without
-  `/proc/sys/net/vsock/` (Linux before 7.0, or `vsock` not loaded) there is
-  no isolation: the command can load `vsock`, and its namespace is then
-  `global`. Before Linux 7.2 (measured on 7.1.4), AF_QIPCRTR sockets also
-  reach the machine's QRTR ports from the sandbox. DESIGN.md ("Socket
+- non-IP socket families other than AF_VSOCK. The nft table filters IPv4
+  and IPv6, Landlock separately guards pathname Unix sockets, and VSOCK
+  mode `local` keeps VM sockets inside the sandbox. Playpen checks
+  inherited descriptors but does not impose a family allowlist on new
+  sockets. Before Linux 7.2 (measured on 7.1.4), AF_QIPCRTR sockets reach
+  the machine's QRTR ports from the sandbox. DESIGN.md ("Socket
   families") has the measurements;
+- VM sockets (AF_VSOCK) where the kernel cannot confine them, or where
+  `vsock` is loaded only after the sandbox's namespace exists. A
+  namespace takes its mode from its creator's
+  [`child_ns_mode`](https://docs.kernel.org/admin-guide/sysctl/net.html#child-ns-mode)
+  when it is created, and a namespace that exists when `vsock` is loaded
+  is `global`. Before Linux 7.0 there is no mode: the command's VM sockets
+  reach the hypervisor host from a VM, and the machine's VMs and VM-socket
+  listeners from a host, and the command can act as a VM through
+  `/dev/vhost-vsock`, which systemd's udev rules make mode 0666. The start
+  line says so and the report has `vsock: "not_confined"`;
+  `--hide /dev/vhost-vsock` closes the last path only. Where P could not
+  load `vsock` (`vsock: "unavailable"`), something that loads it while
+  the command runs leaves the sandbox `global`: root, or the command
+  opening `/dev/vhost-vsock` where only the transports' `net-pf-40`
+  aliases are blocked (`vhost_vsock` needs `vsock` and loads it). The same
+  holds when root unloads `vsock` during a run and it is loaded again;
 - a `socket()` call for a family whose module is not loaded makes the
   kernel load the module, also when the command makes it; the module stays
-  loaded;
+  loaded. playpen itself loads `vsock` this way, once, where it is not
+  loaded (section 5, step 3), and with it the transports its `net-pf-40`
+  alias names and what they need (on 7.2.8: `vsock_loopback`,
+  `vmw_vsock_virtio_transport_common`, `vmw_vsock_vmci_transport` and
+  `vmw_vmci`);
 - kernel exploits; bugs in nftables, pasta or Landlock;
 - processes started outside playpen;
 - what the daemon behind an exposed socket (`--expose`, `--display`) does

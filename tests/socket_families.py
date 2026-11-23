@@ -8,10 +8,15 @@ load it. Do not run `sweep` on a machine whose module set must not change.
   sweep [--families 1,2,...]   one JSON line per family: what socket() did,
                                and which modules appeared in /proc/modules
   vsock-listen PORT            accept AF_VSOCK streams, print the peer, reply
+                               (PORT 4294967295: any; the port is printed)
   vsock-connect CID PORT       connect an AF_VSOCK stream, print the outcome
   vhost-guest PORT             act as a guest through /dev/vhost-vsock and
                                connect to the host (CID 2) at PORT
   vsock-mode                   print /proc/sys/net/vsock/* or "absent"
+  with-mode MODE CMD...        run CMD in a user and mount namespace of its
+                               own, where a tmpfs over /proc/sys gives
+                               /proc/sys/net/vsock/ns_mode the text MODE
+                               (for the test of playpen's refusal)
   qrtr-listen PORT             receive one AF_QIPCRTR datagram on the local node
   qrtr-send PORT               send one AF_QIPCRTR datagram to the local node
 """
@@ -71,7 +76,7 @@ def vsock_listen(args):
     s.bind((socket.VMADDR_CID_ANY, args.port))
     s.listen()
     s.settimeout(args.timeout)
-    print(f'listening port={args.port}', flush=True)
+    print(f'listening port={s.getsockname()[1]}', flush=True)
     for _ in range(args.count):
         try:
             c, (cid, port) = s.accept()
@@ -231,6 +236,32 @@ def vsock_mode(_args):
             print(f'{name}={f.read().strip()}', flush=True)
 
 
+def with_mode(args):
+    """Exec the command where /proc/sys/net/vsock/ns_mode reads args.mode.
+
+    The command keeps the caller's uid and gid (mapped to themselves) and has
+    no capabilities once it runs. The tmpfs hides the rest of /proc/sys.
+    """
+    uid, gid = os.getuid(), os.getgid()
+    os.unshare(os.CLONE_NEWUSER | os.CLONE_NEWNS)
+    for path, text in (('/proc/self/setgroups', 'deny'), ('/proc/self/uid_map', f'{uid} {uid} 1'),
+                       ('/proc/self/gid_map', f'{gid} {gid} 1')):
+        with open(path, 'w') as f:
+            f.write(text)
+    libc = ctypes.CDLL(None, use_errno=True)
+    ms_rec, ms_private = 0x4000, 1 << 18
+    for source, target, fstype, flags in ((None, b'/', None, ms_rec | ms_private),
+                                          (b'none', b'/proc/sys', b'tmpfs', 0)):
+        if libc.mount(source, target, fstype, flags, None) != 0:
+            e = ctypes.get_errno()
+            raise OSError(e, os.strerror(e), target.decode())
+    os.makedirs('/proc/sys/net/vsock')
+    for name in ('ns_mode', 'child_ns_mode'):
+        with open(f'/proc/sys/net/vsock/{name}', 'w') as f:
+            f.write(args.mode + '\n')
+    os.execvp(args.command[0], args.command)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd', required=True)
@@ -250,6 +281,9 @@ def main():
     s.add_argument('--guest-cid', type=int, default=42)
     s.add_argument('--timeout', type=int, default=5)
     sub.add_parser('vsock-mode')
+    s = sub.add_parser('with-mode')
+    s.add_argument('mode')
+    s.add_argument('command', nargs=argparse.REMAINDER)
     s = sub.add_parser('qrtr-listen')
     s.add_argument('port', type=int)
     s.add_argument('--timeout', type=float, default=10)
@@ -257,7 +291,7 @@ def main():
     s.add_argument('port', type=int)
     args = p.parse_args()
     {'sweep': sweep, 'vsock-listen': vsock_listen, 'vsock-connect': vsock_connect,
-     'vhost-guest': vhost_guest, 'vsock-mode': vsock_mode,
+     'vhost-guest': vhost_guest, 'vsock-mode': vsock_mode, 'with-mode': with_mode,
      'qrtr-listen': qrtr_listen, 'qrtr-send': qrtr_send}[args.cmd](args)
 
 

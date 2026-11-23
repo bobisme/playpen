@@ -94,7 +94,7 @@ one by one with `--expose`.
 | The terminal: `TIOCSTI` (pushing input into the terminal, read by the host shell after playpen exits) | only where the kernel allows it | closed: refused by the kernel when `dev.tty.legacy_tiocsti` is 0; elsewhere the default runs the command in a new session without a controlling terminal, and `TIOCSTI` needs one | `the_command_cannot_type_into_the_terminal` (both modes; on this machine the kernel refuses in both, so the new-session layer is shown only by `/dev/tty` being unavailable) |
 | Other terminals of the same user (`/dev/pts/N`) | the command can open them: write text, read keystrokes | open; not a network path (`TIOCSTI` on them needs them to be the controlling terminal) | none |
 | The display server (X11, Wayland) | yes: an X11 client can type into any other window, for example a host terminal | closed by default (the sockets are refused and hidden); `--display` opens it, and the start line says so | `display_exposes_the_wayland_socket_and_is_off_by_default`; `display_works_with_a_real_x_server_and_is_off_by_default` (a private headless X server with a cookie, a real client, with and without Landlock) |
-| VM sockets (AF_VSOCK) the command creates | yes, in the kernel's default `global` mode: to the hypervisor host, to the machine's VMs, and to vsock listeners on the machine (also by acting as a VM through `/dev/vhost-vsock`) | open; see "Socket families" | `tests/socket_families.py` in disposable guests (see "Socket families"); not an automated test |
+| VM sockets (AF_VSOCK) the command creates | in the kernel's default `global` mode, yes: to the hypervisor host, to the machine's VMs, and to vsock listeners on the machine (also by acting as a VM through `/dev/vhost-vsock`). In mode `local`, only to VM sockets of the same namespace | closed from Linux 7.0: the sandbox's network namespace is made in mode `local`, playpen loads `vsock` first where it is not loaded, and a sandbox that is not `local` is not run. Open before 7.0 (said in the start line and the report). See "VM sockets (AF_VSOCK)" | `tests/vsock.rs`: `the_sandbox_reads_vsock_mode_local` (with and without pasta), `a_vsock_listener_of_the_caller_is_not_reachable_from_inside` (connects without the change, `ECONNRESET` with it), `a_sandbox_that_did_not_get_vsock_mode_local_is_not_run`; the VM paths by `tests/socket_families.py` in disposable guests, not automated |
 | Qualcomm IPC router sockets (AF_QIPCRTR) the command creates | before 7.2: yes, to QRTR ports of the machine; from 7.2 the family exists in the initial namespace only | open before 7.2 | same; 7.1.4 and 7.2.8 |
 
 ### The default: Landlock plus a mount layer
@@ -266,13 +266,14 @@ documentation](https://docs.kernel.org/admin-guide/sysctl/net.html#ns-mode),
 and `net/vmw_vsock/af_vsock.c`, `virtio_transport.c`, `vsock_loopback.c`
 and `drivers/vhost/vsock.c` at v7.1 and v7.2.
 
-playpen creates the sandbox's namespace while it is in the caller's
-namespace, so the sandbox's `ns_mode` is the caller's `child_ns_mode`.
-That is `global` unless an administrator wrote `local` in the initial
-namespace.
+Before this version playpen created the sandbox's namespace while it was
+in the caller's namespace, so the sandbox's `ns_mode` was the caller's
+`child_ns_mode`: `global` unless an administrator had written `local` in
+the initial namespace. Now playpen gives the sandbox mode `local` itself
+(see "VSOCK mode local for the sandbox" below).
 
-The paths below were measured on 7.1.4 and 7.2.8, with the same results on
-both. The command ran in a default sandbox, and the other side ran as root
+The paths below were measured on 7.1.4 and 7.2.8, before that change, with
+the same results on both. The command ran in a default sandbox, and the other side ran as root
 in the initial namespace. CID 2 is the host and CID 3 the guest.
 "Connected" means that a message and its reply went through. For `local`,
 root wrote `local` to the initial namespace's `child_ns_mode` before the
@@ -316,9 +317,132 @@ Also measured, on both kernels:
   `/dev/vhost-vsock` mode 0666 before the module is loaded, and the sandbox
   on the host sees it with that mode. A VM's vsock driver needs `vsock`,
   and a host loads `vhost_vsock` when it starts a VM with a vsock device.
-  On the development host neither module is loaded.
+  On the development host neither module was loaded at the time; `vsock`
+  is loaded there now, by playpen (below).
 - On the host, `--hide /dev/vhost-vsock` made the path `/dev/null` (1:3) in
   the sandbox.
+
+### VSOCK mode local for the sandbox
+
+The sandbox's network namespace is made in mode `local`, in three steps
+(`src/vsock.rs`; spec section 5, steps 3 and 4).
+
+**1. P loads `vsock` where it is not loaded.** Before it forks C, when
+`/proc/sys/net/vsock/` is absent, P creates one AF_VSOCK stream socket and
+closes it. The kernel then runs `modprobe` for `net-pf-40`, which names the
+transports; they need `vsock`, which is loaded with them. On the
+development host (7.2.8), where `vsock` was not loaded, this work's first
+AF_VSOCK socket loaded `vsock`, `vsock_loopback`,
+`vmw_vsock_virtio_transport_common`, `vmw_vsock_vmci_transport` and
+`vmw_vmci` (`hv_sock` was not loaded), and `/proc/sys/net/vsock/`
+appeared. Why playpen does this: a namespace that
+exists when the module is loaded stays `global`, and the command can load
+the module itself from inside the sandbox, with any AF_VSOCK `socket()`.
+Loaded later by the command, it would leave the sandbox `global`; loaded
+first, the sandbox can be `local`. It is the autoload any user, and the
+command, can trigger. playpen uses no `modprobe` and no privilege, and
+does nothing else to the host's modules. The modules stay loaded until
+the machine restarts or root unloads them, so this happens at most once
+per boot, and it is the one change to the host that playpen makes. The
+owner approved it (bn-eby).
+
+**2. C makes the sandbox's namespace from an intermediate one.** The
+network namespace that C creates together with its user namespace is now
+an intermediate one. C writes `local` to its `child_ns_mode` (root in the
+user namespace that owns it may), then unshares a second network
+namespace, the sandbox's, which takes `local` as its `ns_mode`. C is then
+in the sandbox's namespace. The intermediate one has no process, no open
+descriptor and no mount left that holds it, and the kernel frees it; it
+never had more than `lo`, down. Everything that happened in C's network
+namespace before happens in the sandbox's, because that is C's namespace
+now: `lo` and `--lo-addr`, the ruleset, `discard0`, pasta (given C's PID,
+it joins `/proc/PID/ns/net`), the default routes added after "go", D, S,
+I and X. The second `unshare` comes before any of them, so nothing is
+left in the intermediate namespace. Where `/proc/sys/net/vsock/` does not
+exist, C writes nothing and still makes both namespaces.
+
+Measured on 7.2.8 as uid 1000, with the same steps in Python: the first
+write of `local` succeeds, a second one too, and `global` after it fails
+with `EBUSY`. In the `local` child, writing `local` succeeds and `global`
+fails with `EPERM`; its own children are `local`. So on 7.2.8 a write of
+`local` never fails with `EPERM` because the parent is `local` already.
+C still handles a failed write: when the intermediate namespace's
+`ns_mode` is `local`, its children are `local` anyway, and otherwise the
+reason is kept for the refusal.
+
+**3. C reads the mode the sandbox got** (`ns_mode` in the sandbox's
+namespace) and tells P before "ready". P puts it in the start line, as the
+last clause, and in the report (`vsock`). It is the measured value, not
+the expected one: a module loaded by someone else between steps 1 and 2
+shows as the mode the sandbox really got.
+
+**`global` stops the run; there is no option to run anyway.** On a
+kernel that has the mode, a sandbox that is not `local` means that
+playpen's own step failed: the write was refused (a security module, a
+kernel change), the module that P saw was unloaded before C read the mode
+(loaded again later, it would leave the sandbox `global`), or the kernel
+gave a value playpen does not know. The README and the spec say that the
+command cannot reach the hypervisor, the machine's VMs or VM-socket
+listeners there. Running it all the same would leave that path open, said
+only in a start line that a script may not read. This is the same
+judgement as a ruleset that does not read back as built, which also stops
+the run. No option turns the refusal off, because no case is known that
+needs one: an unprivileged process can write the `child_ns_mode` of a
+network namespace of its own (measured on 7.1.4 and 7.2.8), so on a
+working kernel the refusal does not happen. Where AppArmor takes the
+capabilities of a new user namespace away, the run stops before this
+step, as it did before. Where it does, the fix belongs on the machine; for
+example, root can write `local` to the initial namespace's
+`child_ns_mode`, which makes the intermediate namespace, and so the
+sandbox, `local` from the start. An option can be added when a real case
+appears. P also refuses a "ready" that comes without a mode, or with
+`global`, so a C that went wrong cannot start the command.
+
+**What runs, and what stays open.**
+
+- `unavailable` (the command cannot create AF_VSOCK sockets): runs; there
+  is nothing to confine. If something loads `vsock` while the command
+  runs, the sandbox's namespace, which existed first, is `global`. P's
+  socket loads the module wherever the command's could, so that needs
+  root, or a machine where only the transports' `net-pf-40` aliases are
+  blocked and the command opens `/dev/vhost-vsock` (`vhost_vsock` needs
+  `vsock` and loads it). Root unloading `vsock` during a run, and its
+  loading again, has the same effect.
+- `not_confined` (VM sockets, and no mode: Linux before 7.0): runs, and
+  the start line says `NOT confined` with `--hide /dev/vhost-vsock` as the
+  one step the operator can take; the report has `"not_confined"`. The
+  kernel offers no confinement there, and refusing would make playpen
+  unusable on such kernels. They also lack Landlock ABI 9 (Linux 7.1), so
+  they already run with `--without-landlock` and its documented weaker
+  isolation.
+
+**Tests** (`tests/vsock.rs`, on the development host, 7.2.8):
+
+- `the_sandbox_reads_vsock_mode_local`: inside, with `--no-network` and
+  with pasta, `P vsock-mode` prints `ns_mode=local` and
+  `child_ns_mode=local`; the start line and the report say `local`.
+  Without this change it printed `ns_mode=global`.
+- `a_vsock_listener_of_the_caller_is_not_reachable_from_inside`: the test
+  listens as uid 1000 in its own namespace (`P vsock-listen`, any port).
+  From outside, `P vsock-connect 1 PORT` connects (so the loopback
+  transport is there; the test is skipped otherwise). From inside a
+  `--no-network` sandbox the same connection fails with `ECONNRESET`.
+  Without this change it connected (`connected reply=pong`).
+- `a_sandbox_that_did_not_get_vsock_mode_local_is_not_run`: no
+  unprivileged process can make the kernel refuse the write, so
+  `P with-mode global` runs playpen in a user and mount namespace whose
+  `/proc/sys` is a tmpfs with a `net/vsock/ns_mode` that reads `global`.
+  The run is `not_started`, the report has `vsock: "global"`, and the
+  command did not run. With `local` in the same file the run gets past
+  this check (it stops later, where I mounts `/proc`, which the tmpfs
+  prevents).
+- `playpen doctor` has the check `VM sockets (AF_VSOCK)`, with a listener
+  of its own on any port.
+
+The tests load `vsock` where it is not loaded, as every run does, and are
+skipped, with the reason, where AF_VSOCK sockets cannot be created, where
+the kernel has no mode, and where no `python3` has `socket.AF_VSOCK` (a
+Python built without the Linux headers for it lacks it).
 
 ### Landlock
 
@@ -351,6 +475,7 @@ the test of a namespace that loaded `vsock` ran only with `--no-network`.
 | Modes | `P vsock-mode` | `echo local > /proc/sys/net/vsock/child_ns_mode` |
 | Mode of a namespace that loaded `vsock` | `bash -c 'P sweep --families 40; sleep 3; P vsock-mode'` | the same `echo`, while the command sleeps |
 | Unprivileged `local` (uid 1000, without playpen) | in L2: `unshare --user --map-root-user --net bash -c 'echo local > /proc/sys/net/vsock/child_ns_mode && unshare --net P vsock-connect 2 1234'`; in L1 the same with `P vsock-connect 3 5000` | `P vsock-listen 1234` in L1; `P vsock-listen 5000` in L2 |
+| playpen's `local` sandbox (on the host, 7.2.8; after this table's other rows) | `playpen run --no-network -- P vsock-mode`; `playpen run --no-network -- P vsock-connect 1 PORT` (`tests/vsock.rs`) | `P vsock-listen 4294967295` as uid 1000, without playpen (any port; it prints the one it got) |
 
 ## The terminal, job control and inherited descriptors
 
@@ -1985,19 +2110,23 @@ less.
   those 5 seconds the pass re-read is not done, so a revocation is not
   seen. The kernel's filter keeps working, and from the end second on its
   time rule refuses all but loopback.
-- **VM sockets (AF_VSOCK).** The nft table does not see them. In the
-  kernel's default `global` mode the command reaches the hypervisor host
-  from a VM with a vsock device, and the machine's VMs and vsock listeners
-  from the host, also by acting as a VM through `/dev/vhost-vsock`. From
-  Linux 7.0, the kernel keeps the sockets of a `local` namespace inside it.
-  playpen does not create the sandbox's namespace in `local` mode. See
-  "Socket families".
+- **VM sockets (AF_VSOCK) where the kernel cannot confine them.** The nft
+  table does not see them. From Linux 7.0 the sandbox's namespace is in
+  mode `local`, and its VM sockets reach only its own; a sandbox that does
+  not get that mode is not run. Before 7.0 there is no mode: the command
+  reaches the hypervisor host from a VM with a vsock device, and the
+  machine's VMs and vsock listeners from the host, also by acting as a VM
+  through `/dev/vhost-vsock`; the start line and the report say so. The
+  sandbox is also `global` when `vsock` is loaded only after it exists,
+  which playpen's own load at the start makes rare (see "VSOCK mode local
+  for the sandbox").
 - **Kernel modules the command loads.** A `socket()` call for a family
   whose module is not loaded makes the kernel load the module, for any
   user and from any namespace. In the sandbox this loaded 48 modules on
   7.2.8, and opening `/dev/vhost-vsock` loads 3 more. They stay loaded
   after the run, and a bug in any of them can be reached by the command.
-  playpen does not stop this.
+  playpen does not stop this, and loads `vsock` and its transports itself
+  where they are not loaded (5 modules on 7.2.8).
 - **The approved destination.** If it is a proxy, a VPN endpoint or a
   jump host, traffic continues from there. playpen cannot see it.
 - **Names resolved elsewhere.** A client that brings its own resolver (DNS

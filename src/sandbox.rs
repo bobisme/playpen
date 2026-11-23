@@ -5,8 +5,10 @@
 //!
 //! ```text
 //! playpen (P, host namespaces)
-//!  └─ C   new user + network namespace, mapped root inside; loads the
-//!     │   ruleset, later reads the counters. Never runs user code.
+//!  └─ C   new user + network namespace, mapped root inside, and in it the
+//!     │   sandbox's network namespace in VSOCK mode local (see
+//!     │   [`crate::vsock`]); loads the ruleset, later reads the counters.
+//!     │   Never runs user code.
 //!     ├─ D   the DNS stub on 127.0.0.1 port 53 (see `dns_stub`); binds,
 //!     │      then drops every capability and, with Landlock, confines
 //!     │      itself to its descriptors; answers `--host` names only.
@@ -326,6 +328,10 @@ pub trait Events {
     /// counted, for the reason given (see [`crate::routes`]). Said once,
     /// after [`Events::starting`].
     fn uncounted(&mut self, _why: &str) {}
+    /// C found the sandbox's VSOCK mode (see [`crate::vsock`]). Said before
+    /// [`Events::starting`], and also when the run stops for it
+    /// ([`crate::vsock::Mode::Global`]).
+    fn vsock(&mut self, _mode: crate::vsock::Mode) {}
     /// A re-read of the pass found an edit that changes nothing in use.
     fn pass_edited(&mut self, message: &str);
     /// A re-read of the pass withdrew the approval; egress is closed as
@@ -854,6 +860,9 @@ fn run_sandbox(
         JobControl::for_run(plan.new_session, private_terminal_requested).map_err(not_started)?;
     let ruleset_text = ruleset::render_instrumented(&plan.approval, plan.instrumentation());
     let files = SandboxFiles::build(plan);
+    // Before any sandbox namespace exists: a namespace that exists when
+    // the vsock module is loaded is global.
+    let vsock_host = crate::vsock::prepare();
 
     match fork_checked().map_err(not_started)? {
         ForkResult::Child => {
@@ -872,6 +881,7 @@ fn run_sandbox(
             let code = match stage_c(
                 plan,
                 &ids,
+                vsock_host,
                 &ruleset_text,
                 &files,
                 &up_w,
@@ -1020,6 +1030,8 @@ struct ParentState {
     uncounted: Option<String>,
     /// The reasons C gave that [`Events::uncounted`] has not been told yet.
     uncounted_unsaid: Option<String>,
+    /// The sandbox's VSOCK mode, from C.
+    vsock: Option<crate::vsock::Mode>,
 }
 
 impl ParentState {
@@ -1027,6 +1039,7 @@ impl ParentState {
         let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
         match word {
             "ready" => self.ready = true,
+            "vsock" => self.vsock = crate::vsock::Mode::parse(rest),
             "denied" => {
                 if let Ok(d) = serde_json::from_str::<DroppedWire>(rest) {
                     self.denied.push(d.into_dest());
@@ -1295,6 +1308,19 @@ fn parent(
             break;
         }
         st.pump(up_r);
+    }
+    if let Some(mode) = st.vsock {
+        events.vsock(mode);
+    }
+    // C stops at a global namespace itself, and says the mode before
+    // "ready"; a "ready" without a mode it may run with is not trusted.
+    if st.ready && st.failure.is_none() && st.vsock.is_none_or(|m| m == crate::vsock::Mode::Global)
+    {
+        st.ready = false;
+        st.failure = Some(st.vsock.map_or_else(
+            || "the namespace setup did not say the sandbox's VSOCK mode".into(),
+            |_| crate::vsock::refusal(None),
+        ));
     }
     if !st.ready {
         let _ = kill(child, Signal::SIGKILL);
@@ -1980,6 +2006,7 @@ pub(crate) fn die_with_parent(parent: Pid) -> Result<(), String> {
 fn stage_c(
     plan: &Plan,
     ids: &Ids,
+    vsock_host: crate::vsock::Host,
     ruleset_text: &str,
     files: &SandboxFiles,
     up_w: &OwnedFd,
@@ -2003,6 +2030,19 @@ fn stage_c(
     write_file("/proc/self/setgroups", "deny")?;
     write_file("/proc/self/uid_map", &format!("0 {} 1", ids.uid))?;
     write_file("/proc/self/gid_map", &format!("0 {} 1", ids.gid))?;
+    // This network namespace is the intermediate one: it only gives the
+    // sandbox's namespace, created from it next, VSOCK mode local. C leaves
+    // it with that unshare; nothing holds it, and the kernel frees it.
+    // Everything below (lo, nft, the discard interface, pasta, D, S and the
+    // command) is in the sandbox's namespace.
+    let asked = crate::vsock::ask_local();
+    unshare(CloneFlags::CLONE_NEWNET)
+        .map_err(|e| format!("cannot create the sandbox's network namespace ({e})"))?;
+    let vsock = crate::vsock::sandbox_mode(vsock_host);
+    write_line(up_w, &format!("vsock {}", vsock.name()));
+    if vsock == crate::vsock::Mode::Global {
+        return Err(crate::vsock::refusal(asked.err().as_deref()));
+    }
     crate::netlink::set_link_up(crate::netlink::LO_INDEX)
         .map_err(|e| format!("cannot bring lo up inside the namespace: {e}"))?;
     for addr in &plan.lo_addrs {
@@ -3580,6 +3620,18 @@ mod tests {
     }
 
     #[test]
+    fn parent_state_reads_the_vsock_mode() {
+        let mut st = ParentState::default();
+        st.handle_line("vsock local");
+        assert_eq!(st.vsock, Some(crate::vsock::Mode::Local));
+        st.handle_line("vsock not_confined");
+        assert_eq!(st.vsock, Some(crate::vsock::Mode::NotConfined));
+        // An unknown word is no mode, which P does not run with.
+        st.handle_line("vsock isolated");
+        assert_eq!(st.vsock, None);
+    }
+
+    #[test]
     fn parent_state_parses_lines() {
         let mut st = ParentState {
             buf: Vec::new(),
@@ -3609,6 +3661,7 @@ mod tests {
             cut_packets: None,
             uncounted: None,
             uncounted_unsaid: None,
+            vsock: None,
         };
         st.handle_line("uncounted IPv6 packets to other hosts fail at routing");
         st.handle_line("uncounted a second reason");
