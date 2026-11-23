@@ -3436,7 +3436,7 @@ mod tests {
         assert_eq!(st.cut, Some(Ok(())));
         st.handle_line("afterend 12");
         assert_eq!(st.refused_after_end, Some(12));
-        st.handle_line(r#"contacts {"destinations":[{"address":"192.0.2.1","protocol":"tcp","port":443,"packets":1}],"truncated":false}"#);
+        st.handle_line(r#"contacts {"destinations":[{"address":"192.0.2.1","protocol":"tcp","port":443,"packets":1,"answered":true,"reset":false}],"truncated":false}"#);
         let Some(Ok(contacted)) = &st.contacts else {
             panic!("{:?}", st.contacts)
         };

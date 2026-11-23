@@ -18,6 +18,14 @@ use crate::ruleset::{
 /// date names one moment; `UTC0` is a POSIX zone that needs no zone files.
 pub const LISTING_TZ: &str = "UTC0";
 
+/// The sets of replies that must start empty, like the contacted sets.
+const REPLY_SETS: [&str; 4] = [
+    contacts::ANSWERED4,
+    contacts::ANSWERED6,
+    contacts::RESET4,
+    contacts::RESET6,
+];
+
 #[derive(Default, Debug, PartialEq, Eq)]
 struct Table {
     // Declaration order is immaterial. Expression order within a rule and
@@ -134,6 +142,10 @@ fn declarations(timed: bool, with: Instrumentation) -> Table {
         sets.extend([
             (contacts::SEEN4, "ipv4_addr"),
             (contacts::SEEN6, "ipv6_addr"),
+            (contacts::ANSWERED4, "ipv4_addr"),
+            (contacts::ANSWERED6, "ipv6_addr"),
+            (contacts::RESET4, "ipv4_addr"),
+            (contacts::RESET6, "ipv6_addr"),
         ]);
     }
     for (name, kind) in sets {
@@ -210,6 +222,24 @@ fn expected(approval: &Approval, with: Instrumentation) -> Table {
     let input = table.chains.get_mut("input").expect("declared input chain");
     input.push(json!([matcher("==", meta("iif"), json!("lo")), {"accept":null}]));
     input.extend(end_rules(end, false));
+    if with.record_contacts {
+        for (family, answered, reset) in [
+            ("ip", contacts::ANSWERED4, contacts::RESET4),
+            ("ip6", contacts::ANSWERED6, contacts::RESET6),
+        ] {
+            let key = |protocol: &str| json!({"concat":[payload(family,"saddr"),meta("l4proto"),payload(protocol,"sport")]});
+            input.push(json!([
+                matcher("in", json!({"ct":{"key":"state"}}), json!(2)),
+                matcher("==", meta("l4proto"), members([json!(6), json!(17)])),
+                {"set":{"op":"add","elem":key("th"),"set":format!("@{answered}")}}
+            ]));
+            input.push(json!([
+                matcher("in", json!({"ct":{"key":"state"}}), json!(2)),
+                matcher("==", json!({"&":[payload("tcp","flags"),4]}), json!(4)),
+                {"set":{"op":"add","elem":key("tcp"),"set":format!("@{reset}")}}
+            ]));
+        }
+    }
     input.extend([established, neighbour_discovery]);
     if let Some(chain) = table.chains.get_mut(contacts::CHAIN) {
         chain.push(json!([{"counter":contacts::COUNTER}]));
@@ -337,6 +367,8 @@ fn normalize_expression(expr: &mut Value) {
                 *right = json!(second);
             }
         } else if left == json!({"ct":{"key":"state"}}) {
+            // One state is printed as a string, several as a list.
+            symbol(right, &[("established", 2), ("related", 4)]);
             if let Some(values) = right.as_array_mut() {
                 for member in &mut *values {
                     symbol(member, &[("established", 2), ("related", 4)]);
@@ -375,12 +407,35 @@ fn normalize_expression(expr: &mut Value) {
             }
         }
     }
+    // `tcp flags & rst == rst`: nft prints the flag by name, or with
+    // --numeric as 4.
+    if let Some(m) = expr.get_mut("match").and_then(Value::as_object_mut)
+        && let Some(mask) = m
+            .get_mut("left")
+            .and_then(|left| left.get_mut("&"))
+            .and_then(Value::as_array_mut)
+        && mask.first() == Some(&payload("tcp", "flags"))
+        && let Some(flag) = mask.get_mut(1)
+    {
+        symbol(flag, &[("rst", 4)]);
+        if let Some(right) = m.get_mut("right") {
+            symbol(right, &[("rst", 4)]);
+        }
+    }
     if let Some(reject) = expr.get_mut("reject")
         && reject.get("type").and_then(Value::as_str) == Some("icmpx")
         && let Some(code) = reject.get_mut("expr")
     {
         symbol(code, &[("admin-prohibited", 3)]);
     }
+}
+
+/// Whether the set `name` must have no element at the start.
+fn starts_empty(name: &str) -> bool {
+    [CUT_SET, contacts::SEEN4, contacts::SEEN6]
+        .into_iter()
+        .chain(REPLY_SETS)
+        .any(|empty| empty == name)
 }
 
 fn parse(mut value: Value) -> Result<Table, String> {
@@ -459,10 +514,7 @@ fn parse(mut value: Value) -> Result<Table, String> {
                 // start: the run would start with a firewall that is not
                 // the one rendered. One in a set of contacted destinations
                 // would report a destination nothing contacted.
-                if kind == "set"
-                    && [CUT_SET, contacts::SEEN4, contacts::SEEN6].contains(&name.as_str())
-                    && data.contains_key("elem")
-                {
+                if kind == "set" && starts_empty(&name) && data.contains_key("elem") {
                     return Err(format!("the {name} set is not empty"));
                 }
                 if kind == "set"
@@ -821,8 +873,8 @@ mod tests {
         let elsewhere = CONTACTS.replacen("\"target\": \"contacted\"", "\"target\": \"input\"", 1);
         assert_eq!(contacts(&elsewhere, 0), Err("output rule 7 differs".into()));
         let dropped = CONTACTS.replace(
-            "\"chain\": \"contacted\", \"handle\": 38, \"expr\": [{\"accept\": null}]",
-            "\"chain\": \"contacted\", \"handle\": 38, \"expr\": [{\"drop\": null}]",
+            "\"chain\": \"contacted\", \"handle\": 42, \"expr\": [{\"accept\": null}]",
+            "\"chain\": \"contacted\", \"handle\": 42, \"expr\": [{\"drop\": null}]",
         );
         assert_ne!(CONTACTS, dropped);
         assert_eq!(
@@ -845,6 +897,53 @@ mod tests {
             contacts(&swapped, 0),
             Err("contacted rule 2 differs".into())
         );
+    }
+
+    #[test]
+    fn the_reply_rules_are_part_of_the_record() {
+        // Each of the four rules and each of the four sets is required.
+        for needle in [
+            "\"@answered4\"",
+            "\"@answered6\"",
+            "\"@reset4\"",
+            "\"@reset6\"",
+        ] {
+            let other = CONTACTS.replacen(needle, "\"@seen4\"", 1);
+            assert_ne!(CONTACTS, other);
+            assert!(
+                contacts(&other, 0).is_err_and(|e| e.starts_with("input rule")),
+                "{needle}"
+            );
+        }
+        // A reset that is not a reset.
+        let flag = CONTACTS.replacen(
+            "\"rst\"]}, \"right\": \"rst\"",
+            "\"syn\"]}, \"right\": \"syn\"",
+            1,
+        );
+        assert_ne!(CONTACTS, flag);
+        assert!(contacts(&flag, 0).is_err());
+        // The same replies recorded by a rule that also accepts or drops.
+        let verdict = CONTACTS.replacen(
+            "\"set\": \"@answered4\"}}",
+            "\"set\": \"@answered4\"}}, {\"accept\": null}",
+            1,
+        );
+        assert_ne!(CONTACTS, verdict);
+        assert!(contacts(&verdict, 0).is_err());
+        // A reply set that does not start empty.
+        let filled = CONTACTS.replacen(
+            "\"name\": \"reset6\", \"table\": \"playpen\", \"type\": [\"ipv6_addr\", \"inet_proto\", \"inet_service\"], \"handle\": 15, \"size\": 1024, \"flags\": [\"dynamic\"]",
+            "\"name\": \"reset6\", \"table\": \"playpen\", \"type\": [\"ipv6_addr\", \"inet_proto\", \"inet_service\"], \"handle\": 15, \"size\": 1024, \"flags\": [\"dynamic\"], \"elem\": []",
+            1,
+        );
+        assert_ne!(CONTACTS, filled);
+        assert_eq!(
+            contacts(&filled, 0),
+            Err("the reset6 set is not empty".into())
+        );
+        // Without the option the rules are not wanted.
+        assert!(verify_policy(CONTACTS, &approval()).is_err());
     }
 
     #[test]

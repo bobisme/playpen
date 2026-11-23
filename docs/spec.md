@@ -928,8 +928,9 @@ no rule. `--until` is checked as by `run` (a time in the past, or with
 (section 6.1); with `--pass` and no `--until` the time rule is at
 `valid_until`. `--report-contacts` prints the ruleset that `run
 --report-contacts` loads: each grant rule ends in `goto contacted` in
-place of `accept`, and the `contacted` counter, the `seen4` and `seen6`
-sets and the `contacted` chain are added (section 6.1, item 7). Without it
+place of `accept`, and the `contacted` counter, the `seen4`, `seen6`, `answered4`, `answered6`,
+`reset4` and `reset6` sets, the `contacted` chain and four rules in the
+input chain are added (sections 6.1, item 7, and 6.2). Without it
 the output is the same as before the option existed. `--on-drop cut` or
 `stop` prints the ruleset with the tripwire (section 6.1; both values give
 the same ruleset), and the JSON then has `"on_drop": "cut"` or `"stop"`;
@@ -1086,7 +1087,7 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `dropped_error` | string or null | why the counters could not be read |
 | `lookups` | object or null | the names the command looked up: `{"names": [{"name", "count", "mapped"}], "truncated": bool}`, in the order first asked, as shown in "Name lookups" (4.1); `mapped` is true for a `--host` name; null when the command did not run or the record could not be read |
 | `lookups_error` | string or null | why the record of names could not be read |
-| `contacted` | object or null | present only with `--report-contacts`: `{"destinations": [{"address", "protocol", "port", "packets"}], "truncated": bool}`, as shown in "Contacted destinations in private reports"; null when `outcome` is not `"ran"` or the record could not be read |
+| `contacted` | object or null | present only with `--report-contacts`: `{"destinations": [{"address", "protocol", "port", "packets", "answered", "reset"}], "truncated": bool}`, as shown in "Contacted destinations in private reports"; null when `outcome` is not `"ran"` or the record could not be read |
 | `contacted_error` | string or null | present only with `--report-contacts`: why the record of contacted destinations could not be read |
 | `refused_after_end` | integer or null | packets the command sent that the firewall refused because the approval had ended: by the time rule from the end second on, or by the cut once playpen stopped the command (section 6.1). Not part of `dropped`, not unapproved destinations, and not judged by `--fail-on-drop`. Null when the counters could not be read. With `--on-drop` and a tripped cut, the time rule's packets only, and null also when the `cut` counter could not be read: every packet the cut refused came after the trip and is in `egress_cut.refused` |
 | `socket_guard` | `"landlock"` or `"mounts_only"` | how host Unix sockets were kept from the command; `"mounts_only"` with `--without-landlock` |
@@ -1160,15 +1161,38 @@ With the option, each grant rule ends in `goto contacted` in place of
 `contacted`, adds its destination address, protocol and port to the set
 `seen4` (IPv4) or `seen6` (IPv6), and accepts the packet (section 6.1,
 item 7). Each set entry has its own packet counter. Each set holds 1024
-entries, as the drop sets do. The start-up check (section 5, step 6)
-compares this chain, the counter, both sets and the `goto` of every grant,
-and requires both sets to be empty. At teardown, the listing that gives
-the drop counters also gives the sets.
+entries, as the drop sets do.
+
+The input chain also records the replies (section 6.2). Before the rule
+that accepts established flows, four rules without a verdict match `ct
+state established` and add the reply's source address, protocol and
+source port, which is the key of the destination the command contacted:
+`answered4` and `answered6` take every TCP or UDP reply, `reset4` and
+`reset6` take TCP replies with the RST flag. These four sets have the
+shape and the size of the `seen` sets. The start-up check (section 5,
+step 6) compares this chain, the counter, the six sets, the four input
+rules and the `goto` of every grant, and requires all six sets to be
+empty. At teardown, the listing that gives the drop counters also gives
+the sets.
 
 `contacted` is `{"destinations": [{"address", "protocol", "port",
-"packets"}], "truncated": bool}`. The destinations are sorted by address
-(IPv4 first), then protocol, then port. `protocol` is `tcp` or `udp`:
-grants admit no other protocol.
+"packets", "answered", "reset"}], "truncated": bool}`. The destinations are
+sorted by address (IPv4 first), then protocol, then port. `protocol` is
+`tcp` or `udp`: grants admit no other protocol.
+
+`answered` is true when the destination sent at least one reply that is
+not a TCP reset: a SYN-ACK, data or a UDP datagram. It holds when the
+packet count of the destination in `answered*` is above its count in
+`reset*`. `reset` is true when the destination sent at least one TCP
+reset, which is a refusal. With `answered` false and `reset` true the
+destination refused; with both false it sent nothing the command
+received: a host that is down, a connection that timed out, a datagram
+nobody answered. An ICMP error (port or host unreachable) is not a reply
+here: its state is `related`, not `established`, and its source is a
+router or the host, with another protocol. So a UDP destination that
+refused with an ICMP error has both false. The fields cover all flows of
+the run to that destination: `answered` can be true when one flow worked
+and another did not.
 
 `packets` counts flow starts, not volume. A grant sees a packet only while
 conntrack has seen no reply in its flow, because `ct state
@@ -1183,7 +1207,9 @@ recorded: no grant admits it (section 6.1 says what happens to it).
 `truncated` is true when the list can leave out a destination: when more
 destinations of one address family reached the chain than a set holds, or
 when the entries do not add up to the `contacted` counter, or when the
-listing has an entry or a set that playpen cannot read. A full set does not
+listing has an entry or a set that playpen cannot read, or lacks one of
+the four reply sets, or has a reply from a destination that is not in the
+list. A full set does not
 change what is admitted: the addition is a rule of its own in the chain,
 and a failed addition ends only that rule (DESIGN.md, "Contacted
 destinations").
@@ -1319,6 +1345,16 @@ contains `[` and `]`, which a shell can take as a file name pattern: run
 `set -f` before such a substitution. With nothing contacted, stderr also
 says that `--no-network` admits the same traffic.
 
+A destination whose `answered` is false stays in the list, so the options
+are the same as without the mark. stderr then also says `playpen: N of the
+destinations above got no usable answer, so the command may not have used
+them; they are still listed:` and, one line each, `playpen:   SPEC: no
+reply` or `playpen:   SPEC: refused with a TCP reset`. `no reply` is
+`answered` and `reset` both false. A report without `answered` (a
+hand-written one, or from before the field) has no mark. A report with
+`answered` that is not a boolean, or `reset` without `answered`, is
+`invalid-report`.
+
 With `--pass` (the report's `pass` is an object), `--allow` cannot be
 added beside the pass. `suggest` then prints each destination without
 `--allow`: these are the destinations that a narrower pass from its owner
@@ -1328,10 +1364,14 @@ destinations. With nothing contacted under a pass, stdout is empty. The
 pass id is not printed.
 
 JSON: `{"source": "allow" or "pass", "allow": [SPEC...], "hosts":
-["NAME=ADDR"...], "no_network": bool, "advice": [...]}`. Under a pass,
-`allow` holds the destinations. The first advice has type `one-run` and
-the caution. A second advice has type `pass` or `nothing-contacted` when
-the text output prints that note.
+["NAME=ADDR"...], "no_network": bool, "unanswered": [{"destination": SPEC,
+"answer": "no-reply" or "refused"}...], "advice": [...]}`. Under a pass,
+`allow` holds the destinations. `unanswered` lists the destinations that
+did not answer, in the order of `allow`, and is empty when all did or the
+report has no `answered`. The first advice has type `one-run` and the
+caution. A second advice has type `pass` or `nothing-contacted` when the
+text output prints that note. An advice of type `unanswered` (level
+`warn`) has the text that stderr shows.
 
 Exit 0 means printed. Exit 2 means refused, with nothing on stdout. The
 error type is `incomplete-record` when `outcome` is not `"ran"`, when the
@@ -1340,8 +1380,8 @@ when `contacted` is null (the record is unavailable; the message gives
 `contacted_error`), or when `truncated` is not `false`. It is
 `invalid-report` when the file cannot be read, is larger than 1 MiB, is
 not JSON or not a full 0.1.0 report (a shareable report is not), when a
-destination is not exactly an address, `tcp` or `udp`, a port and a packet
-count, when a destination is listed twice, when a destination is not
+destination is not exactly an address, `tcp` or `udp`, a port, a packet
+count and (when the entry has them) the flags `answered` and `reset`, when a destination is listed twice, when a destination is not
 admitted by `allowed`, or when `allowed` or `hosts` does not parse.
 
 ### Pass enforcement coverage
@@ -1441,7 +1481,9 @@ Each step either succeeds or stops the run with a message that ends
    the packet mark against the `cut` set, the time, set additions, counters
    and verdicts, `goto contacted` among them. The `cut` set must be empty.
    With `--report-contacts`, the `contacted` chain, its counter and the
-   `seen4` and `seen6` sets are compared too, and both sets must be empty.
+   `seen4` and `seen6` sets, the four reply rules of the input chain and the
+   sets `answered4`, `answered6`, `reset4` and `reset6` are compared too,
+   and all six sets must be empty.
    With `--on-drop`, the tripwire and the size of the `cut` set are
    compared too (section 6.1). `nft --json` prints the time
    rule's operand as a date without an offset (`"2026-12-01 12:34:56"`) in
@@ -1571,7 +1613,8 @@ control pipe; D stops and sends its record of names (within 2 seconds, or
 C kills it and reports why). C reports the record, lists the table again to
 read the counters (`dropped`, the drop sets, the grant counters, `late`
 and `cut`, and with `--report-contacts` the `contacted` counter and the
-`seen4` and `seen6` sets), reports them, and exits. P stops pasta
+`seen4`, `seen6`, `answered4`, `answered6`, `reset4` and `reset6` sets),
+reports them, and exits. P stops pasta
 if it is still running (pasta also exits when the namespace's process is
 gone; it looks once a second), removes pasta's PID file and its private
 directory, prints the summary, writes the report, and exits. With
@@ -1631,7 +1674,8 @@ In this order:
    rules: `counter name "contacted"`; `meta nfproto ipv4 add @seen4 { ip
    daddr . meta l4proto . th dport }`; the same for IPv6 and `@seen6`; and
    `accept`. A full set makes its addition fail, which ends only that rule,
-   so the packet is still accepted;
+   so the packet is still accepted. The input chain gets four more rules
+   (section 6.2);
 8. everything else: added to a per-destination set with a counter
    (address, protocol, port; port 0 for protocols other than TCP and UDP),
    counted in the `dropped` counter, and rejected with ICMP
@@ -1697,11 +1741,23 @@ So by default:
 Input, in this order: accepts anything arriving on `lo`; with an end
 time, drops everything else from the end second on (`meta time >=
 END-SECOND drop`); drops everything else once the cut is in place (`meta
-mark @cut drop`); accepts established/related traffic and IPv6 neighbour
+mark @cut drop`); with `--report-contacts`, four rules without a verdict
+that record replies (below); accepts established/related traffic and IPv6 neighbour
 solicitation/advertisement with hop limit 255. So nothing from outside can
 open a connection to the command, and after the approval ends nothing from
 outside reaches it. The two input rules have no counter: what arrives was
 not sent by the command. Forward accepts nothing.
+
+With `--report-contacts`, four rules come just before the established
+rule: `ct state established meta nfproto ipv4 meta l4proto { tcp, udp }
+add @answered4 { ip saddr . meta l4proto . th sport }`; `ct state
+established meta nfproto ipv4 tcp flags & rst == rst add @reset4 { ip
+saddr . meta l4proto . th sport }`; and the two for IPv6 with `ip6 saddr`,
+`@answered6` and `@reset6`. They end no packet: the established rule
+still accepts it. A reply is `established` only when it comes from the
+address and port the command sent to, so its source is the destination
+(`th sport`; nft prints `tcp sport` in the reset rule). Only replies
+reach them, because nothing can open a connection to the command.
 
 ### 6.3 pasta options
 

@@ -49,13 +49,13 @@ The comparator accepts the following expression vocabulary from these dumps.
 It checks connection state, interface, IP destination and prefix, IPv6 hop
 limit and ICMP type, transport protocol and inclusive ports, the packet
 mark against the `cut` set, the time, the four dynamic additions to the
-drop sets, the two to the `seen` sets and, with `--on-drop`, the addition
+drop sets, the two to the `seen` sets, the four to the `answered` and `reset` sets and, with `--on-drop`, the addition
 of the mark 0 to the `cut` set, the named counters, and accept, drop,
 `goto contacted` and ICMPx reject verdicts. Named and
 numeric spellings from the recorded dumps are equivalent, as are anonymous
 set member permutations and textual IP address spellings. Rule order and
 expression order are checked. Handles, counter values and the elements of
-the dynamic drop sets vary at runtime. The `cut`, `seen4` and `seen6` sets
+the dynamic drop sets vary at runtime. The `cut`, `seen4`, `seen6`, `answered4`, `answered6`, `reset4` and `reset6` sets
 must be empty. Unknown material objects and expressions are refused.
 
 Startup qualification used Playpen's normal `run` path on the same host
@@ -70,10 +70,16 @@ narrower-readback adapter delegates the real load unchanged.
 
 `contacts.json` is the `nonempty.json` approval with `--report-contacts`,
 recorded on the same host with nftables 1.1.7. It differs from
-`nonempty.json` only in the `contacted` counter, the `seen4` and `seen6`
-sets, the regular `contacted` chain with its four rules, and `goto
-contacted` in place of `accept` in the three grant rules. nft prints the two
-additions in that chain without their `meta nfproto` matches.
+`nonempty.json` only in the `contacted` counter, the `seen4`, `seen6`,
+`answered4`, `answered6`, `reset4` and `reset6` sets, the regular
+`contacted` chain with its four rules, four rules in the input chain
+before `ct state established,related accept` (the records of replies), and
+`goto contacted` in place of `accept` in the three grant rules. nft prints
+the two additions in that chain without their `meta nfproto` matches. In
+the input chain it prints `ct state established` as the string
+`"established"` (a list for two states, `2` with `--numeric`), the reset
+rule as `tcp flags & rst == rst` with `th sport` printed as `tcp sport`, and
+the `rst` flag as `4` with `--numeric`; the comparator reads these.
 
 `contacts-on-drop.json` is the `contacts.json` approval with `--on-drop`
 as well (`cut` and `stop` render the same table). It differs from

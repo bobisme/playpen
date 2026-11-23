@@ -37,6 +37,48 @@ struct Suggestion {
     /// `NAME=ADDR` for each `hosts` entry whose address was contacted, in
     /// the report's order.
     hosts: Vec<String>,
+    /// The destinations in `rules` that sent no reply the command could use,
+    /// in the order of `rules`. They are still in `rules`.
+    unanswered: Vec<(AllowRule, Unanswered)>,
+}
+
+/// What the report says about the answer of one destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// The entry has no `answered`: nothing is known either way.
+    Unmarked,
+    /// It sent a reply that was not a reset.
+    Answered,
+    /// It did not answer.
+    No(Unanswered),
+}
+
+/// What the record says about a destination that did not answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Unanswered {
+    /// It sent nothing back: no listener behind a drop, a host that is down,
+    /// a flow that timed out.
+    Silent,
+    /// It sent a TCP reset and nothing else: a host that refused.
+    Refused,
+}
+
+impl Unanswered {
+    /// The name in JSON.
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::Silent => "no-reply",
+            Self::Refused => "refused",
+        }
+    }
+
+    /// The words in the text.
+    const fn words(self) -> &'static str {
+        match self {
+            Self::Silent => "no reply",
+            Self::Refused => "refused with a TCP reset",
+        }
+    }
 }
 
 /// Why `suggest` refuses: the error type for JSON, and the message.
@@ -66,6 +108,21 @@ impl Suggestion {
         out
     }
 
+    /// The text on stderr about the destinations that did not answer.
+    fn unanswered_note(&self) -> Option<String> {
+        if self.unanswered.is_empty() {
+            return None;
+        }
+        let mut text = format!(
+            "{} of the destinations above got no usable answer, so the command may not have used them; they are still listed:",
+            self.unanswered.len()
+        );
+        for (rule, why) in &self.unanswered {
+            let _ = write!(text, "\nplaypen:   {rule}: {}", why.words());
+        }
+        Some(text)
+    }
+
     /// What the output says besides the caution: its type for JSON, and
     /// the text.
     fn note(&self) -> Option<(&'static str, &'static str)> {
@@ -85,8 +142,10 @@ impl Suggestion {
 }
 
 /// One contacted destination of the report, or `None` when the entry is
-/// not exactly an address, `tcp` or `udp`, a port and a packet count.
-fn destination(item: &Value) -> Option<(IpAddr, Proto, u16)> {
+/// not exactly an address, `tcp` or `udp`, a port, a packet count, and
+/// `answered` and `reset` flags when it has them. The last of the tuple is
+/// what the record says about an answer.
+fn destination(item: &Value) -> Option<(IpAddr, Proto, u16, Answer)> {
     let address = item["address"].as_str()?.parse().ok()?;
     let proto = match item["protocol"].as_str()? {
         "tcp" => Proto::Tcp,
@@ -95,7 +154,23 @@ fn destination(item: &Value) -> Option<(IpAddr, Proto, u16)> {
     };
     let port = u16::try_from(item["port"].as_u64()?).ok()?;
     item["packets"].as_u64()?;
-    Some((address, proto, port))
+    let answer = match (item.get("answered"), item.get("reset")) {
+        (None, None) => Answer::Unmarked,
+        (Some(Value::Bool(answered)), reset) => {
+            let reset = match reset {
+                None => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => return None,
+            };
+            match (answered, reset) {
+                (true, _) => Answer::Answered,
+                (false, true) => Answer::No(Unanswered::Refused),
+                (false, false) => Answer::No(Unanswered::Silent),
+            }
+        }
+        _ => return None,
+    };
+    Some((address, proto, port, answer))
 }
 
 /// A text field of the report as it may be shown: quoted, with every
@@ -151,10 +226,11 @@ fn suggest(v: &Value) -> Result<Suggestion, Refusal> {
         .as_array()
         .ok_or_else(|| invalid("contacted has no destinations array".into()))?;
     let mut rules = BTreeSet::new();
+    let mut unanswered = Vec::new();
     for (n, item) in (1..).zip(items) {
-        let (address, proto, port) = destination(item).ok_or_else(|| {
+        let (address, proto, port, answer) = destination(item).ok_or_else(|| {
             invalid(format!(
-                "contacted destination {n} is not an address, tcp or udp, a port and a packet count"
+                "contacted destination {n} is not an address, tcp or udp, a port, a packet count and answered and reset flags"
             ))
         })?;
         let width = if address.is_ipv4() { 32 } else { 128 };
@@ -171,7 +247,11 @@ fn suggest(v: &Value) -> Result<Suggestion, Refusal> {
         if !rules.insert(rule) {
             return Err(invalid(format!("contacted lists {rule} twice")));
         }
+        if let Answer::No(why) = answer {
+            unanswered.push((rule, why));
+        }
     }
+    unanswered.sort();
     let addresses: BTreeSet<IpAddr> = rules.iter().map(|r| r.net.addr()).collect();
     let mut hosts = Vec::new();
     for raw in v["hosts"]
@@ -188,6 +268,7 @@ fn suggest(v: &Value) -> Result<Suggestion, Refusal> {
         pass: v["pass"].is_object(),
         rules,
         hosts,
+        unanswered,
     })
 }
 
@@ -213,12 +294,16 @@ pub fn run_formatted(path: &Path, format: Format) -> i32 {
         if let Some((kind, message)) = note {
             advice.push(json!({"level":"info","type":kind,"message":message}));
         }
+        if let Some(message) = s.unanswered_note() {
+            advice.push(json!({"level":"warn","type":"unanswered","message":message}));
+        }
         println!(
             "{}",
             json!({
                 "source": if s.pass { "pass" } else { "allow" },
                 "allow": s.rules.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 "hosts": s.hosts,
+                "unanswered": s.unanswered.iter().map(|(rule, why)| json!({"destination": rule.to_string(), "answer": why.kind()})).collect::<Vec<_>>(),
                 "no_network": s.no_network(),
                 "advice": advice,
             })
@@ -227,6 +312,9 @@ pub fn run_formatted(path: &Path, format: Format) -> i32 {
         // Only the options go to stdout, so it can be given to run as it is.
         print!("{}", s.lines());
         if let Some((_, message)) = note {
+            eprintln!("playpen: {message}");
+        }
+        if let Some(message) = s.unanswered_note() {
             eprintln!("playpen: {message}");
         }
         eprintln!("playpen: caution: {CAUTION}");
@@ -309,6 +397,44 @@ mod tests {
         // Nor an address that can never be approved.
         v["contacted"]["destinations"][0]["address"] = "127.0.0.1".into();
         assert!(refusal(&v).1.contains("loopback"));
+    }
+
+    #[test]
+    fn destinations_that_did_not_answer_are_marked_and_still_listed() {
+        let plain = suggest(&report()).unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(plain.unanswered.is_empty() && plain.unanswered_note().is_none());
+        let mut v = report();
+        let entries = v["contacted"]["destinations"]
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("destinations"));
+        for (entry, (answered, reset)) in
+            entries
+                .iter_mut()
+                .zip([(true, false), (false, false), (false, true), (true, true)])
+        {
+            entry["answered"] = answered.into();
+            entry["reset"] = reset.into();
+        }
+        let s = suggest(&v).unwrap_or_else(|e| panic!("{e:?}"));
+        // The options are the same with and without the marks.
+        assert_eq!(s.lines(), plain.lines());
+        let note = s.unanswered_note().unwrap_or_default();
+        assert_eq!(
+            note,
+            "2 of the destinations above got no usable answer, so the command may not have used them; they are still listed:\nplaypen:   198.51.100.7:9558/tcp: no reply\nplaypen:   [2001:db8::5]:53/udp: refused with a TCP reset"
+        );
+        // Only an `answered` that is not a boolean, or a `reset` alone, is wrong.
+        for bad in [
+            json!({"answered": 1}),
+            json!({"reset": true}),
+            json!({"answered": true, "reset": "no"}),
+        ] {
+            let mut v = report();
+            for (k, x) in bad.as_object().into_iter().flatten() {
+                v["contacted"]["destinations"][0][k] = x.clone();
+            }
+            assert_eq!(refusal(&v).0, "invalid-report", "{bad}");
+        }
     }
 
     #[test]

@@ -118,6 +118,10 @@ fn declarations(out: &mut String, timed: bool, with: Instrumentation) {
         sets.extend([
             (contacts::SEEN4, "ipv4_addr"),
             (contacts::SEEN6, "ipv6_addr"),
+            (contacts::ANSWERED4, "ipv4_addr"),
+            (contacts::ANSWERED6, "ipv6_addr"),
+            (contacts::RESET4, "ipv4_addr"),
+            (contacts::RESET6, "ipv6_addr"),
         ]);
     }
     // The contacted sets have the shape of the drop sets.
@@ -240,6 +244,9 @@ pub fn render_instrumented(approval: &Approval, with: Instrumentation) -> String
     );
     let _ = writeln!(out, "\t\tiif \"lo\" accept");
     end_rules(&mut out, end, false);
+    if with.record_contacts {
+        reply_rules(&mut out);
+    }
     let _ = writeln!(out, "\t\tct state established,related accept");
     let _ = writeln!(
         out,
@@ -254,6 +261,30 @@ pub fn render_instrumented(approval: &Approval, with: Instrumentation) -> String
     let _ = writeln!(out, "\t}}");
     let _ = writeln!(out, "}}");
     out
+}
+
+/// With `--report-contacts`, the rules of the input chain that record the
+/// replies of established flows, before the rule that accepts them. They
+/// have no verdict. A reply names the destination it came from by its
+/// source address, protocol and source port: the key of the contacted
+/// sets. `answered` counts every TCP or UDP reply; `reset` counts the TCP
+/// replies with RST. A destination with more replies than resets sent
+/// something else (see [`crate::contacts`]).
+fn reply_rules(out: &mut String) {
+    for (family, addr, answered, reset) in [
+        ("ipv4", "ip", contacts::ANSWERED4, contacts::RESET4),
+        ("ipv6", "ip6", contacts::ANSWERED6, contacts::RESET6),
+    ] {
+        let key = format!("{{ {addr} saddr . meta l4proto . th sport }}");
+        let _ = writeln!(
+            out,
+            "\t\tct state established meta nfproto {family} meta l4proto {{ tcp, udp }} add @{answered} {key}"
+        );
+        let _ = writeln!(
+            out,
+            "\t\tct state established meta nfproto {family} tcp flags & rst == rst add @{reset} {key}"
+        );
+    }
 }
 
 /// The regular chain every grant goes to with `--report-contacts`: count
@@ -651,6 +682,7 @@ mod tests {
             );
             let recorded = render_instrumented(&approval, contacts(counters));
             assert!(!plain.contains("contacted") && !plain.contains("seen"));
+            assert!(!plain.contains("answered") && !plain.contains("reset"));
             assert_eq!(recorded.matches(" goto contacted\n").count(), 2);
             let added = [
                 "\tcounter contacted {}\n".to_owned(),
@@ -658,6 +690,19 @@ mod tests {
                 "\tset seen6 {\n\t\ttype ipv6_addr . inet_proto . inet_service\n\t\tsize 1024\n\t\tflags dynamic\n\t\tcounter\n\t}\n".into(),
                 format!("\t{}\n\t}}\n", chain(&recorded, "contacted")),
             ];
+            let set = |name: &str, ty: &str| {
+                format!(
+                    "\tset {name} {{\n\t\ttype {ty} . inet_proto . inet_service\n\t\tsize 1024\n\t\tflags dynamic\n\t\tcounter\n\t}}\n"
+                )
+            };
+            let added = added.into_iter().chain([
+                set("answered4", "ipv4_addr"),
+                set("answered6", "ipv6_addr"),
+                set("reset4", "ipv4_addr"),
+                set("reset6", "ipv6_addr"),
+                "\t\tct state established meta nfproto ipv4 meta l4proto { tcp, udp } add @answered4 { ip saddr . meta l4proto . th sport }\n\t\tct state established meta nfproto ipv4 tcp flags & rst == rst add @reset4 { ip saddr . meta l4proto . th sport }\n\t\tct state established meta nfproto ipv6 meta l4proto { tcp, udp } add @answered6 { ip6 saddr . meta l4proto . th sport }\n\t\tct state established meta nfproto ipv6 tcp flags & rst == rst add @reset6 { ip6 saddr . meta l4proto . th sport }\n".into(),
+            ]);
+            let added: Vec<String> = added.collect();
             let mut stripped = recorded.replace(" goto contacted\n", " accept\n");
             for text in &added {
                 assert_eq!(stripped.matches(text.as_str()).count(), 1, "{text}");

@@ -360,7 +360,19 @@ playpen: caution: this is what one run contacted. One quiet run does not show th
 $ playpen run $(playpen suggest wide.json) -- ./client
 ```
 
-The options go to stdout and the caution goes to stderr. `suggest` never
+The options go to stdout and the caution goes to stderr. The record also
+says whether each destination answered. A destination that sent nothing
+back (a host that is down, a connection that timed out) or only a TCP
+reset (nothing listens) is still printed, and stderr names it:
+
+```text
+playpen: 2 of the destinations above got no usable answer, so the command may not have used them; they are still listed:
+playpen:   198.51.100.9:8080/tcp: no reply
+playpen:   198.51.100.7:9559/tcp: refused with a TCP reset
+```
+
+Look at these first when you narrow the list. A UDP port that refused
+with an ICMP error counts as no reply. `suggest` never
 prints a destination that the run's own grants did not admit. It refuses a
 record that is truncated or unavailable, and a report whose `outcome` is
 not `ran`. A

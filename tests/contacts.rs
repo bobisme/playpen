@@ -289,6 +289,15 @@ fn wide_run(dir: &Path, report_path: &Path) -> Vec<(String, u64)> {
     );
     // One connection each: one flow start each.
     assert!(listed.iter().all(|(_, p)| *p == 1), "{listed:?}");
+    // Every one of them has a listener: answered, not refused.
+    assert!(
+        report["contacted"]["destinations"]
+            .as_array()
+            .is_some_and(|d| d
+                .iter()
+                .all(|d| d["answered"] == true && d["reset"] == false)),
+        "{report}"
+    );
     for (a, p) in [(7, 9557), (7, 9558), (9, 9557)] {
         assert_eq!(accepted(dir, a, p), 1, "198.51.100.{a}:{p}");
     }
@@ -353,6 +362,99 @@ fn suggested_options_admit_the_same_requests_and_drop_a_fourth() {
     assert_eq!(names(&again), names(&listed));
     let _ = std::fs::remove_dir_all(&wide);
     let _ = std::fs::remove_dir_all(&narrow);
+}
+
+/// A destination that answered, one that refused with a reset, and one
+/// that was silent (a host that is not there: the connection times out,
+/// as 198.51.100.9:8080 did in the evaluation). The record tells them
+/// apart, `suggest` still prints all three and says which two got no
+/// usable answer.
+#[test]
+fn suggest_marks_the_destinations_that_never_answered() {
+    require!(fake_host_skip());
+    let dir = tmpdir("answers");
+    let report_path = dir.join("report.json");
+    let targets = [
+        // A listener: the handshake completes.
+        "198.51.100.7:9557/tcp",
+        // The address is the host's, the port has no listener: a reset.
+        "198.51.100.7:9559/tcp",
+        // No such host behind the dummy route: nothing comes back.
+        "198.51.100.20:9558/tcp",
+    ];
+    let mut args = vec![
+        "run",
+        "--allow",
+        "198.51.100.0/24:9550-9560/tcp",
+        "--report-contacts",
+        "--report",
+        path(&report_path),
+    ];
+    args.extend(reach_args(&targets));
+    let out = in_fake_host(&dir, &args);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let results = reach_results(&text(&out.stdout));
+    assert!(reached(&results, targets[0]), "{results:?}");
+    assert!(!reached(&results, targets[1]), "{results:?}");
+    assert!(!reached(&results, targets[2]), "{results:?}");
+    let report = read_report(&report_path);
+    assert_eq!(report["contacted"]["truncated"], false, "{report}");
+    let marks: Vec<(String, bool, bool)> = report["contacted"]["destinations"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|d| {
+            (
+                format!("{}:{}", d["address"].as_str().unwrap_or("?"), d["port"]),
+                d["answered"].as_bool().unwrap_or(false),
+                d["reset"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect();
+    assert_eq!(
+        marks,
+        [
+            ("198.51.100.7:9557".to_owned(), true, false),
+            ("198.51.100.7:9559".to_owned(), false, true),
+            ("198.51.100.20:9558".to_owned(), false, false),
+        ],
+        "{report}"
+    );
+
+    let out = playpen(&["suggest", path(&report_path)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    // Nothing is dropped from the options.
+    assert_eq!(
+        text(&out.stdout),
+        "--allow 198.51.100.7:9557/tcp\n--allow 198.51.100.7:9559/tcp\n--allow 198.51.100.20:9558/tcp\n"
+    );
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("playpen: 2 of the destinations above got no usable answer"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("playpen:   198.51.100.7:9559/tcp: refused with a TCP reset\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("playpen:   198.51.100.20:9558/tcp: no reply\n"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("198.51.100.7:9557/tcp:"), "{stderr}");
+
+    let out = playpen(&["--format", "json", "suggest", path(&report_path)]);
+    let s: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    assert_eq!(
+        s["unanswered"],
+        json!([
+            {"destination": "198.51.100.7:9559/tcp", "answer": "refused"},
+            {"destination": "198.51.100.20:9558/tcp", "answer": "no-reply"}
+        ]),
+        "{s}"
+    );
+    assert_eq!(s["allow"].as_array().map(Vec::len), Some(3), "{s}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// More destinations than a set holds: the record says it is truncated,

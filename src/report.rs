@@ -615,6 +615,8 @@ mod tests {
                     protocol: "tcp".into(),
                     port: 4242,
                     packets: 1,
+                    answered: false,
+                    reset: false,
                 }],
                 truncated: false,
             }),
@@ -819,6 +821,8 @@ mod tests {
                     protocol: "udp".into(),
                     port: 53,
                     packets: 2,
+                    answered: true,
+                    reset: false,
                 }],
                 truncated: true,
             }),
@@ -827,7 +831,7 @@ mod tests {
         let json = serde_json::to_value(&r).unwrap_or_default();
         assert_eq!(
             json["contacted"],
-            serde_json::json!({"destinations":[{"address":"192.0.2.7","protocol":"udp","port":53,"packets":2}],"truncated":true})
+            serde_json::json!({"destinations":[{"address":"192.0.2.7","protocol":"udp","port":53,"packets":2,"answered":true,"reset":false}],"truncated":true})
         );
         let t = text_summary(&r);
         assert!(

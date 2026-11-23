@@ -803,8 +803,9 @@ matter for safety:
    It checks table family, chain hooks, priorities and policies, ordered rule
    expressions and verdicts, and the accounting sets and counters,
    including the time rule and the empty `cut` set, and with
-   `--report-contacts` the `contacted` chain and the empty `seen4` and
-   `seen6` sets, and with `--on-drop` the tripwire and the declared size
+   `--report-contacts` the `contacted` chain, the empty `seen4`,
+   `seen6`, `answered4`, `answered6`, `reset4` and `reset6` sets and the
+   four reply rules of the input chain, and with `--on-drop` the tripwire and the declared size
    of `cut`. It normalizes the
    supported numeric and symbolic spellings (and reads the time, listed
    with `TZ=UTC0`, as UTC) and ignores handles, counter values and the
@@ -1361,7 +1362,71 @@ not answered). So `packets` counts flow starts. The byte count is left
 out: it would be the bytes of these packets only. ICMP never reaches a
 grant.
 
-**Start empty.** The start-up readback requires both sets to be empty, as
+**Answered or not.** A grant admits the first packet of a flow, so the
+record alone cannot say whether anything came back. `playpen suggest` once
+printed `--allow 198.51.100.9:8080/tcp`, a destination with no listener
+whose connection timed out, like the working ones. The ruleset now also
+sees the replies, in the input chain, just before `ct state
+established,related accept`: four rules with no verdict that add `ip
+saddr . meta l4proto . th sport` (or `ip6`) of an established TCP or UDP
+packet to `answered4`/`answered6`, and of a TCP packet with RST to
+`reset4`/`reset6`. For a flow the command started, that triple is exactly
+the `seen` key of its destination.
+
+Measured on Linux 7.2.8 with nftables 1.1.7, in a throwaway `unshare -Urn`
+namespace, with the input rules on loopback: a TCP connect to a listener
+added the listener to the answered set (and, because loopback shows both
+directions, the client's ephemeral port too, which the real input chain
+never sees: only the sandbox's own `lo` traffic is accepted before the
+rules); a connect to a closed port added an entry to the reset set only;
+a UDP datagram that was answered added the peer; a UDP datagram to a closed
+port, whose ICMP port-unreachable came back, added nothing, since that
+error is `related`, has protocol icmp and comes from another address.
+Through pasta, in the fake host of `tests/contacts.rs`: a listener gives a
+SYN-ACK (answered), an address of the host with no listener gives a
+reset (refused), and an address that is not there gives nothing, so pasta
+sent no SYN-ACK before its own connect succeeded.
+
+**Rejected, by reasoning.** (1) A `ct state established` match in the
+output chain: the output chain sees only what the command sends, never the
+reply, and a rule there would run on every packet the command sends, not
+only on flow starts. (2) `ct status seen-reply` in the `contacted` chain:
+only flow starts reach that chain (the established rule comes first), and
+a flow start has no reply yet, so the answer is always no. (3) One set
+for all replies: a refusal would look like an answer. (4) One set for
+the resets and one for the replies that are not resets: it needs one
+more rule and the same sets. The sets here count every reply in
+`answered*` and the resets in `reset*`, so a destination answered when
+its count in `answered*` is above its count in `reset*`. Both counts come
+from one `nft list`, which is one consistent view.
+
+**What the answer means.** `answered` is a fact about what reached the
+sandbox: a reply conntrack accepted as part of the flow, so its source
+address, protocol and port are the destination's. No other host can
+forge one without the command's own flow tuple. It does not say that the
+command read it, or that the reply was good (a 500 is a reply; so is a
+TLS alert). A TCP reset is a refusal (`reset`), also when it comes in the
+middle of a connection; then both fields are true. A UDP destination that
+sent an ICMP error is shown as no reply, because the error is not part of
+the flow. A destination that answered some flows and not others is
+`answered`. So an unanswered destination is a destination that was not
+used successfully in this run, not one that is never needed: the
+caution about one run stays. `suggest` prints it all the same, and says
+which ones got no usable answer on stderr and in JSON, never dropping a
+line: a reviewer decides.
+
+**Cost.** Four sets (1024 entries each, so at most 4096 more entries in
+the table), four rules in the input chain and one counter update per
+reply packet of a TCP or UDP flow (a set lookup and an update, which is
+more per packet than the single established rule). They are evaluated
+only with `--report-contacts`; without the option the ruleset is byte for
+byte what it was before (checked by a unit test that strips the added
+text from the recorded ruleset and compares it to the plain one). No set
+can fill before `seen` does: a reply of a flow has the key of a contacted
+destination, so the reply sets never hold more entries than `seen`. A reply
+from a key that `seen` does not hold makes the record `truncated`.
+
+**Start empty.** The start-up readback requires all six sets to be empty, as
 it does for `cut`. The rest of the record (counter, sets, chain, each
 grant's `goto`) is compared like the drop accounting. `nft --json` prints
 the two additions without their `meta nfproto` match, as it prints the

@@ -511,14 +511,15 @@ fn contacts_are_recorded_until_the_tripwire_closes_egress() {
     check_traffic(&traffic, &context);
 
     // Each datagram to A is a flow start (A never answers), so the record
-    // counts exactly the ones that left: all before the trip.
+    // counts exactly the ones that left: all before the trip. A never
+    // answers, so the destination has no answer.
     let left = traffic.to_a.iter().filter(|s| s.sent).count();
     assert!(left >= 10, "{context}");
     assert_eq!(
         report["contacted"],
         json!({
             "destinations": [
-                {"address": "198.51.100.7", "protocol": "udp", "port": 9571, "packets": left}
+                {"address": "198.51.100.7", "protocol": "udp", "port": 9571, "packets": left, "answered": false, "reset": false}
             ],
             "truncated": false
         }),
