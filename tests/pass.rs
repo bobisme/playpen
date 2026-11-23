@@ -545,9 +545,10 @@ fn a_revoked_pass_kills_a_command_that_ignores_sigterm() {
     assert!(took >= Duration::from_millis(800 + 3000), "took {took:?}");
     // ...and not much more than the edit, one interval and the grace.
     assert!(
-        // The slack covers teardown on a loaded machine (the stub's record,
-        // the cut, the counters); the lower bound above proves the grace.
-        took < Duration::from_millis(800 + 200 + 3000 + 3000),
+        // 0.8 s to the edit, a 0.2 s interval, the 3 s grace, and 3 s of
+        // slack for teardown on a loaded machine (the stub's record, the
+        // cut, the counters). The lower bound above proves the grace.
+        took < Duration::from_secs(7),
         "took {took:?}"
     );
     assert!(err.contains("revoked"), "{err}");
