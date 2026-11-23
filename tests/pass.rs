@@ -132,8 +132,13 @@ fn write_pass(path: &Path, contents: &str) {
     std::fs::rename(&tmp, path).unwrap_or_else(|e| panic!("{e}"));
 }
 
+/// Writes the pass `DIR/pass/test.pass.toml`: in a directory of its own, as
+/// the README says, so playpen hides that directory from the command, and
+/// the command can still write to `DIR` (markers, logs).
 fn new_pass(dir: &Path, contents: &str) -> PathBuf {
-    let path = dir.join("test.pass.toml");
+    let own = dir.join("pass");
+    std::fs::create_dir_all(&own).unwrap_or_else(|e| panic!("{e}"));
+    let path = own.join("test.pass.toml");
     write_pass(&path, contents);
     path
 }
@@ -298,6 +303,17 @@ fn pass_destinations_are_reachable_and_nothing_else_and_the_report_names_the_pas
     assert!(p["digest"].as_str().unwrap_or("").starts_with("sha256:"));
     assert_eq!(p["labels"], serde_json::json!(["web", "sip", "v6"]));
     assert_eq!(p["valid_until"], json["until"]);
+    // A directory of its own, outside the working directory: hidden.
+    assert_eq!(p["directory"], "hidden");
+    assert!(
+        start.contains(&format!(
+            "playpen:   pass directory: {} (hidden from the command)",
+            std::fs::canonicalize(dir.join("pass"))
+                .unwrap_or_default()
+                .display()
+        )),
+        "{start}"
+    );
     assert_eq!(
         json["allowed"],
         serde_json::json!([
@@ -1210,14 +1226,11 @@ fn getent(stdout: &str, name: &str) -> Vec<String> {
         .collect()
 }
 
-/// The NOTE lines on stderr, without the one about the pass's directory:
-/// every pass here is in a directory the command can reach, so every run
-/// gets that one (it is tested in `tests/own_files.rs`).
+/// The NOTE lines on stderr. Every pass here is in a directory of its own,
+/// which playpen hides, so none is about the pass's directory (that NOTE
+/// comes only with `--pass-dir-writable`, tested in `tests/own_files.rs`).
 fn pass_notes(stderr: &str) -> Vec<&str> {
-    stderr
-        .lines()
-        .filter(|l| l.contains("NOTE") && !l.contains("is not hidden from the command"))
-        .collect()
+    stderr.lines().filter(|l| l.contains("NOTE")).collect()
 }
 
 /// The start line without its NOTE lines: the first line and the

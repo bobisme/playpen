@@ -175,6 +175,9 @@ pub struct Plan {
     /// With `--pass`: the pass file to re-read while the command runs. A
     /// re-read can stop the run, never change the rules.
     pub watch: Option<PassWatch>,
+    /// With `--pass`: how the pass's directory is kept from the command,
+    /// unless it is hidden already or `--pass-dir-writable` was given.
+    pub pass_dir: Option<DirGuard>,
     /// With `--events-fd`, `--live-drops` or `--on-drop`: C reads the drop
     /// counter every [`crate::live_drops::INTERVAL`] while the command
     /// runs, and P reports each new dropped destination
@@ -183,6 +186,21 @@ pub struct Plan {
     /// With `--on-drop`: the ruleset closes all egress at the first packet
     /// it drops, and needs [`Plan::watch_drops`] for P to learn of it.
     pub on_drop: Option<OnDrop>,
+}
+
+/// A directory that the command must not change, and what it sees of it.
+///
+/// Mounted before the mount layer, while the path still leads to the real
+/// directory, and before the hidden paths, so the `/dev/null` binds over
+/// the files in it go on top.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirGuard {
+    /// The directory bound onto itself, read-only: the command reads what
+    /// is in it, and can create, rename, link or remove no entry, nor write
+    /// a file in it.
+    ReadOnly(PathBuf),
+    /// An empty read-only tmpfs over it, as with `--hide`.
+    Hidden(PathBuf),
 }
 
 impl Plan {
@@ -2925,6 +2943,62 @@ fn hide_path(path: &Path) -> Result<(), String> {
     result.map_err(|e| format!("cannot hide {} from the command: {e}", path.display()))
 }
 
+/// Mounts `guard` (see [`DirGuard`]). A missing directory is an error: the
+/// guard fails closed.
+fn guard_dir(guard: &DirGuard) -> Result<(), String> {
+    use nix::sys::statvfs::{FsFlags, statvfs};
+    let failed = |dir: &Path, e: Errno| {
+        format!(
+            "cannot keep the command from changing {}: {e}",
+            dir.display()
+        )
+    };
+    match guard {
+        DirGuard::Hidden(dir) => mount(
+            Some("tmpfs"),
+            dir,
+            Some("tmpfs"),
+            MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+            Some("size=4k,mode=0555"),
+        )
+        .map_err(|e| failed(dir, e)),
+        DirGuard::ReadOnly(dir) => {
+            // Recursive, so a file system mounted below stays visible.
+            mount(
+                Some(dir),
+                dir,
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_REC,
+                None::<&str>,
+            )
+            .map_err(|e| failed(dir, e))?;
+            // The remount must repeat the flags the kernel locked on the
+            // host's mount (nosuid, nodev, noexec), or it fails with EPERM
+            // (measured on a nosuid,nodev /tmp). The atime flags are kept
+            // by the kernel; nosymfollow is not carried over.
+            let host = statvfs(dir).map_err(|e| failed(dir, e))?;
+            let mut keep = MsFlags::empty();
+            for (st, ms) in [
+                (FsFlags::ST_NOSUID, MsFlags::MS_NOSUID),
+                (FsFlags::ST_NODEV, MsFlags::MS_NODEV),
+                (FsFlags::ST_NOEXEC, MsFlags::MS_NOEXEC),
+            ] {
+                if host.flags().contains(st) {
+                    keep |= ms;
+                }
+            }
+            mount(
+                None::<&str>,
+                dir,
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | keep,
+                None::<&str>,
+            )
+            .map_err(|e| failed(dir, e))
+        }
+    }
+}
+
 /// Mounts a fresh, empty, writable tmpfs over `cover.path` with the host
 /// directory's mode, and creates its child directory if it has one.
 fn cover_dir(cover: &crate::sockets::Cover) -> Result<(), String> {
@@ -3052,6 +3126,9 @@ fn setup_files(plan: &Plan, files: &SandboxFiles) -> Result<(), String> {
     let mqueue = Path::new("/dev/mqueue").is_dir();
 
     stage_resolver_files(plan, files)?;
+    if let Some(guard) = &plan.pass_dir {
+        guard_dir(guard)?;
+    }
     for cover in &files.covers {
         cover_dir(cover)?;
     }

@@ -800,37 +800,142 @@ kernel signal delivery affect when the command actually stops. The hidden
 owns the pass, so nothing in file permissions keeps it from the pass. An
 evaluation showed the result: a command copied its pass at start and put
 the copy back 17 ms after the owner set `revoked = true`, and the run went
-on. Two measures follow, and a limit that only the operator can close.
+on. Three measures follow.
 
 - *The pass is `/dev/null` inside*, as the capture is: its path joins the
   hidden paths. Inside, reading it gives nothing. A bind mount is attached
   to the file's directory entry, so in the sandbox's mount namespace a
   rename or removal of that entry, and a rename over it, fail with
-  `EBUSY`, and a hard link fails with `EXDEV`. The directory stays
-  writable: it is often the working directory or next to it, and a
-  read-only bind of it would break builds. The evaluation's command now
-  copies an empty file, so its "restore" writes an empty pass, which no
-  longer validates, and the run stops.
-- *The limit.* An owner who edits the pass with an editor or `sed -i`
-  writes a new file and renames it over the old one. On the host that
-  rename detaches the bind mount, in every namespace, so the new pass is
-  visible inside. A command that can write the directory can then read
-  the new pass, or rename an unrevoked one over it before the next
-  re-read. Measured: a command that rewrites `revoked = true` to `false`
-  whenever it sees it kept a revoked run alive. A changed inode of the
-  pass cannot count as tampering, because every such edit by the owner
-  changes it. A watch on the directory (inotify, fanotify) was considered
-  and rejected: a restore inside one re-read interval looks the same as
-  an edit, writes through a shared `mmap` raise no modify event, and an
-  unprivileged fanotify does not say which process wrote. While the
-  command can write the pass's directory there is no sound fix. The sound
-  setup is the pass in a directory of its own, outside the working
-  directory, hidden with `--hide`: the same command then cannot even see
-  the pass (measured), and the revocation stops the run. playpen prints a
-  NOTE at the start when the pass's directory is not hidden that way.
-  Hiding the working directory, or a directory above it, does not count:
-  a process keeps reaching the real directory it started in through
-  relative paths and `..` (measured).
+  `EBUSY`, and a hard link fails with `EXDEV`. The evaluation's command
+  now copies an empty file, so its "restore" writes an empty pass, which
+  no longer validates, and the run stops.
+- *That lasts only until the owner's edit.* An owner who edits the pass
+  with an editor or `sed -i` writes a new file and renames it over the old
+  one. On the host that rename detaches the bind mount, in every
+  namespace, so the new pass is visible inside. A command that can write
+  the directory can then read the new pass and rename an unrevoked one
+  over it before the next re-read. Measured: a command that rewrites
+  `revoked = true` to `false` whenever it sees it kept a revoked run
+  alive (3 runs of 3, still running 10 s after the revocation). A changed
+  inode of the pass cannot count as tampering, because every such edit by
+  the owner changes it. A watch on the directory (inotify, fanotify) was
+  considered and rejected: a restore inside one re-read interval looks the
+  same as an edit, writes through a shared `mmap` raise no modify event,
+  and an unprivileged fanotify does not say which process wrote. While the
+  command can write the pass's directory there is no sound fix, so
+  playpen does not let it (next item).
+- *The pass's directory is closed to the command* (bn-r5m). Before, the
+  directory stayed writable and playpen printed a NOTE unless the
+  operator hid it with `--hide`; the bn-2sa evaluation showed that a NOTE
+  is not enough. Now, unless `--hide` or the mount layer hides the
+  directory already (nothing is added then, and nothing said), playpen
+  decides at start, from the directory with links resolved:
+
+  | Layout | What playpen does |
+  |---|---|
+  | holds nothing but the pass and playpen's own files (`.ledger`, the `--report` and `--capture` files) | an empty read-only tmpfs over it, as `--hide` does |
+  | holds other files too | binds it onto itself, read-only |
+  | is the working directory, or holds it | refuses: exit 2, nothing run |
+  | is at or below an `--expose` path | refuses: exit 2, nothing run |
+  | any of these, with `--pass-dir-writable` | nothing; the NOTE of before, reworded |
+
+  Hide or read-only. Hiding is the stronger: the command cannot even read
+  the new pass after an edit. But hiding a directory that holds other
+  files takes them from the command, and an engagement directory with
+  notes and tools beside the pass is common. A read-only bind keeps them
+  readable and closes what matters, putting a pass back. So playpen hides
+  when nothing but its own files would vanish (they are `/dev/null`
+  inside anyway, so hiding costs nothing) and binds read-only otherwise.
+  The tech lead's leaning was "hide when only the pass and its ledger";
+  this counts the report and capture files too, for that reason.
+
+  How. In I, after the resolver files are bound and before the mount
+  layer, while the path still leads to the host's directory: for a
+  read-only directory, `mount(DIR, DIR, MS_BIND | MS_REC)`, then a
+  remount with `MS_BIND | MS_REMOUNT | MS_RDONLY` plus the host mount's
+  `nosuid`, `nodev` and `noexec`. A user namespace locks those flags on
+  the mounts it copies, and a remount that leaves one out fails with
+  `EPERM` (measured on `/tmp`, `nosuid,nodev`; on an ext4 `/home` with
+  only `relatime` both forms worked). `MS_REC` keeps a file system
+  mounted below the directory visible. The hidden paths come later, so
+  the `/dev/null` binds over the pass and its ledger go on top (inside
+  the tmpfs they find nothing and are skipped). A directory missing at
+  that moment stops the run; one replaced between the check and the
+  mount is caught by the re-read just before release (next item).
+
+  Measured, with a nested user namespace standing in for the command
+  (the same as X: no capabilities over the mounts I made), the owner's
+  edit on the host, and the command's working directory beside the pass's
+  directory, on tmpfs `/tmp` and on ext4 `/home`:
+
+  - read-only bind: creating a file, the un-revoke (`sed` to a new file
+    and `mv` over the pass), renaming, hard-linking or symlinking a file
+    in, `mkdir`, `mkfifo`, `rm`, a rename within the directory, writing
+    the pass in place, `chmod`, and the same through a symbolic link to
+    the directory, a relative path (`../passes/new`), `..` from a
+    directory below (`cd DIR/sub; echo > ../new`) and
+    `/proc/self/cwd/../new`: all `EROFS`. Renaming the directory:
+    `EBUSY`. Undoing the bind from inside: remount read-write `EPERM`,
+    `umount` `EINVAL`, a non-recursive bind of the parent (to see past
+    it) `EINVAL`, all three because the mounts are locked for the inner
+    namespace. After the owner's edit the command reads the new pass
+    (`revoked = true`) but cannot replace it; the owner's rename on the
+    host works and reaches the directory playpen holds. A Unix socket in
+    the directory can still be connected to.
+  - tmpfs: the same failures, and the directory is empty, also after the
+    edit.
+  - nothing (as before): the un-revoke succeeds, and the directory can be
+    renamed.
+  - the working directory is the pass's directory: with the read-only
+    bind and with the tmpfs alike, `./new` and `/proc/self/cwd/new` are
+    created in the host's directory. The working directory is a reference
+    to the host's mount, taken before any mount, and paths relative to it
+    never cross the new one. Neither mount can close this, so playpen
+    refuses.
+  - the working directory is below the pass's directory: relative writes
+    land in the host's subdirectory, and `../new` fails with `EROFS`
+    (`..` from below a mount point crosses onto the mount on top). So the
+    pass's own entries were safe in this case, but the command's working
+    directory would be writable by relative paths and read-only by
+    absolute ones, and hiding would take it away. playpen refuses here as
+    well, so that the rule is simple: the pass is never in or above the
+    place the command works in.
+  - with the built binary (`tests/own_files.rs` repeats each): the pass
+    alone (hidden; the command saw an empty directory; stopped by the
+    revocation), beside other files (read-only; it read `revoked = true`,
+    every write `Read-only file system`; stopped), the working directory
+    and a directory above it (exit 2, nothing run), and the working
+    directory with `--pass-dir-writable` (the un-revoke won 3 of 3).
+
+  `--expose` at or above the pass's directory gives the command the real
+  directory, because exposed paths are bound back after the mount layer.
+  playpen refuses rather than narrow what the operator asked for; a
+  read-only bind after the exposed paths would probably work, but that
+  was not measured or built. The refusal names `--hide DIR` as a fix:
+  `--hide` wins over `--expose` (hides are mounted last), and `--expose`
+  inside a `--hide` path is refused already.
+
+  The refusal says what the command could do and how to fix it: move the
+  pass to a directory of its own outside the working directory, `--hide`
+  for an exposed path, or `--pass-dir-writable` to accept the risk. That
+  option keeps the earlier behaviour with a NOTE that names the risk and
+  the fix; the start line has a `pass directory:` clause in every case
+  but "hidden already", the report has `pass.directory`, and the plan has
+  `pass_dir_writable` only when given, so earlier plan digests stay valid.
+
+  Limits. The read-only bind does not keep `nosymfollow` (nix's
+  `FsFlags` does not expose it; the host flag is rare). A second mount of
+  the same file system that shows the directory at another path (a bind
+  mount made on the host, a second mount of the device) stays writable,
+  for `--hide` as for this; this host has none (`/home` is one mount). A
+  descriptor of the directory that the operator hands in, as standard
+  input (`< DIR`), is the host's mount: measured, `touch
+  /proc/self/fd/0/new` created the file on the host while `touch DIR/new`
+  failed with `EROFS`. That is the same reason the working directory is
+  refused, and the operator has to do it on purpose. With the read-only
+  bind the command reads the other files in the directory and the pass
+  after an edit; to keep those from it, give the pass a directory of its
+  own.
 - *The directory is held.* playpen opens the pass's directory (`O_PATH`)
   at start and reads the pass through it on every re-read, with
   hallpass's loader on `/proc/self/fd/N/NAME`, so the rules for links and
@@ -843,10 +948,13 @@ on. Two measures follow, and a limit that only the operator can close.
   owner's edits would then go to the forged pass, or, with reads by path,
   playpen would read the forged one. A pass replaced inside the held
   directory, as the owner's edit does, is read as before. Not seen: a
-  directory moved away and back between two re-reads. With the pass's
-  directory hidden, the command can still do that with a directory above
-  it, but it cannot see when playpen re-reads, and a re-read in between
-  stops the run.
+  directory moved away and back between two re-reads. The pass's
+  directory, hidden or read-only, is a mount point inside and cannot be
+  renamed (`EBUSY`), but a directory above it can (a mount point below
+  does not stop that), and `tests/own_files.rs` moves one and puts a
+  forged pass at the path: the re-read stops the run. The command cannot
+  see when playpen re-reads, so moving it away and back is a guess, and a
+  re-read in between stops the run.
 - *The ledger.* Neither playpen nor `hallpass::load` reads the hallpass
   ledger (`PASS.ledger`); hallpass's `spend` and `permits` do. playpen
   hides it too when it is a regular file at start, so that the command
@@ -1380,6 +1488,20 @@ non-zero status is kept, so the command's own failure still shows. When
 the new file cannot be written, P removes what is at the path, so no
 forgery is left, and reports `report-write-failed`.
 
+**Its directory stays as it is** (bn-r5m). The pass's directory had to be
+closed to the command ("The command and the pass file") because two
+things come together there: the owner replaces the pass during the run,
+which detaches the `/dev/null` bind, and playpen reads the file at the
+path while the command still runs. Neither holds for the report. Nobody
+outside replaces it during the run, so the bind stays for the whole run
+and the command cannot write the file or put another at its path except
+by moving a directory above it. And playpen reads nothing from the path:
+it writes the report only after every process in the sandbox is gone,
+and then checks the path and its directory as above, so whatever the
+command left there is replaced. A read-only or hidden report directory
+would add nothing to that, and would break the common report in the
+working directory. Not changed; the limit is the one below.
+
 **Not closed.** A playpen killed before it writes the report leaves the
 file empty, or, after such a move, the command's file at the path. The
 path is `/dev/null` inside, so a build that owns a file of that name
@@ -1835,7 +1957,7 @@ less.
 | `--allow` adding a destination beside a pass | refused | yes |
 | The command reading or changing the packet capture while it runs | the capture's path is `/dev/null` inside, as with `--hide` | yes: the command finds a character device at the path |
 | The command reading its pass, or restoring a copy over the owner's revocation (the evaluation's attack) | the pass and its ledger are `/dev/null` inside; the copy is empty, and restoring it makes the pass invalid | yes (`the_restore_loop_of_the_evaluation_is_stopped_and_never_read_the_pass`, `the_pass_and_its_ledger_are_dev_null_inside_and_cannot_be_linked_moved_or_removed`: link `EXDEV`, rename and removal `EBUSY`) |
-| The command rewriting the pass after the owner's edit replaced the file | only when the pass's directory is hidden with `--hide` (a NOTE says so otherwise); not closed without it | yes (`with_its_directory_hidden_the_pass_cannot_be_seen_or_replaced`); without `--hide`, measured by hand to succeed |
+| The command rewriting the pass after the owner's edit replaced the file | the pass's directory is hidden (when it holds only playpen's files, or by `--hide`) or read-only; a pass in or above the working directory, or inside an `--expose` path, is refused; not closed with `--pass-dir-writable` (a NOTE says so) | yes (`with_its_directory_hidden_the_pass_cannot_be_seen_or_replaced`, `a_pass_alone_in_its_directory_is_hidden_and_the_unrevoke_attack_fails`, `a_pass_beside_other_files_is_read_only_and_the_unrevoke_attack_fails`: 14 ways to write there, all fail; `a_pass_in_or_above_the_working_directory_or_exposed_is_refused`; `with_pass_dir_writable_the_command_can_replace_an_edited_pass` shows the risk the option takes) |
 | The command moving the pass's directory and putting a forged pass at the path | the pass is read through the directory opened at start; a path that leads elsewhere stops the run | yes (`a_moved_pass_directory_with_a_forged_pass_in_its_place_stops_the_run`) |
 | The command replacing the `--report` file with a forged report | the report is `/dev/null` inside; a directory moved above it is found at the end, the report written again at the path, exit 1 | yes (`the_report_forgery_of_the_evaluation_leaves_the_real_report`, `a_moved_report_directory_with_a_forged_report_is_found_and_rewritten`, `a_symbolic_link_at_the_report_path_is_replaced_and_not_followed`) |
 | pasta writing the capture through a link put in place of the file | playpen creates the file (`O_EXCL`, `O_NOFOLLOW`) in a directory where no other user can replace it, starts pasta there by descriptor, and checks that its own file got pasta's header | yes: an existing file, a link, an unwritable and a group-writable directory are refused; a pasta that writes no capture stops the run before the command starts |
@@ -1916,8 +2038,11 @@ less.
   write the pass file can put the old content back between two re-reads,
   or edit it before the run starts; hallpass's own threat model applies
   (it does not protect against a writer of the engagement directory). The
-  command can do the same when the pass's directory is not hidden and an
-  edit has replaced the file (see "The command and the pass file"); and a
+  command can do the same only with `--pass-dir-writable`, once an edit
+  has replaced the file (see "The command and the pass file"). With the
+  directory read-only it can read the pass after such an edit; a second
+  mount of the directory's file system at another path, or a descriptor
+  of the directory handed in by the operator, is not made read-only. A
   directory of the pass moved away and back between two re-reads is not
   seen.
 

@@ -368,6 +368,58 @@ fn pass_hosts_is_listed_and_without_pass_is_a_usage_error() {
     assert!(!std::path::Path::new(marker).exists(), "the command ran");
 }
 
+/// `--pass-dir-writable` is listed for run and plan, says what it risks,
+/// needs `--pass`, and the run workflow says where to keep a pass.
+#[test]
+fn pass_dir_writable_is_listed_and_without_pass_is_a_usage_error() {
+    for name in ["run", "plan"] {
+        let help = json(&invoke(&["help", name, "--format", "json"], None).stdout);
+        let arg = help["arguments"]
+            .as_array()
+            .expect("arguments")
+            .iter()
+            .find(|a| a["long"] == "pass-dir-writable")
+            .cloned()
+            .unwrap_or_else(|| panic!("{name}: no --pass-dir-writable in {help}"));
+        assert_eq!(arg["takes_value"], false, "{name}");
+        let said = arg["help"].as_str().unwrap_or("");
+        for part in ["With --pass", "read-only", "working directory", "unrevoked"] {
+            assert!(said.contains(part), "{name}: {part}: {said}");
+        }
+        let text = String::from_utf8(invoke(&[name, "--help"], None).stdout).expect("help");
+        assert!(text.contains("--pass-dir-writable"), "{text}");
+    }
+    let run = json(&invoke(&["help", "run", "--format", "json"], None).stdout);
+    let workflow = run["workflow"].as_str().unwrap_or("");
+    assert!(
+        workflow.contains("Keep a pass in a directory of its own, outside the working directory")
+            && workflow.contains("--pass-dir-writable"),
+        "{workflow}"
+    );
+    assert!(
+        run["examples"]
+            .as_array()
+            .expect("examples")
+            .iter()
+            .any(|e| e
+                .as_str()
+                .is_some_and(|e| e.contains("--pass ~/passes/engagement.pass.toml"))),
+        "{run}"
+    );
+    for args in [
+        &["run", "--pass-dir-writable", "--no-network", "--", "true"][..],
+        &["plan", "--pass-dir-writable", "--no-network", "--", "true"][..],
+    ] {
+        let out = invoke(args, None);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--pass <FILE>"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[test]
 fn the_contacted_record_and_suggest_are_listed() {
     let root = json(&invoke(&["--help", "--json"], None).stdout);

@@ -51,19 +51,32 @@ below gives curl that name for that address. Substitute the pass from your
 own engagement.
 
 ```sh
-playpen run --pass ~/passes/engagement.pass.toml --hide ~/passes --pass-hosts \
+playpen run --pass ~/passes/engagement.pass.toml --pass-hosts \
   -- curl -sS https://app.example.test/
 ```
 
 Keep the pass in a directory of its own, outside the directory the command
-works in, and hide that directory with `--hide`, as above. Inside the
-sandbox the pass, and its `.ledger`, are `/dev/null` in any case. But most
-editors and `sed -i` save a new file, and the new file is visible inside.
-A command that can write the pass's directory could then read it, or put
-back an unrevoked pass before playpen's next check. Without `--hide` on
-that directory playpen prints a NOTE at the start. A tool that reads the
-pass, such as `hallpass permits` or `hallpass spend`, must run outside the
-sandbox.
+works in, as above. Inside the sandbox the pass, and its `.ledger`, are
+`/dev/null`. But most editors and `sed -i` save a new file, and the new
+file is visible inside. A command that could write the pass's directory
+could then read it and put back an unrevoked pass before playpen's next
+check. So playpen keeps the command from changing that directory:
+
+- a directory that holds only the pass (and its `.ledger`, and the
+  `--report` and `--capture` files if they are there) is hidden: the
+  command sees it empty;
+- a directory that holds other files too is read-only for the command: it
+  can read them, and the pass after an edit, but cannot create, rename or
+  remove anything there;
+- a directory you hid with `--hide` stays as it is;
+- a pass in the working directory, in a directory above it, or inside an
+  `--expose` path is refused (exit 2, "nothing was run"), with a message
+  that says how to fix it. `--pass-dir-writable` runs anyway, with a NOTE
+  about the risk.
+
+The start line says which it is (`pass directory: ...`), and the report
+has it as `pass.directory`. A tool that reads the pass, such as `hallpass
+permits` or `hallpass spend`, must run outside the sandbox.
 
 playpen reads the pass through the directory it opened at start. If that
 directory is moved or replaced while the command runs, playpen stops the
@@ -383,7 +396,7 @@ resolution with pasta. A packet the firewall refuses never reaches that
 interface, so it is not in the file; the report counts it instead.
 
 ```sh
-playpen run --pass engagement.pass.toml --capture run.pcap --report run.json -- ./scan
+playpen run --pass ~/passes/engagement.pass.toml --capture run.pcap --report run.json -- ./scan
 sha256sum run.pcap   # the same digest as .capture.sha256 in run.json
 ```
 
@@ -575,9 +588,10 @@ playpen guards against:
   another network namespace. It cannot read the pass or its ledger, and
   cannot read or replace the `--report` or `--capture` file: inside, each
   is `/dev/null`. A report replaced by moving a directory above it is
-  found and written again, and playpen exits 1 (each is tested). The pass
-  is protected only until the owner's next edit, unless its directory is
-  hidden (see [Run under a Hallpass
+  found and written again, and playpen exits 1 (each is tested). It
+  cannot change the pass's directory, which is hidden or read-only inside,
+  so it cannot put back a pass after the owner's edit; a pass in or above
+  the working directory is refused (see [Run under a Hallpass
   approval](#run-under-a-hallpass-approval));
 - attempts that would fail before the firewall: with `--no-network`, or
   over an address family this host has no default route for, a packet to
@@ -624,9 +638,11 @@ playpen does not guard against:
   revocation](#how-a-pass-backed-run-ends) (up to one check interval, or
   longer while playpen is stopped);
 - a process that restores the pass file between two checks: any process
-  outside playpen, and the command itself when the pass's directory is not
-  hidden and the owner's edit saved a new file. A pass directory moved away
-  and back between two checks is not noticed;
+  outside playpen, and the command itself with `--pass-dir-writable` once
+  the owner's edit saved a new file. With a read-only pass directory, the
+  command can read the pass after such an edit, and the other files
+  there. A pass directory moved away and back between two checks is not
+  noticed;
 - a report forged while playpen was killed: trust the report only together
   with playpen's own exit status.
 

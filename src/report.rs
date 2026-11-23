@@ -224,6 +224,11 @@ pub struct PassReport {
     pub valid_until: Option<String>,
     /// Labels of the destinations in use.
     pub labels: Vec<String>,
+    /// What the command could do in the pass's directory: `"hidden"`,
+    /// `"read_only"`, or `"writable"` with `--pass-dir-writable`. Absent
+    /// when the run was refused before playpen looked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory: Option<&'static str>,
 }
 
 /// A moment as the report writes it: RFC 3339 in UTC, like `until`.
@@ -618,6 +623,7 @@ mod tests {
             digest: None,
             valid_until: None,
             labels: vec!["private-label".into()],
+            directory: Some("writable"),
         });
         r.contacts = Some(crate::contacts::ContactFields {
             contacted: Some(crate::contacts::Contacted {

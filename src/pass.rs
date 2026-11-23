@@ -291,6 +291,12 @@ impl PassDir {
         self.path.join(&self.name)
     }
 
+    /// The pass's name in the directory.
+    #[must_use]
+    pub fn name(&self) -> &std::ffi::OsStr {
+        &self.name
+    }
+
     /// Reads the pass with hallpass's own loader, through the held
     /// directory. Errors name `shown`, the path as the operator gave it,
     /// exactly as `hallpass::load(shown)` would.

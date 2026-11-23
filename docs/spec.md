@@ -72,11 +72,21 @@ If you used v0.1, these will be different:
   that read the pass (`hallpass permits`, `hallpass spend`) or that wrote,
   renamed or removed a file at the `--report` path no longer can. A
   `--report` file that the command replaced is written again at the end,
-  and playpen then exits 1 instead of 0. With `--pass`, a NOTE follows the
-  start line when the pass's directory is not hidden, and a re-read stops
-  the run when that directory was moved or replaced (section 4.1). The
-  plan and the report have no new fields; the report's `message` is set,
-  with `outcome: "ran"`, when the report file was replaced.
+  and playpen then exits 1 instead of 0. With `--pass`, a re-read stops
+  the run when the pass's directory was moved or replaced (section 4.1).
+  The report's `message` is set, with `outcome: "ran"`, when the report
+  file was replaced.
+- **The pass's directory is hidden or read-only inside, and a pass in or
+  above the working directory is refused.** Unless `--hide` or the mount
+  layer hides it already, the pass's directory gets an empty read-only
+  tmpfs over it when it holds nothing but the pass and playpen's own
+  files, and is made read-only for the command otherwise. A pass in the
+  working directory, in a directory that holds it, or inside an
+  `--expose` path is refused (exit 2, `nothing was run`): move the pass to
+  a directory of its own, as in the README. `--pass-dir-writable` runs
+  anyway, with a NOTE (section 4.1). The start line has a `pass
+  directory:` clause, the report has `pass.directory`, and the plan has
+  `pass_dir_writable` when the option is given.
 
 ## 1. Purpose and non-goals
 
@@ -185,6 +195,7 @@ and exits 2.
 
 ```text
 playpen run --pass FILE [--only LABEL]... [--pass-hosts]
+            [--pass-dir-writable]
             [--host NAME=ADDR]... [--until RFC3339] [SOCKETS]
             [--format text|pretty|json] [--report FILE] [--capture FILE]
             [--live-drops] [--on-drop cut|stop] -- COMMAND [ARGS...]
@@ -306,19 +317,58 @@ reads the pass (for example `hallpass permits`) reads nothing either.
 
 This lasts until the file is replaced on the host. An edit that writes a
 new file and renames it over the pass (most editors, `sed -i`) leaves the
-new file visible inside. A command that can
-write the pass's directory can then read the new pass, or rename another
-file over it before the next re-read. Only a directory the command cannot
-reach closes this: keep the pass in a directory of its own, outside the
-working directory, and give `--hide DIR`. When the pass's directory is not
-hidden, a NOTE follows the start line: `the directory of the pass, DIR, is
-not hidden from the command. Inside, the pass is /dev/null until it is
-replaced: ... hide that directory with --hide`. The directory counts as
-hidden when it is, or is inside, a `--hide` directory or a directory the
-mount layer replaces (section 7); that directory is not the working
-directory and does not hold it (a process keeps reaching the real
-directory it started in through relative paths); and no `--expose` path
-is at or above the pass's directory.
+new file visible inside. A command that could write the pass's directory
+could then read the new pass and rename another file over it before the
+next re-read, so playpen keeps the command from changing that directory:
+
+- **Hidden already**: the pass's directory is, or is inside, a `--hide`
+  directory, or a directory the mount layer replaces (section 7) with no
+  `--expose` path at or above the pass's directory and at or below the
+  replaced one; and that directory is not the working directory and does
+  not hold it (a process keeps reaching the real directory it started in
+  through relative paths). playpen adds nothing.
+- **Hidden by playpen**: the directory holds nothing but the pass and
+  playpen's own files (the `.ledger`, and the `--report` and `--capture`
+  files when they are there; all four are `/dev/null` inside anyway). It
+  gets an empty read-only tmpfs over it, as with `--hide`. Inside, it is
+  empty and nothing can be created in it.
+- **Read-only**: the directory holds other files too. It is bound onto
+  itself read-only (recursively, so file systems mounted below it stay
+  visible; still `nosuid`, `nodev` and `noexec` where the host's mount
+  is). The command reads what is in it, but cannot create, rename, link or
+  remove an entry there, or write a file in it (`EROFS`), whatever path it
+  takes (a symbolic link, a relative path, `..` from a directory below,
+  `/proc/self/cwd`); the directory itself cannot be renamed (`EBUSY`). A
+  Unix socket in it can still be connected to. After an owner's edit the
+  command can read the new pass, but cannot replace it.
+- **Refused** (exit 2, `refused: --pass FILE: the pass's directory, DIR,
+  ...`, `nothing was run`): the directory is the working directory
+  (`is the working directory`), holds it (`holds the working directory
+  CWD`), or is at or below an `--expose` path (`is inside --expose PATH`).
+  playpen cannot make the directory the command works in read-only or hide
+  it, and does not narrow what `--expose` gives. The message says why,
+  what the command could do, and how to fix it: move the pass to a
+  directory of its own outside the working directory (or outside the
+  exposed path), hide its directory with `--hide DIR` (for an exposed
+  path), or give `--pass-dir-writable`. `plan` refuses the same way.
+
+The directory is the pass's directory with symbolic links resolved, and is
+checked at start. Each case but the first adds the clause `pass directory:
+DIR (hidden from the command)`, `(read-only for the command)` or
+`(writable by the command, --pass-dir-writable)` to the start line, and
+the report has `pass.directory` (section 4.5).
+
+**`--pass-dir-writable`** (needs `--pass`). Leave the pass's directory as
+it is: no refusal, no read-only bind, no tmpfs. A NOTE follows the start
+line: `the pass's directory, DIR, is writable by the command
+(--pass-dir-writable). Inside, the pass is /dev/null until it is replaced:
+an edit that writes a new file (sed -i and most editors do) makes the new
+pass visible there, and the command can read it and put another in its
+place before the next re-read. Keep the pass in a directory of its own,
+outside the working directory, and leave out --pass-dir-writable: playpen
+then makes that directory read-only for the command, or hides it`. A pass
+whose directory is hidden already gets neither the NOTE nor the clause.
+The plan has `pass_dir_writable: true` only when the option is given.
 
 **The pass's directory.** playpen opens the pass's directory at start
 (`O_PATH`) and reads the pass through it, by name, at start and on every
@@ -826,15 +876,18 @@ The supervisor’s human-readable diagnostics on stderr include the following me
     it. Nor are the pass, its ledger and the `--report` file, which playpen
     always hides (section 7): the list stays what the operator typed, as in
     the plan;
-  - `display exposed: PATH, ...` with `--display`.
+  - `display exposed: PATH, ...` with `--display`;
+  - with `--pass`, unless its directory is hidden already, `pass
+    directory: DIR (hidden from the command)`, `(read-only for the
+    command)` or `(writable by the command, --pass-dir-writable)` (see
+    "The pass inside the sandbox").
 
   The start line says nothing about ceilings. The NOTE lines follow it, one
   per line, each starting `playpen: NOTE:`: the ceilings the pass sets and
   playpen does not enforce, the `--pass-hosts` notes, when an allowed
   grant covers a cloud metadata address, the note described under
-  `--allow`, and, with `--pass`, when the pass's directory is not hidden,
-  the note described under "The pass inside the sandbox". The JSON report
-  is unchanged;
+  `--allow`, and, with `--pass-dir-writable`, the note described under
+  that option. The JSON report is unchanged;
 - when packets to other hosts fail at routing in this sandbox (section 5,
   steps 6 and 8), once, after the start line: `NOTE: WHY. The drop counts
   of this run are incomplete: --fail-on-drop says unknown, and --on-drop
@@ -1052,8 +1105,11 @@ mapping and argument order are preserved. With `--pass-hosts` the plan has
 `"pass_hosts": true`, and `hosts` lists the entries from the pass after the
 `--host` ones. Without it the field is absent, so plans without the option
 keep their digest. The same holds for `--live-drops` and `"live_drops":
-true`, for `--report-contacts` and `"report_contacts": true`, and for
-`--on-drop` and `"on_drop": "cut"` or `"stop"`.
+true`, for `--report-contacts` and `"report_contacts": true`, for
+`--on-drop` and `"on_drop": "cut"` or `"stop"`, and for
+`--pass-dir-writable` and `"pass_dir_writable": true`. `plan` checks the
+pass's directory as `run` does (4.1, "The pass inside the sandbox") and
+refuses the same layouts.
 
 The top-level `digest` is SHA-256 of the compact JSON encoding of the v1
 plan (object keys in lexical order). Give it to `run --expect-plan DIGEST`
@@ -1253,7 +1309,7 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `stopped_by_pass` | bool | playpen stopped the command after re-reading the pass |
 | `stop_reason` | string or null | why playpen stopped the command, when `stopped_by_until`, `stopped_by_pass` or `stopped_by_drop` |
 | `enforcement_coverage` | object, if available | selected pass enforcement coverage; omitted when unavailable |
-| `pass` | object or null | null without `--pass`; else `{"file", "id", "name", "owner", "digest", "valid_until", "labels"}`: the file as given, the pass id, name, `approval.owner`, `sha256:` digest of the file at start, `valid_until` (RFC 3339 UTC), and the labels in use. When the pass could not be loaded, everything but `file` is null and `labels` is empty |
+| `pass` | object or null | null without `--pass`; else `{"file", "id", "name", "owner", "digest", "valid_until", "labels"}`: the file as given, the pass id, name, `approval.owner`, `sha256:` digest of the file at start, `valid_until` (RFC 3339 UTC), and the labels in use. When the pass could not be loaded, everything but `file` is null and `labels` is empty. A run that got past its checks also has `directory`: `"hidden"` (by `--hide`, the mount layer or playpen), `"read_only"`, or `"writable"` with `--pass-dir-writable` (4.1, "The pass inside the sandbox"); it is absent from a refusal and from `rules` |
 | `capture` | object or null | null without `--capture` and when nothing was run; else `{"file", "bytes", "sha256"}`: the capture file (absolute), its size, and the SHA-256 of its bytes in lower-case hex as `sha256sum` prints it, read through the descriptor playpen created it with, after pasta has exited. Also null when the file could not be read back; `message` then says why |
 | `playpen_exit_status` | integer | the status playpen exits with |
 | `dropped` | object or null | `{"packets": N, "destinations": [{"address", "protocol", "port", "packets"}], "destinations_truncated": bool}`; `port` is null for protocols other than TCP and UDP; destinations are sorted by packet count, largest first |
@@ -1715,6 +1771,8 @@ Each step either succeeds or stops the run with a message that ends
    and, with `--without-landlock`, finds the sockets to cover, both in the
    host's view of the tree; binds the generated `/etc/hosts`,
    `/etc/resolv.conf` and `/etc/nsswitch.conf` read-only over the host's;
+   with `--pass`, makes the pass's directory read-only or hides it (4.1,
+   "The pass inside the sandbox"; a missing directory stops the run);
    replaces the directories of section 7 with private ones and mounts a
    fresh `/dev/mqueue`; covers the sockets found; binds every exposed path
    that is now hidden back into place; and applies `--hide`, then hides
@@ -2013,6 +2071,10 @@ directory, reached through the descriptor playpen holds for it.
   and its `.ledger` (with `--pass`), and the `--report` file when it is a
   regular file. Each is `/dev/null`. The pass stays `/dev/null` only until
   an edit on the host replaces the file (section 4.1).
+- With `--pass`, the pass's directory, unless it is hidden already or
+  `--pass-dir-writable` is given: an empty read-only tmpfs when it holds
+  nothing but the pass and playpen's own files, else the host's directory,
+  read-only (section 4.1).
 
 Inside, the command's uid and gid are the caller's; other users and groups
 show as `nobody`.
@@ -2026,7 +2088,8 @@ are refused and counted), the command's children and daemons, the
 command trying to change the firewall, interfaces, addresses or routes, open raw
 sockets, or join another network namespace, the command reading or
 replacing the pass, its ledger, the `--report` file or the `--capture`
-file (within the limits below), and the command reaching the
+file, or changing the pass's directory (within the limits below), and the
+command reaching the
 host's network through a host daemon's Unix socket, an inherited
 descriptor, a socket on standard input or output, host IPC, the display
 server (unless `--display`) or the terminal's input queue.
@@ -2153,9 +2216,16 @@ Not guarded against, or known limits:
   that re-read on, the cut refuses all but loopback before the notice and
   during the grace. A process that can write the pass's directory can
   restore the pass between two re-reads: any process outside playpen, and
-  the command itself when the pass's directory is not hidden and an edit
-  has replaced the pass's file (it is `/dev/null` inside only until then;
-  playpen prints a NOTE at the start, section 4.1). A directory of the
+  the command itself only with `--pass-dir-writable` after an edit has
+  replaced the pass's file (it is `/dev/null` inside only until then;
+  playpen prints a NOTE at the start, section 4.1). Without the option,
+  the directory is hidden or read-only inside, and a pass in or above the
+  working directory, or inside an `--expose` path, is refused. When the
+  directory is read-only, the command can read the pass after such an edit,
+  and every other file in that directory. The read-only bind does not keep
+  `nosymfollow`. Another mount of the same file system that shows the
+  directory at a second path (a bind mount made on the host) is not made
+  read-only, by playpen or by `--hide`. A directory of the
   pass that is moved away and back between two re-reads is not seen.
   Ceilings are not enforced by playpen.
 

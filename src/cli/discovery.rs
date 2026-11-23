@@ -20,7 +20,7 @@ pub(super) const RUN: &str = "Examples
   playpen run --format json --no-network -- printf hello
   playpen run --no-network --private-tty -- bash -i
   playpen run --allow 192.0.2.10:443/tcp --report run.json -- true
-  playpen run --pass engagement.pass.toml --pass-hosts -- curl -sS https://app.example.test/
+  playpen run --pass ~/passes/engagement.pass.toml --pass-hosts -- curl -sS https://app.example.test/
   playpen run --allow 192.0.2.10:443/tcp --capture run.pcap --report run.json -- true
   playpen run --allow 192.0.2.10:443/tcp --live-drops --events-fd 3 -- ./scan 3> >(jq -c .)
   playpen run --allow 192.0.2.0/24:8000-8099/tcp --report-contacts --report wide.json -- true
@@ -29,6 +29,7 @@ pub(super) const RUN: &str = "Examples
 Agent workflow
   Choose --no-network, explicit --allow grants, or --pass FILE. Use plan with the same command and policy first, then pass its digest to --expect-plan.
   Nothing is resolved: there is no DNS inside. With --pass, --pass-hosts maps the hostname of each selected single-address destination to its address. --host NAME=ADDR maps any other name to an approved address.
+  Keep a pass in a directory of its own, outside the working directory: playpen hides that directory from the command, or makes it read-only when it holds other files, so the command cannot put back a pass the owner revoked. A pass in or above the working directory, or inside an --expose path, is refused (exit 2). --pass-dir-writable runs anyway, with a NOTE.
   In JSON mode the final report goes to stdout and workload output streams to stderr. With --report FILE, the file gets the report and stdout belongs to the workload.
   To learn of a refused destination while the command runs, read --events-fd: one denied record per new dropped destination, within about 2 s. --live-drops also prints the first 8 on stderr. The report's dropped field remains the complete record.
   --on-drop cut makes the first dropped packet close all egress but loopback in the firewall itself; --on-drop stop also stops the command within about 2 s plus the 3 s grace and never exits 0. The report's egress_cut names the destination. mDNS, LLMNR, a client's own DNS server, a cloud metadata probe and IPv6 attempts trip it too, so try a run without it first.

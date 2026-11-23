@@ -233,6 +233,12 @@ struct RunArgs {
     /// --host for the same name wins.
     #[arg(help_heading = "Network policy", long, requires = "pass")]
     pass_hosts: bool,
+    /// With --pass: leave the pass's directory writable by the command. By
+    /// default it is read-only inside (hidden if it holds only the pass), and
+    /// a pass in or above the working directory is refused. With this, an edit
+    /// that saves a new pass lets the command put back an unrevoked one.
+    #[arg(help_heading = "Network policy", long, requires = "pass")]
+    pass_dir_writable: bool,
     /// When the approval ends (RFC 3339 with offset); the command is stopped
     /// then. With --pass it can only be earlier than the pass's window end.
     #[arg(help_heading = "Network policy", long, value_name = "RFC3339")]
@@ -500,6 +506,7 @@ fn pass_report(id: &pass::PassIdentity) -> PassReport {
         digest: Some(id.digest.to_string()),
         valid_until: Some(hallpass::stamp(id.valid_until)),
         labels: id.labels.clone(),
+        directory: None,
     }
 }
 
@@ -637,10 +644,57 @@ struct Checked {
     pass_hosts: Option<PassHosts>,
     lo_addrs: Vec<IpAddr>,
     from_pass: Option<FromPass>,
+    /// With `--pass`: what the command can do in the pass's directory.
+    pass_dir: Option<PassDirView>,
     /// Every exposed path, canonical (`--expose` and `--display`).
     exposed: Vec<PathBuf>,
     /// The display sockets among them.
     display: Vec<PathBuf>,
+}
+
+/// What the command can do in the pass's directory (docs/DESIGN.md, "The
+/// command and the pass file"). Each path is canonical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PassDirView {
+    /// Hidden already, by `--hide` or by the mount layer: nothing is added.
+    Hidden,
+    /// It holds only the pass and playpen's own files: playpen hides it.
+    HiddenByPlaypen(PathBuf),
+    /// It holds other files too: playpen makes it read-only.
+    ReadOnly(PathBuf),
+    /// `--pass-dir-writable`: left as it is, with a NOTE.
+    Writable(PathBuf),
+}
+
+impl PassDirView {
+    /// The mount playpen adds, if any.
+    fn guard(&self) -> Option<sandbox::DirGuard> {
+        match self {
+            Self::HiddenByPlaypen(dir) => Some(sandbox::DirGuard::Hidden(dir.clone())),
+            Self::ReadOnly(dir) => Some(sandbox::DirGuard::ReadOnly(dir.clone())),
+            Self::Hidden | Self::Writable(_) => None,
+        }
+    }
+
+    /// The report's `pass.directory`.
+    const fn report(&self) -> &'static str {
+        match self {
+            Self::Hidden | Self::HiddenByPlaypen(_) => "hidden",
+            Self::ReadOnly(_) => "read_only",
+            Self::Writable(_) => "writable",
+        }
+    }
+
+    /// The start-line clause; none when the operator hid the directory.
+    fn clause(&self) -> Option<String> {
+        let (dir, what) = match self {
+            Self::Hidden => return None,
+            Self::HiddenByPlaypen(dir) => (dir, "hidden from the command"),
+            Self::ReadOnly(dir) => (dir, "read-only for the command"),
+            Self::Writable(dir) => (dir, "writable by the command, --pass-dir-writable"),
+        };
+        Some(format!("pass directory: {} ({what})", dir.display()))
+    }
 }
 
 impl Checked {
@@ -878,6 +932,10 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
         lo_addrs.push(parse_literal_addr(a).map_err(|e| format!("--lo-addr {a:?}: {e}"))?);
     }
     let (exposed, display) = check_exposed(args)?;
+    let pass_dir = from_pass
+        .as_ref()
+        .map(|p| pass_dir_view(args, p, &exposed))
+        .transpose()?;
     sandbox::check_stdio(!args.without_landlock)?;
     Ok(Checked {
         fixture: args
@@ -891,8 +949,96 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
         pass_hosts,
         lo_addrs,
         from_pass,
+        pass_dir,
         exposed,
         display,
+    })
+}
+
+/// How the command will see the pass's directory, or why the run is
+/// refused: the directory is, or holds, the working directory, or an
+/// `--expose` path gives the command the real directory. The command could
+/// write there, and after an owner's edit that saves a new file it could
+/// read the new pass and put an unrevoked one in its place.
+fn pass_dir_view(
+    args: &RunArgs,
+    from_pass: &FromPass,
+    exposed: &[PathBuf],
+) -> Result<PassDirView, String> {
+    let held = from_pass.watch.dir();
+    let given = from_pass.identity.file.display();
+    let dir = std::fs::canonicalize(held.path()).map_err(|e| {
+        format!(
+            "--pass {given}: cannot resolve the pass's directory {}: {e}",
+            held.path().display()
+        )
+    })?;
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|c| std::fs::canonicalize(c).ok());
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let covers: Vec<PathBuf> = sockets::covers(nix::unistd::getuid(), runtime_dir.as_deref())
+        .into_iter()
+        .map(|c| c.path)
+        .collect();
+    if dir_hidden(&dir, &args.hide, &covers, exposed, cwd.as_deref()) {
+        return Ok(PassDirView::Hidden);
+    }
+    if args.pass_dir_writable {
+        return Ok(PassDirView::Writable(dir));
+    }
+    let shown = dir.display();
+    let risk = "the command could write there, and after an edit that saves a new pass (sed -i and most editors do) read it and put an unrevoked one in its place before the next re-read";
+    let accept = "or give --pass-dir-writable to run with that risk";
+    let cwd_why = match cwd {
+        Some(c) if c == dir => Some(String::from("is the working directory")),
+        Some(c) if c.starts_with(&dir) => {
+            Some(format!("holds the working directory {}", c.display()))
+        }
+        _ => None,
+    };
+    if let Some(why) = cwd_why {
+        return Err(format!(
+            "--pass {given}: the pass's directory, {shown}, {why}: {risk}. playpen cannot make the directory a command works in read-only or hide it. Move the pass to a directory of its own outside the working directory (playpen then makes that directory read-only for the command, or hides it), {accept}"
+        ));
+    }
+    if let Some(e) = exposed.iter().find(|e| dir.starts_with(e)) {
+        return Err(format!(
+            "--pass {given}: the pass's directory, {shown}, is inside --expose {}: {risk}. playpen does not narrow what --expose gives the command. Move the pass to a directory of its own outside {}, hide its directory with --hide {shown}, {accept}",
+            e.display(),
+            e.display()
+        ));
+    }
+    let file = held.file();
+    let mut own: Vec<OsString> = vec![
+        held.name().to_owned(),
+        hallpass::ledger_path(&file)
+            .file_name()
+            .unwrap_or_default()
+            .to_owned(),
+    ];
+    for p in [&args.report, &args.capture].into_iter().flatten() {
+        if let Ok(p) = std::path::absolute(p)
+            && let (Some(parent), Some(name)) = (p.parent(), p.file_name())
+            && std::fs::canonicalize(parent).is_ok_and(|parent| parent == dir)
+        {
+            own.push(name.to_owned());
+        }
+    }
+    Ok(if only_entries(&dir, &own) {
+        PassDirView::HiddenByPlaypen(dir)
+    } else {
+        PassDirView::ReadOnly(dir)
+    })
+}
+
+/// Whether every entry of `dir` has one of the `names`; false when it
+/// cannot be listed.
+fn only_entries(dir: &Path, names: &[OsString]) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .map(|e| e.map(|e| e.file_name()))
+            .all(|name| name.is_ok_and(|n| names.contains(&n)))
     })
 }
 
@@ -1134,11 +1280,12 @@ fn start_line(c: &Checked, args: &RunArgs, capture: Option<&Path>) -> String {
             .push("the command runs in its own session, without a controlling terminal".to_owned());
     }
     lines.extend(sockets_clauses(c, args));
+    lines.extend(c.pass_dir.as_ref().and_then(PassDirView::clause));
     let mut out = lines.remove(0);
     for line in lines {
         let _ = write!(out, "\n{CLAUSE_PREFIX}{line}");
     }
-    out.push_str(&start_notes(c, &args.hide));
+    out.push_str(&start_notes(c));
     out
 }
 
@@ -1177,7 +1324,7 @@ fn metadata_notes(approval: &Approval) -> Vec<String> {
 }
 
 /// The NOTE lines that follow the start line, each starting with a newline.
-fn start_notes(c: &Checked, hide: &[PathBuf]) -> String {
+fn start_notes(c: &Checked) -> String {
     let mut out = String::new();
     for note in metadata_notes(&c.approval) {
         let _ = write!(out, "\nplaypen: {note}");
@@ -1188,50 +1335,49 @@ fn start_notes(c: &Checked, hide: &[PathBuf]) -> String {
     for note in c.pass_hosts.iter().flat_map(|p| &p.notes) {
         let _ = write!(out, "\nplaypen: NOTE: {note}");
     }
-    if let Some(note) = pass_dir_note(c, hide) {
-        let _ = write!(out, "\nplaypen: NOTE: {note}");
+    if let Some(PassDirView::Writable(dir)) = &c.pass_dir {
+        let _ = write!(
+            out,
+            "\nplaypen: NOTE: the pass's directory, {}, is writable by the command (--pass-dir-writable). Inside, the pass is /dev/null until it is replaced: an edit that writes a new file (sed -i and most editors do) makes the new pass visible there, and the command can read it and put another in its place before the next re-read. Keep the pass in a directory of its own, outside the working directory, and leave out --pass-dir-writable: playpen then makes that directory read-only for the command, or hides it",
+            dir.display()
+        );
     }
     out
 }
 
-/// The NOTE for a pass whose directory the command can reach; `None`
-/// without a pass, and when its directory is hidden.
-fn pass_dir_note(c: &Checked, hide: &[PathBuf]) -> Option<String> {
-    let dir = c.from_pass.as_ref()?.watch.dir().path();
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-    let mut hidden: Vec<PathBuf> = hide.to_vec();
-    hidden.extend(
-        sockets::covers(nix::unistd::getuid(), runtime_dir.as_deref())
-            .into_iter()
-            .map(|c| c.path),
-    );
-    let cwd = std::env::current_dir().ok();
-    if dir_hidden(dir, &hidden, &c.exposed, cwd.as_deref()) {
-        return None;
-    }
-    Some(format!(
-        "the directory of the pass, {}, is not hidden from the command. Inside, the pass is /dev/null until it is replaced: an edit that writes a new file (sed -i and most editors do) makes the new pass visible there, and a command that can write that directory can read it and put another in its place before the next re-read. Keep the pass in a directory of its own, outside the working directory, and hide that directory with --hide",
-        dir.display()
-    ))
-}
-
-/// Whether the command cannot reach `dir`: it is at or below a directory in
-/// `hidden` (`--hide`, or one the mount layer replaces) that is not the
-/// working directory `cwd` and does not hold it, and no `exposed` path at
-/// or above it brings it back. A process that starts in a hidden directory,
-/// or below it, keeps reaching the real one through relative paths.
-fn dir_hidden(dir: &Path, hidden: &[PathBuf], exposed: &[PathBuf], cwd: Option<&Path>) -> bool {
+/// Whether the command cannot reach `dir`: it is at or below a `hide`
+/// directory, or one of the `covers` the mount layer replaces, that is not
+/// the working directory `cwd` and does not hold it. An `exposed` path
+/// brings back what a cover hides when it is at or above `dir` and at or
+/// below the cover: the exposed paths are bound back after the covers, the
+/// `--hide` paths are mounted after both (and `--expose` refuses a path
+/// inside a `--hide` one). A process that starts in a hidden directory, or
+/// below it, keeps reaching the real one through relative paths.
+fn dir_hidden(
+    dir: &Path,
+    hide: &[PathBuf],
+    covers: &[PathBuf],
+    exposed: &[PathBuf],
+    cwd: Option<&Path>,
+) -> bool {
     let canonical = |p: &Path| std::fs::canonicalize(p).ok();
     let Some(dir) = canonical(dir) else {
         return false;
     };
     let cwd = cwd.and_then(canonical);
-    let covered = hidden
-        .iter()
-        .filter_map(|h| canonical(h))
-        .filter(|h| h.is_dir())
-        .any(|h| dir.starts_with(&h) && !cwd.as_ref().is_some_and(|c| c.starts_with(&h)));
-    covered && !exposed.iter().any(|e| dir.starts_with(e))
+    let hides = |h: &PathBuf| {
+        h.is_dir() && dir.starts_with(h) && !cwd.as_ref().is_some_and(|c| c.starts_with(h))
+    };
+    hide.iter().filter_map(|h| canonical(h)).any(|h| hides(&h))
+        || covers
+            .iter()
+            .filter_map(|c| canonical(c))
+            .filter(hides)
+            .any(|c| {
+                !exposed
+                    .iter()
+                    .any(|e| dir.starts_with(e) && e.starts_with(&c))
+            })
 }
 
 /// The first line (the grant summary, the end time and what is dropped),
@@ -1330,6 +1476,7 @@ fn base_report(args: &RunArgs) -> Report {
             digest: None,
             valid_until: None,
             labels: Vec::new(),
+            directory: None,
         }),
         capture: None,
         playpen_exit_status: EXIT_REFUSED,
@@ -1578,7 +1725,10 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     }
     report.until = checked.approval.ends_at.map(EndsAt::to_rfc3339);
     if let Some(p) = &checked.from_pass {
-        report.pass = Some(pass_report(&p.identity));
+        report.pass = Some(PassReport {
+            directory: checked.pass_dir.as_ref().map(PassDirView::report),
+            ..pass_report(&p.identity)
+        });
     }
     let fail = |report: &mut Report, file: Option<&mut ReportFile>, outcome, msg: String| {
         sayln!("playpen: {msg}");
@@ -1659,6 +1809,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         pasta,
         capture: capture.clone(),
         watch: checked.from_pass.map(|p| p.watch),
+        pass_dir: checked.pass_dir.as_ref().and_then(PassDirView::guard),
         watch_drops: args.events_fd.is_some() || args.live_drops || args.on_drop.is_some(),
         on_drop: args.on_drop,
     };
@@ -1827,35 +1978,61 @@ mod tests {
         let pass = root.join("sealed/pass");
         let work = root.join("work");
         let hide = |h: &[&str]| -> Vec<PathBuf> { h.iter().map(|p| root.join(p)).collect() };
+        // Each check twice: with the directory given as `--hide`, and as a
+        // directory the mount layer replaces.
+        let hidden = |h: &[&str], exposed: &[PathBuf], cwd: &Path| {
+            let by_hide = dir_hidden(&pass, &hide(h), &[], exposed, Some(cwd));
+            let by_cover = dir_hidden(&pass, &[], &hide(h), exposed, Some(cwd));
+            (by_hide, by_cover)
+        };
         // Nothing hidden.
-        assert!(!dir_hidden(&pass, &[], &[], Some(&work)));
+        assert!(!dir_hidden(&pass, &[], &[], &[], Some(&work)));
         // The directory itself, or one above it, through a link or not.
-        assert!(dir_hidden(&pass, &hide(&["sealed/pass"]), &[], Some(&work)));
-        assert!(dir_hidden(&pass, &hide(&["sealed"]), &[], Some(&work)));
-        assert!(dir_hidden(&pass, &hide(&["link"]), &[], Some(&work)));
+        assert_eq!(hidden(&["sealed/pass"], &[], &work), (true, true));
+        assert_eq!(hidden(&["sealed"], &[], &work), (true, true));
+        assert_eq!(hidden(&["link"], &[], &work), (true, true));
         // A sibling is not enough.
-        assert!(!dir_hidden(&pass, &hide(&["work"]), &[], Some(&work)));
+        assert_eq!(hidden(&["work"], &[], &work), (false, false));
         // A hidden directory that holds the working directory is still
         // reachable through relative paths.
-        assert!(!dir_hidden(&pass, &hide(&["sealed"]), &[], Some(&pass)));
-        assert!(!dir_hidden(
-            &pass,
-            &hide(&["sealed"]),
-            &[],
-            Some(&root.join("sealed"))
-        ));
-        assert!(!dir_hidden(&pass, &hide(&[""]), &[], Some(&work)));
-        // An exposed path at or above it brings it back.
-        let exposed = [std::fs::canonicalize(root.join("sealed")).unwrap_or_default()];
-        assert!(!dir_hidden(
-            &pass,
-            &hide(&["sealed/pass"]),
-            &exposed,
-            Some(&work)
-        ));
+        assert_eq!(hidden(&["sealed"], &[], &pass), (false, false));
+        assert_eq!(
+            hidden(&["sealed"], &[], &root.join("sealed")),
+            (false, false)
+        );
+        assert_eq!(hidden(&[""], &[], &work), (false, false));
+        // An exposed path at or above the directory and at or below a
+        // cover brings it back; a `--hide` directory is mounted after the
+        // exposed paths, so nothing brings that back.
+        let canonical = |p: &str| std::fs::canonicalize(root.join(p)).unwrap_or_default();
+        let sealed = [canonical("sealed")];
+        assert_eq!(hidden(&["sealed"], &sealed, &work), (true, false));
+        assert_eq!(hidden(&["sealed/pass"], &sealed, &work), (true, true));
+        assert_eq!(hidden(&["sealed"], &[canonical("")], &work), (true, true));
+        // The directory itself, exposed, comes back from a cover; a path
+        // below it does not bring it back.
+        let itself = [canonical("sealed/pass")];
+        std::fs::create_dir_all(root.join("sealed/pass/sock")).unwrap_or_else(|e| panic!("{e}"));
+        let below = [canonical("sealed/pass/sock")];
+        assert_eq!(hidden(&["sealed"], &itself, &work), (true, false));
+        assert_eq!(hidden(&["sealed"], &below, &work), (true, true));
         // A hidden file is not a hidden directory.
         std::fs::write(root.join("file"), "").unwrap_or_else(|e| panic!("{e}"));
-        assert!(!dir_hidden(&pass, &hide(&["file"]), &[], Some(&work)));
+        assert_eq!(hidden(&["file"], &[], &work), (false, false));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_entries_lists_the_directory_and_refuses_what_it_cannot_list() {
+        let root = tree("entries");
+        let dir = root.join("sealed/pass");
+        let names = |n: &[&str]| -> Vec<OsString> { n.iter().map(OsString::from).collect() };
+        assert!(only_entries(&dir, &names(&[])));
+        std::fs::write(dir.join("p.toml"), "").unwrap_or_else(|e| panic!("{e}"));
+        assert!(only_entries(&dir, &names(&["p.toml", "p.toml.ledger"])));
+        std::fs::write(dir.join("notes"), "").unwrap_or_else(|e| panic!("{e}"));
+        assert!(!only_entries(&dir, &names(&["p.toml", "p.toml.ledger"])));
+        assert!(!only_entries(&root.join("missing"), &names(&[])));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

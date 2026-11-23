@@ -77,6 +77,10 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
     if let Some(on_drop) = args.on_drop {
         scope["on_drop"] = json!(on_drop);
     }
+    // And for runs that leave the pass's directory writable.
+    if args.pass_dir_writable {
+        scope["pass_dir_writable"] = json!(true);
+    }
     Ok(scope)
 }
 
