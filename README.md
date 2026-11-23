@@ -64,8 +64,12 @@ of each selected single-address destination, with that address, into the
 sandbox's `/etc/hosts`; it looks nothing up and grants nothing. Map any
 other name to an address of the pass with `--host NAME=ADDR`.
 
+To check a pass you wrote by hand, run `playpen rules --pass FILE`: it prints
+each problem on its own line, or the ruleset when the pass is valid.
+
 Pass restrictions on destination names and application ceilings need a separate
-application-level enforcer. Use `--require-enforced` to refuse a pass with
+application-level enforcer. playpen prints a NOTE at the start (and on
+`playpen rules --pass`) for each such term in the pass. Use `--require-enforced` to refuse a pass with
 such applicable terms when playpen must enforce every restriction itself.
 The refusal names the destination labels and the ceilings.
 

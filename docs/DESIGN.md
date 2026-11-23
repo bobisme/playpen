@@ -581,9 +581,12 @@ flags, where a typo widens or narrows the approval without anyone
 noticing.
 
 **hallpass's own loader, not a second parser.** playpen calls
-`hallpass::load`, so the pass is held to exactly the rules `hallpass check`
-applies (no links, mode, size, every validation rule), and an operator sees
-the same codes and messages from both tools. The price is three crates
+`hallpass::load`, so the pass is held to the same rules as in hallpass (no
+links, mode, size, every validation rule), and an operator sees the same
+codes and problem texts. playpen words the refusal for an invalid pass
+itself: hallpass's text points to `hallpass check`, which playpen does not
+ship, so playpen prints each problem on its own line and points to
+`playpen rules --pass FILE`. The price is three crates
 (sha2, toml, thiserror, with their own small dependencies). playpen
 depends on hallpass with `default-features = false`: hallpass's binary and
 clap sit behind its default `cli` feature, added for this.

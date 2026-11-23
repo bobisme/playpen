@@ -307,15 +307,65 @@ fn from_pass(
     })
 }
 
-/// The hallpass error in words; for an invalid pass, every problem.
+/// The hallpass error in words. An invalid pass gets playpen's own text: a
+/// heading, then one indented line per problem (`field: message`). hallpass's
+/// own wording points to its `hallpass check` command, which playpen does not
+/// ship, so it is not used here.
 fn load_error(path: &Path, e: &hallpass::Error) -> String {
-    let mut msg = format!("--pass {}: {}: {e}", path.display(), e.code());
-    if let hallpass::Error::Invalid { problems, .. } = e {
-        for p in problems {
-            let _ = write!(msg, "; {}: {}", p.field, p.message);
-        }
+    let shown = path.display();
+    let hallpass::Error::Invalid { problems, .. } = e else {
+        return format!("--pass {shown}: {}: {e}", e.code());
+    };
+    let n = problems.len();
+    let mut msg = format!(
+        "--pass {shown}: {}: not a valid pass, {n} {}; fix each one, then check the file with `playpen rules --pass {shown}`",
+        e.code(),
+        if n == 1 { "problem" } else { "problems" },
+    );
+    for p in problems {
+        let _ = write!(msg, "\n{PROBLEM_INDENT}{}: {}", p.field, p.message);
     }
     msg
+}
+
+/// The indent of each problem line in a multi-line refusal. A message whose
+/// lines after the first start with it carries a list of problems.
+pub const PROBLEM_INDENT: &str = "  ";
+
+/// Splits a refusal into its heading and its problem lines.
+///
+/// The problems are returned without the indent. A message is split only
+/// when every line after the first is a problem line; any other message is
+/// kept whole, with no problems.
+#[must_use]
+pub fn split_problems(message: &str) -> (&str, Vec<&str>) {
+    let Some((heading, rest)) = message.split_once('\n') else {
+        return (message, Vec::new());
+    };
+    rest.lines()
+        .map(|l| l.strip_prefix(PROBLEM_INDENT))
+        .collect::<Option<Vec<_>>>()
+        .map_or((message, Vec::new()), |problems| (heading, problems))
+}
+
+/// The NOTE texts for the terms of the pass that playpen does not enforce:
+/// destination `names` and ceilings. Empty when it enforces every term.
+#[must_use]
+pub fn unenforced_notes(p: &FromPass) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !p.name_limited.is_empty() {
+        notes.push(format!(
+            "the pass approves these destinations only for the listed host names: {}. playpen filters addresses and ports and cannot see the name inside a request, so it does NOT enforce this; the command must send only those names",
+            p.name_limited.join("; ")
+        ));
+    }
+    if !p.coverage.external_ceilings.is_empty() {
+        notes.push(format!(
+            "the pass's ceilings ({}) are not enforced by playpen, which limits where packets go and not how many; an application-level enforcer must apply them",
+            p.coverage.external_ceilings.join(", ")
+        ));
+    }
+    notes
 }
 
 /// The destinations named by `only`, in file order (all when empty).
@@ -561,6 +611,17 @@ pub fn describe(identity: &PassIdentity) -> String {
 mod tests {
     use super::*;
     use time::macros::datetime;
+
+    #[test]
+    fn only_a_list_of_indented_problems_is_split() {
+        assert_eq!(split_problems("one line"), ("one line", vec![]));
+        assert_eq!(
+            split_problems("heading\n  a: x\n  b: y"),
+            ("heading", vec!["a: x", "b: y"])
+        );
+        let mixed = "heading\n  a: x\nnot a problem";
+        assert_eq!(split_problems(mixed), (mixed, vec![]));
+    }
 
     const PASS: &str = r#"
 format = 1

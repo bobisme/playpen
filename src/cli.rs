@@ -419,12 +419,16 @@ fn rules(
         Ok(until) => until,
         Err(e) => return refuse(&e.to_string()),
     };
+    let mut notes = Vec::new();
     let (mut approval, identity) = if let Some(path) = pass_file {
         if !allow.is_empty() {
             return refuse(PASS_AND_ALLOW);
         }
         match pass::load(path, only, now) {
-            Ok(p) => (p.approval, Some(p.identity)),
+            Ok(p) => {
+                notes = pass::unenforced_notes(&p);
+                (p.approval, Some(p.identity))
+            }
             Err(e) => return refuse(&e),
         }
     } else {
@@ -459,13 +463,18 @@ fn rules(
     };
     let text = crate::ruleset::render_instrumented(&approval, with);
     match format {
-        Format::Text | Format::Pretty => print!("{text}"),
+        Format::Text | Format::Pretty => {
+            for note in &notes {
+                eprintln!("playpen: NOTE: {note}");
+            }
+            print!("{text}");
+        }
         Format::Json => {
             let mut out = serde_json::json!({
                 "allowed": approval.rules().iter().map(ToString::to_string).collect::<Vec<_>>(),
                 "pass": identity.as_ref().map(pass_report),
                 "until": approval.ends_at.map(EndsAt::to_rfc3339),
-                "ruleset": text, "advice": [],
+                "ruleset": text, "notes": notes, "advice": [],
             });
             if let Some(on_drop) = on_drop {
                 out["on_drop"] = serde_json::json!(on_drop);
@@ -1117,16 +1126,10 @@ fn start_line(c: &Checked, args: &RunArgs, capture: Option<&Path>) -> String {
 
 /// The NOTE lines that follow the start line, each starting with a newline.
 fn start_notes(c: &Checked) -> String {
-    let mut out = c
-        .from_pass
-        .as_ref()
-        .filter(|p| !p.name_limited.is_empty())
-        .map_or_else(String::new, |p| {
-            format!(
-                "\nplaypen: NOTE: the pass approves these destinations only for the listed host names: {}. playpen filters addresses and ports and cannot see the name inside a request, so it does NOT enforce this; the command must send only those names",
-                p.name_limited.join("; ")
-            )
-        });
+    let mut out = String::new();
+    for note in c.from_pass.iter().flat_map(pass::unenforced_notes) {
+        let _ = write!(out, "\nplaypen: NOTE: {note}");
+    }
     for note in c.pass_hosts.iter().flat_map(|p| &p.notes) {
         let _ = write!(out, "\nplaypen: NOTE: {note}");
     }

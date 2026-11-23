@@ -202,8 +202,14 @@ instead (`| cat`, `< /dev/null`).
 - Refused (exit 2, `refused:`, the hallpass code and message, `nothing was
   run`): a missing or unreadable file (`io`), `symlink`,
   `not-regular-file`, `too-large`, `insecure-permissions`, `invalid-pass`
-  (every problem listed with its field path), `not-yet-valid`, `expired`,
-  `revoked`.
+  (see below), `not-yet-valid`, `expired`, `revoked`.
+- An `invalid-pass` refusal has a heading line (the code, the number of
+  problems, and the check ``playpen rules --pass FILE``), then one
+  indented line per problem, `FIELD: what is wrong and what to write`. The
+  hallpass wording, which points to `hallpass check`, is not used: playpen
+  does not ship that command. In JSON (`rules`), the error object has the
+  heading as `message` and `problems`, an array of the same lines without
+  the indent.
 - The allow list is exactly the pass's destinations in file order: one
   allow rule per destination and port range (`ports = [443, "8000-8100"]`
   gives two rules), with the destination's address or network and
@@ -349,6 +355,16 @@ destination the owner wrote, so the address is one the pass approves.
   without `--pass-hosts`.
 - A mid-run edit of a `hostname` does not stop the run (see the re-read
   rules above).
+
+A pass with `[ceilings]` has terms that playpen does not enforce: it
+limits where packets go, not how many. The start line is followed by one
+`playpen: NOTE: the pass's ceilings (KEY, KEY) are not enforced by playpen
+...; an application-level enforcer must apply them`, with every ceiling
+key in the pass (the ceilings apply to the whole pass, not to `--only`).
+A pass without ceilings prints no such NOTE. `playpen rules --pass` prints
+the same NOTEs (and the one for `names`) on stderr, without `playpen: NOTE:`
+in the JSON `notes` array. `plan` already has the keys in
+`pass.coverage.external_ceilings`; it gets no new field.
 
 A destination's `names` in the pass (the only host names the owner approved
 on that address) is **not enforced**: playpen filters addresses and ports
@@ -899,7 +915,8 @@ playpen rules --pass FILE [--only LABEL]... [--pass-hosts] [--until RFC3339]
 Prints the ruleset that `run` would load for these rules. Sends nothing,
 creates nothing. Text: the ruleset. JSON: `{"allowed": [SPEC...], "pass":
 {...} or null, "until": TIME or null, "ruleset": "..."}` with canonical
-specs; `pass` has the same fields as in the report (4.5). A bad spec is
+specs; `pass` has the same fields as in the report (4.5); `notes` lists
+the NOTE texts below (empty when there are none). A bad spec is
 refused (exit 2, nothing printed on stdout). An empty `--allow` list is
 allowed here and prints the ruleset that allows nothing. With `--pass`, the
 pass is loaded and checked exactly as by `run` (window included: an

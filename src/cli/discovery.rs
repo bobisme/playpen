@@ -49,7 +49,7 @@ pub(super) const RULES: &str = "Examples
   playpen rules --format json
 
 Agent workflow
-  Inspect allowed and ruleset before a launch. Empty grants show the baseline firewall. Use plan to bind grants to a specific command. Exit 0 means rendered. Invalid grants exit 2.";
+  Inspect allowed and ruleset before a launch. Empty grants show the baseline firewall. Use plan to bind grants to a specific command. Exit 0 means rendered. Invalid grants exit 2. `rules --pass FILE` is the check for a hand-written pass: it lists each problem on its own line.";
 pub(super) const POLICY: &str = r#"Examples
   printf '%s\n' '[{"address":"192.0.2.10","port":443,"protocol":"tcp","expect":"allow"}]' > cases.json
   playpen policy-test cases.json --allow 192.0.2.10:443/tcp --format json
@@ -127,10 +127,14 @@ impl Format {
 
 pub fn error(format: Format, kind: &str, message: &str, status: i32) -> i32 {
     if format == Format::Json {
-        eprintln!(
-            "{}",
-            json!({"error":{"type":kind,"message":message},"exit_code":status,"advice":[]})
-        );
+        // A refusal that lists problems gives the heading as the message and
+        // the problems, one string each, as an array.
+        let (heading, problems) = crate::pass::split_problems(message);
+        let mut error = json!({"type":kind,"message":heading});
+        if !problems.is_empty() {
+            error["problems"] = json!(problems);
+        }
+        eprintln!("{}", json!({"error":error,"exit_code":status,"advice":[]}));
     } else {
         eprintln!("playpen: {message}");
     }

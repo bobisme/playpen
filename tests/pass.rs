@@ -819,7 +819,10 @@ fn a_pass_that_limits_names_is_enforced_by_address_only_and_playpen_says_so() {
     assert!(!note.contains("sip"), "{note}");
 
     // A pass without names prints no such note.
-    let plain = new_pass(&dir, &valid_pass(&[WEB, SIP]));
+    let plain = new_pass(
+        &dir,
+        &valid_pass(&[WEB, SIP]).replace("[ceilings]\ncalls = 6\n", ""),
+    );
     let (_, out) = reach(&["--pass", s(&plain)], &["192.0.2.1:9101/tcp"]);
     assert!(!text(&out.stderr).contains("NOTE"));
 }
@@ -1522,4 +1525,95 @@ fn plan_and_pin_cover_pass_hosts() {
         ]);
         assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     }
+}
+
+/// A pass with two ceilings and no names.
+fn two_ceiling_pass() -> String {
+    valid_pass(&[WEB]).replace("calls = 6", "calls = 6\nrequests = 100")
+}
+
+#[test]
+fn rules_note_the_ceilings_the_pass_has_and_playpen_does_not_enforce() {
+    let dir = tmpdir("ceiling-note-rules");
+    let pass = new_pass(&dir, &two_ceiling_pass());
+    let out = run(&["rules", "--pass", s(&pass)]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let notes: Vec<&str> = err.lines().filter(|l| l.contains("NOTE")).collect();
+    assert_eq!(notes.len(), 1, "{err}");
+    assert!(notes[0].contains("(calls, requests)"), "{err}");
+    assert!(notes[0].contains("not enforced by playpen"), "{err}");
+
+    let out = run(&["--json", "rules", "--pass", s(&pass)]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    assert_eq!(json["notes"].as_array().map(Vec::len), Some(1), "{json}");
+
+    let plain = new_pass(
+        &dir,
+        &valid_pass(&[WEB]).replace("[ceilings]\ncalls = 6\n", ""),
+    );
+    let out = run(&["rules", "--pass", s(&plain)]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!text(&out.stderr).contains("NOTE"), "{}", text(&out.stderr));
+}
+
+#[test]
+fn the_start_line_has_one_ceiling_note_naming_every_ceiling() {
+    require_sandbox!();
+    let dir = tmpdir("ceiling-note-start");
+    let pass = new_pass(&dir, &two_ceiling_pass());
+    let (_, out) = reach(&["--pass", s(&pass)], &["192.0.2.1:9101/tcp"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let notes: Vec<&str> = err.lines().filter(|l| l.contains("NOTE")).collect();
+    assert_eq!(notes.len(), 1, "{err}");
+    assert!(notes[0].contains("(calls, requests)"), "{err}");
+
+    let plain = new_pass(
+        &dir,
+        &valid_pass(&[WEB]).replace("[ceilings]\ncalls = 6\n", ""),
+    );
+    let (_, out) = reach(&["--pass", s(&plain)], &["192.0.2.1:9101/tcp"]);
+    assert!(!text(&out.stderr).contains("NOTE"), "{}", text(&out.stderr));
+}
+
+#[test]
+fn an_invalid_pass_lists_one_problem_per_line_and_points_to_playpen() {
+    let dir = tmpdir("invalid-lines");
+    let bad = valid_pass(&[WEB])
+        .replace("address = \"192.0.2.1\"", "address = \"app.example.test\"")
+        .replace("protocol = \"tcp\"", "protocol = \"TCP\"")
+        .replace("revoked = false", "");
+    let pass = new_pass(&dir, &bad);
+    let out = run(&["rules", "--pass", s(&pass)]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(!err.contains("hallpass check"), "{err}");
+    assert!(err.contains("playpen rules --pass"), "{err}");
+    let lines: Vec<&str> = err.lines().collect();
+    let problems: Vec<&&str> = lines.iter().filter(|l| l.starts_with("  ")).collect();
+    assert_eq!(problems.len(), 3, "{err}");
+    assert!(!lines[0].contains("destination[1]"), "{err}");
+    assert!(
+        problems
+            .iter()
+            .any(|l| l.contains("destination[1].address"))
+    );
+
+    let out = run(&["--json", "rules", "--pass", s(&pass)]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap_or_default();
+    let listed = json["error"]["problems"].as_array().map_or(0, Vec::len);
+    assert_eq!(listed, problems.len(), "{json}");
+    assert_eq!(json["error"]["type"], "refused");
+    assert!(
+        !json["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains('\n'),
+        "{json}"
+    );
+
+    // The suggested check succeeds on a valid pass.
+    let good = new_pass(&dir, &valid_pass(&[WEB]));
+    assert_eq!(run(&["rules", "--pass", s(&good)]).status.code(), Some(0));
 }
