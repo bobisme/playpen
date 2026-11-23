@@ -37,7 +37,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Write as _;
 use std::net::IpAddr;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -473,27 +473,37 @@ struct PrivateTtyFds {
 
 impl PrivateTerminal {
     fn prepare(stdout_report: bool) -> Result<Self, String> {
-        let stdin = unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
-        if unsafe { libc::isatty(stdin.as_raw_fd()) } != 1 {
-            return Err("--private-tty needs an interactive terminal on standard input".into());
+        // Open /dev/tty independently of stdio: an explicit private tty owns
+        // keyboard input even when every standard stream is redirected. This
+        // open-file description also survives session-leader death.
+        let raw_tty = unsafe {
+            libc::open(
+                c"/dev/tty".as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if raw_tty < 0 {
+            return Err(format!(
+                "--private-tty needs a controlling terminal: {}",
+                Errno::last()
+            ));
         }
+        let host_tty = unsafe { OwnedFd::from_raw_fd(raw_tty) };
         let host_group = getpgrp();
-        let foreground = unsafe { libc::tcgetpgrp(stdin.as_raw_fd()) };
+        let foreground = unsafe { libc::tcgetpgrp(host_tty.as_raw_fd()) };
         if foreground < 0 || foreground != host_group.as_raw() {
             return Err(
                 "--private-tty needs to run in the caller terminal's foreground process group"
                     .into(),
             );
         }
-        let host_session = unsafe { libc::tcgetsid(stdin.as_raw_fd()) };
+        let host_session = unsafe { libc::tcgetsid(host_tty.as_raw_fd()) };
         if host_session < 0 || unsafe { libc::getsid(0) } != host_session {
-            return Err(
-                "--private-tty standard input is not the caller's controlling terminal".into(),
-            );
+            return Err("--private-tty needs the caller's controlling terminal".into());
         }
 
-        let mut streams = [true, false, false];
-        for (index, fd) in [libc::STDOUT_FILENO, libc::STDERR_FILENO]
+        let mut streams = [false; 3];
+        for (index, fd) in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
             .into_iter()
             .enumerate()
         {
@@ -505,10 +515,10 @@ impl PrivateTerminal {
             {
                 return Err(format!(
                     "--private-tty cannot preserve terminal-connected standard {} on a different terminal",
-                    if index == 0 { "output" } else { "error" }
+                    ["input", "output", "error"][index]
                 ));
             }
-            streams[index + 1] = true;
+            streams[index] = true;
         }
         // `run --json` moves stdout to stderr in C before exec. Match that
         // final descriptor layout so a redirected stderr stays redirected.
@@ -516,13 +526,13 @@ impl PrivateTerminal {
             streams[1] = streams[2];
         }
 
-        let termios =
-            tcgetattr(stdin).map_err(|e| format!("cannot read terminal settings: {e}"))?;
+        let termios = tcgetattr(host_tty.as_fd())
+            .map_err(|e| format!("cannot read terminal settings: {e}"))?;
         let mut winsize = std::mem::MaybeUninit::<Winsize>::zeroed();
         // SAFETY: TIOCGWINSZ writes one `winsize` value to this valid buffer.
         if unsafe {
             libc::ioctl(
-                stdin.as_raw_fd(),
+                host_tty.as_raw_fd(),
                 libc::TIOCGWINSZ as libc::c_ulong,
                 winsize.as_mut_ptr(),
             )
@@ -552,7 +562,7 @@ impl PrivateTerminal {
             .map_err(|e| format!("cannot protect private terminal monitor: {e}"))?;
         // SAFETY: run_sandbox verified this process is single-threaded before
         // creating the relay helper.
-        let relay = unsafe { crate::terminal_relay::Relay::start(pair.master) }
+        let relay = unsafe { crate::terminal_relay::Relay::start(pair.master, host_tty) }
             .map_err(|e| format!("cannot start the private terminal relay: {e}"))?;
         Ok(Self {
             relay,

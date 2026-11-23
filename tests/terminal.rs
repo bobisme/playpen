@@ -847,9 +847,10 @@ fn private_tty_resizes_and_restores_the_outer_terminal_after_interrupt() {
 }
 
 #[test]
-fn private_tty_refuses_non_terminal_input_before_starting() {
+fn private_tty_refuses_a_session_without_controlling_terminal() {
     require_sandbox!();
-    let out = Command::new(BIN)
+    let mut command = Command::new(BIN);
+    command
         .args([
             "run",
             "--no-network",
@@ -858,9 +859,20 @@ fn private_tty_refuses_non_terminal_input_before_starting() {
             "echo",
             "unexpected-marker",
         ])
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    // SAFETY: setsid is async-signal-safe and guarantees no controlling tty,
+    // even if the integration suite itself was launched from a terminal.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = command
         .output()
-        .expect("launch playpen");
+        .expect("launch playpen without a controlling tty");
     let err = text(&out.stderr);
     assert!(matches!(out.status.code(), Some(1 | 2)), "{err}");
     assert!(
@@ -956,9 +968,19 @@ fn private_tty_signals_foreground_pipeline_after_its_leader_exits() {
 
 #[test]
 fn private_tty_restores_mode_when_session_leader_is_killed() {
+    require_sandbox!();
+    assert_private_tty_restored_after_leader_kill(false);
+}
+
+#[test]
+fn private_tty_restores_mode_after_leader_kill_with_redirected_stdin() {
+    require_sandbox!();
+    assert_private_tty_restored_after_leader_kill(true);
+}
+
+fn assert_private_tty_restored_after_leader_kill(redirected_stdin: bool) {
     use std::os::unix::process::ExitStatusExt as _;
 
-    require_sandbox!();
     // Retain the slave in the test process, outside Playpen's session, so
     // the terminal settings remain observable after its leader dies.
     let (master, slave) = Pty::pair();
@@ -986,7 +1008,15 @@ fn private_tty_restores_mode_when_session_leader_is_killed() {
         }
     };
     let before = mode();
-    let mut cmd = Command::new(BIN);
+    let mut cmd = if redirected_stdin {
+        // The fixture gives the shell a controlling terminal. It keeps
+        // the same session-leader PID when it execs Playpen with a null fd 0.
+        let mut shell = Command::new("sh");
+        shell.args(["-c", "exec \"$@\" </dev/null", "session-leader", BIN]);
+        shell
+    } else {
+        Command::new(BIN)
+    };
     cmd.args([
         "run",
         "--no-network",
@@ -1033,4 +1063,48 @@ fn private_tty_restores_mode_when_session_leader_is_killed() {
         );
         t.read_for(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn private_tty_separates_keyboard_input_when_all_stdio_are_redirected() {
+    require_pty!(t);
+    t.send(
+        r#"scratch=$(mktemp -d); printf '%s\n' file-line >"$scratch/input"
+"#,
+    );
+    t.expect("$ ");
+    t.send(
+        r#"$P run --no-network --private-tty -- sh -c 'test ! -t 0 && test ! -t 1 && test ! -t 2 || exit 41; IFS= read -r data || exit 42; printf "keyboard-%s\n" ready >/dev/tty || exit 43; IFS= read -r key </dev/tty || exit 44; if IFS= read -r extra; then exit 45; fi; printf "file-stdout:%s/%s\n" "$data" "$key"; printf "file-stderr:%s/%s\n" "$data" "$key" >&2' <"$scratch/input" >"$scratch/output" 2>"$scratch/error"
+"#,
+    );
+    t.expect("keyboard-ready\r\n");
+    t.send("keyboard-line\n");
+    let tail = t.expect("$ ");
+    assert!(
+        !tail.contains("file-stdout:") && !tail.contains("file-stderr:"),
+        "{tail}"
+    );
+    assert_eq!(t.status(), "0");
+    t.expect("$ ");
+    t.send(
+        r#"if test "$(cat "$scratch/output")" = 'file-stdout:file-line/keyboard-line' && grep -Fxq 'file-stderr:file-line/keyboard-line' "$scratch/error"; then echo redirected-"stdio-confirmed"; fi; rm -f "$scratch/input" "$scratch/output" "$scratch/error"; rmdir "$scratch"
+"#,
+    );
+    t.expect("redirected-stdio-confirmed\r\n");
+}
+
+#[test]
+fn private_tty_keeps_piped_stdin_separate_from_dev_tty_keyboard_input() {
+    require_pty!(t);
+    t.send("set -o pipefail\n");
+    t.expect("$ ");
+    t.send(
+        r#"printf '%s\n' pipe-first pipe-last | $P run --no-network --private-tty -- sh -c 'test ! -t 0 || exit 41; IFS= read -r first || exit 42; printf "pipe-keyboard-%s\n" ready >/dev/tty || exit 43; IFS= read -r key </dev/tty || exit 44; IFS= read -r last || exit 45; if IFS= read -r extra; then exit 46; fi; printf "channels:%s/%s/%s\n" "$first" "$key" "$last"'
+"#,
+    );
+    t.expect("pipe-keyboard-ready\r\n");
+    t.send("keyboard-line\n");
+    t.expect("channels:pipe-first/keyboard-line/pipe-last\r\n");
+    t.expect("$ ");
+    assert_eq!(t.status(), "0");
 }

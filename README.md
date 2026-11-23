@@ -105,8 +105,9 @@ The shell gets its own controlling terminal for prompts and job control.
 Send a forwarded signal such as SIGTERM or SIGUSR1 to the playpen PID or
 its process group. Either way, the private terminal’s foreground job gets
 one copy. Use this mode when playpen has exclusive use of terminal input.
-For a pipeline with another stage that reads the keyboard, use the default
-terminal behavior.
+A pipe or file can supply stdin while the command reads a password or
+confirmation from `/dev/tty`. For a pipeline with another stage that reads
+the keyboard, use the default terminal behavior.
 
 ### Run with a command-line allow list
 

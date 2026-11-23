@@ -356,10 +356,11 @@ A dangling symlink is treated the same way. Command stdout is unchanged.
 Applied after the mount layer and `--expose`.
 
 **`--private-tty`**. Run the workload with a private controlling terminal.
-Start playpen in the foreground with its controlling terminal on stdin, and
-dedicate keyboard input to this run. The workload can open `/dev/tty`, use
-an interactive shell and receive signals forwarded from the playpen PID or
-its process group. Redirected output retains its destination. Terminal
+Start playpen in the foreground and dedicate its controlling terminal’s
+keyboard input to this run. A pipe or file on stdin stays connected to the
+workload. Programs can open `/dev/tty` for keyboard input, and shells can
+use job control. Playpen forwards signals addressed to its PID or process
+group to the private foreground job. Redirected output retains its destination. Terminal
 availability is checked at launch. The plan digest covers `--private-tty`.
 
 **Terminal and job control.** In the default attached mode, the command stays in

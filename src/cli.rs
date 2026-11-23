@@ -223,7 +223,8 @@ struct RunArgs {
     #[arg(help_heading = "Host access", long)]
     new_session: bool,
     /// Give the command a private controlling terminal with job control and one
-    /// signal route. Requires foreground terminal stdin dedicated to this run.
+    /// signal route. Requires exclusive keyboard input from a foreground controlling
+    /// terminal. Stdin can come from a pipe or file.
     #[arg(help_heading = "Host access", long, conflicts_with = "new_session")]
     private_tty: bool,
     /// Write lifecycle JSON lines to an inherited pipe above stderr.

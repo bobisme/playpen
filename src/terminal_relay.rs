@@ -2,7 +2,7 @@
 //!
 //! The caller owns PTY allocation, the slave's controlling session, and the
 //! decision which workload descriptors are attached to it. This relay opens
-//! its own controlling-terminal descriptor and requires foreground tty stdin.
+//! the separately opened foreground controlling-terminal descriptor.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -20,52 +20,25 @@ pub struct Relay {
 }
 
 impl Relay {
-    /// Open and validate the exclusive foreground controlling terminal, then
-    /// start the relay. The caller attaches only tty-backed standard streams to
-    /// the private slave and initializes that slave from the original tty.
+    /// Start the relay with an independently opened controlling-terminal fd.
+    /// The caller validates foreground ownership and attaches only standard
+    /// streams belonging to that terminal to the private slave.
     ///
     /// # Errors
-    /// If stdin is redirected, another process group owns the terminal, or
-    /// relay setup fails. Nothing is started on validation failure.
+    /// If terminal ownership changes or relay setup fails.
     ///
     /// # Safety
     /// The caller must be single threaded: the helper executes Rust after fork.
-    pub unsafe fn start(master: OwnedFd) -> io::Result<Self> {
-        // Open the actual terminal device, not the /dev/tty alias: when a
-        // session leader dies, /dev/tty stops resolving in its old session.
-        // A separate open-file description also keeps O_NONBLOCK local.
-        let mut path = [libc::c_char::default(); 4096];
-        let name_error = unsafe { libc::ttyname_r(0, path.as_mut_ptr(), path.len()) };
-        if name_error != 0 {
-            return Err(io::Error::from_raw_os_error(name_error));
-        }
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let outer_tty = unsafe { OwnedFd::from_raw_fd(fd) };
-        let mut source: libc::stat = unsafe { std::mem::zeroed() };
-        let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+    pub unsafe fn start(master: OwnedFd, outer_tty: OwnedFd) -> io::Result<Self> {
+        let fd = outer_tty.as_raw_fd();
         let session = unsafe { libc::tcgetsid(fd) };
-        if unsafe { libc::isatty(0) } != 1
-            || unsafe { libc::fstat(0, &raw mut source) } != 0
-            || unsafe { libc::fstat(fd, &raw mut opened) } != 0
-            || source.st_dev != opened.st_dev
-            || source.st_ino != opened.st_ino
-            || source.st_rdev != opened.st_rdev
-            || session < 0
-            || unsafe { libc::tcgetsid(0) } != session
-            || unsafe { libc::tcgetpgrp(0) != libc::getpgrp() }
+        if session < 0
+            || unsafe { libc::getsid(0) } != session
             || unsafe { libc::tcgetpgrp(fd) != libc::getpgrp() }
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "private tty requires foreground controlling-terminal stdin",
+                "private tty requires the foreground controlling terminal",
             ));
         }
         let mut original: libc::termios = unsafe { std::mem::zeroed() };

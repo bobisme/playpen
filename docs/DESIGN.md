@@ -253,7 +253,9 @@ the caller's job. PID 1 forwards a signal from the supervisor to the private
 terminal's foreground process group. A signal addressed to the caller's
 whole job takes the same route. The relay copies the initial terminal
 settings and propagates window size changes. It connects terminal-backed
-streams to the private terminal and preserves redirected output.
+streams to the private terminal and preserves redirected input and output.
+The relay reads keyboard input from the caller’s controlling terminal,
+including when all three standard streams are redirected.
 
 At the top level, Ctrl-Z lets the outer shell suspend and resume Playpen.
 When an inner shell gives the private terminal to a foreground job, the
@@ -274,6 +276,13 @@ forward could lose a signal sent to the supervisor alone. The shared group
 also lets other pipeline stages read the real terminal and lets a command
 open `/dev/tty` with redirected stdin. For single delivery in this mode,
 address the supervisor PID.
+
+Giving the terminal to a separate workload group fixes signal delivery but
+also moves the other pipeline stages into the background. A sibling with
+SIGTTIN blocked then gets EIO on a keyboard read that would have succeeded
+in the original foreground job. It need not produce any signal that Playpen
+could use to hand the terminal back. The shared-terminal acceptance test
+must therefore cover both signal counts and input at a sibling stage.
 
 ## AppArmor
 
