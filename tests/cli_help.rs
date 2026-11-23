@@ -274,3 +274,61 @@ fn pass_hosts_is_listed_and_without_pass_is_a_usage_error() {
     }
     assert!(!std::path::Path::new(marker).exists(), "the command ran");
 }
+
+#[test]
+fn the_contacted_record_and_suggest_are_listed() {
+    let root = json(&invoke(&["--help", "--json"], None).stdout);
+    assert!(
+        root["commands"]
+            .as_array()
+            .expect("commands")
+            .iter()
+            .any(|c| c["name"] == "suggest"),
+        "{root}"
+    );
+    for name in ["run", "rules"] {
+        let help = json(&invoke(&["help", name, "--format", "json"], None).stdout);
+        let arg = help["arguments"]
+            .as_array()
+            .expect("arguments")
+            .iter()
+            .find(|a| a["long"] == "report-contacts")
+            .cloned()
+            .unwrap_or_else(|| panic!("{name}: no --report-contacts in {help}"));
+        assert_eq!(arg["takes_value"], false, "{name}");
+        assert!(
+            help["examples"]
+                .as_array()
+                .expect("examples")
+                .iter()
+                .any(|e| e.as_str().is_some_and(|e| e.contains("--report-contacts"))),
+            "{name}: {help}"
+        );
+    }
+    let run = json(&invoke(&["help", "run", "--format", "json"], None).stdout);
+    assert!(
+        run["workflow"]
+            .as_str()
+            .is_some_and(|w| w.contains("playpen suggest REPORT")),
+        "{run}"
+    );
+    let suggest = json(&invoke(&["help", "suggest", "--format", "json"], None).stdout);
+    let workflow = suggest["workflow"].as_str().unwrap_or("");
+    assert!(
+        workflow.contains("One quiet run does not show that a later run needs less"),
+        "{workflow}"
+    );
+    let report = suggest["arguments"]
+        .as_array()
+        .expect("arguments")
+        .iter()
+        .find(|a| a["name"] == "report")
+        .cloned()
+        .expect("REPORT");
+    assert_eq!(report["required"], true);
+    let text = String::from_utf8(invoke(&["suggest", "--help"], None).stdout).expect("help");
+    assert!(
+        text.contains("Usage: playpen suggest [OPTIONS] <REPORT>"),
+        "{text}"
+    );
+}

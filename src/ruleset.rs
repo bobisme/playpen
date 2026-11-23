@@ -11,6 +11,7 @@ use std::net::IpAddr;
 use serde::Serialize;
 
 use crate::approval::{AllowRule, Approval, Proto};
+use crate::contacts;
 pub use crate::nft_readback::verify_policy;
 
 /// Name of the nftables table playpen loads.
@@ -68,11 +69,12 @@ pub fn render(rules: &[AllowRule]) -> String {
 /// and its end time.
 #[must_use]
 pub fn render_approval(approval: &Approval) -> String {
-    render_instrumented(approval, 0)
+    render_instrumented(approval, 0, false)
 }
 
-/// The table's counters and sets.
-fn declarations(out: &mut String, timed: bool, grant_counters: usize) {
+/// The table's counters and sets. With `record_contacts`, also the counter
+/// and the sets of [`crate::contacts`].
+fn declarations(out: &mut String, timed: bool, grant_counters: usize, record_contacts: bool) {
     let _ = writeln!(out, "\tcounter dropped {{");
     let _ = writeln!(out, "\t}}");
     if timed {
@@ -88,7 +90,18 @@ fn declarations(out: &mut String, timed: bool, grant_counters: usize) {
             crate::grant_use::counter_name(index)
         );
     }
-    for (name, ty) in [("drop4", "ipv4_addr"), ("drop6", "ipv6_addr")] {
+    if record_contacts {
+        let _ = writeln!(out, "\tcounter {} {{}}", contacts::COUNTER);
+    }
+    let mut sets = vec![("drop4", "ipv4_addr"), ("drop6", "ipv6_addr")];
+    if record_contacts {
+        sets.extend([
+            (contacts::SEEN4, "ipv4_addr"),
+            (contacts::SEEN6, "ipv6_addr"),
+        ]);
+    }
+    // The contacted sets have the shape of the drop sets.
+    for (name, ty) in sets {
         let _ = writeln!(out, "\tset {name} {{");
         let _ = writeln!(out, "\t\ttype {ty} . inet_proto . inet_service");
         let _ = writeln!(out, "\t\tsize {DROP_SET_SIZE}");
@@ -102,14 +115,26 @@ fn declarations(out: &mut String, timed: bool, grant_counters: usize) {
     let _ = writeln!(out, "\t}}");
 }
 
-pub(crate) fn render_instrumented(approval: &Approval, grant_counters: usize) -> String {
+/// The ruleset with the optional records. Without either it is
+/// [`render_approval`].
+///
+/// A counter on each of the first `grant_counters` grants
+/// (`--report-grant-use`), and with `record_contacts` the record of
+/// contacted destinations (`--report-contacts`): each grant then ends in
+/// `goto contacted` instead of `accept`.
+#[must_use]
+pub fn render_instrumented(
+    approval: &Approval,
+    grant_counters: usize,
+    record_contacts: bool,
+) -> String {
     let end = end_second(approval);
     let mut out = String::new();
     // A table of our own; flush it first so a reload replaces it whole.
     let _ = writeln!(out, "table inet {TABLE} {{}}");
     let _ = writeln!(out, "delete table inet {TABLE}");
     let _ = writeln!(out, "table inet {TABLE} {{");
-    declarations(&mut out, end.is_some(), grant_counters);
+    declarations(&mut out, end.is_some(), grant_counters, record_contacts);
     let _ = writeln!(out, "\tchain output {{");
     let _ = writeln!(
         out,
@@ -143,7 +168,11 @@ pub(crate) fn render_instrumented(approval: &Approval, grant_counters: usize) ->
                 crate::grant_use::counter_name(index)
             );
         }
-        let _ = writeln!(out, " accept");
+        if record_contacts {
+            let _ = writeln!(out, " goto {}", contacts::CHAIN);
+        } else {
+            let _ = writeln!(out, " accept");
+        }
     }
     let _ = writeln!(
         out,
@@ -164,6 +193,9 @@ pub(crate) fn render_instrumented(approval: &Approval, grant_counters: usize) ->
     let _ = writeln!(out, "\t\tcounter name \"dropped\"");
     let _ = writeln!(out, "\t\treject with icmpx admin-prohibited");
     let _ = writeln!(out, "\t}}");
+    if record_contacts {
+        contacted_chain(&mut out);
+    }
     let _ = writeln!(out, "\tchain input {{");
     let _ = writeln!(
         out,
@@ -185,6 +217,28 @@ pub(crate) fn render_instrumented(approval: &Approval, grant_counters: usize) ->
     let _ = writeln!(out, "\t}}");
     let _ = writeln!(out, "}}");
     out
+}
+
+/// The regular chain every grant goes to with `--report-contacts`: count
+/// the packet, add its destination to the set of its family, accept it.
+fn contacted_chain(out: &mut String) {
+    let _ = writeln!(out, "\tchain {} {{", contacts::CHAIN);
+    let _ = writeln!(
+        out,
+        "\t\t# A full set ends only the rule that adds to it; the accept below still applies."
+    );
+    let _ = writeln!(out, "\t\tcounter name \"{}\"", contacts::COUNTER);
+    for (family, addr, set) in [
+        ("ipv4", "ip", contacts::SEEN4),
+        ("ipv6", "ip6", contacts::SEEN6),
+    ] {
+        let _ = writeln!(
+            out,
+            "\t\tmeta nfproto {family} add @{set} {{ {addr} daddr . meta l4proto . th dport }}"
+        );
+    }
+    let _ = writeln!(out, "\t\taccept");
+    let _ = writeln!(out, "\t}}");
 }
 
 /// The time rule (with an end time) and the cut rule. Only the output
@@ -349,7 +403,7 @@ pub fn parse_counters(json: &str) -> Result<DropSummary, String> {
                 None => {} // nft omits elem for an empty set
                 Some(serde_json::Value::Array(elems)) => {
                     for elem in elems {
-                        if let Some(d) = parse_elem(elem, name.unwrap_or_default()) {
+                        if let Some(d) = parse_elem(elem, name == Some("drop4")) {
                             if !identities.insert((d.address.clone(), d.protocol.clone(), d.port)) {
                                 detail_uncertain = true;
                             }
@@ -376,7 +430,10 @@ pub fn parse_counters(json: &str) -> Result<DropSummary, String> {
     })
 }
 
-fn parse_elem(elem: &serde_json::Value, family: &str) -> Option<DroppedDest> {
+/// One element of a set of destinations (address, protocol, port) with
+/// its counter: of an IPv4 set when `v4`, else of an IPv6 set. `None` for
+/// an element of any other shape or family.
+pub(crate) fn parse_elem(elem: &serde_json::Value, v4: bool) -> Option<DroppedDest> {
     let inner = elem.get("elem")?;
     let concat = inner.get("val")?.get("concat")?.as_array()?;
     if concat.len() != 3 {
@@ -389,7 +446,7 @@ fn parse_elem(elem: &serde_json::Value, family: &str) -> Option<DroppedDest> {
         .ok()?
         .to_string();
     let ip = address.parse::<std::net::IpAddr>().ok()?;
-    if (family == "drop4") != ip.is_ipv4() {
+    if v4 != ip.is_ipv4() {
         return None;
     }
     // nft prints the protocol by name when it knows it, else as a number.
@@ -530,6 +587,48 @@ mod tests {
         }
         // Arriving packets are refused but not counted.
         assert!(!input.contains("counter"));
+    }
+
+    #[test]
+    fn the_contacted_record_only_adds_and_turns_accept_into_goto() {
+        let approval = Approval::new(
+            rules(&["192.0.2.0/30:8000-8002/tcp", "[2001:db8::1]:53/udp"]),
+            Some(EndsAt::parse("2099-01-01T00:00:00Z").unwrap_or_else(|e| panic!("{e}"))),
+        );
+        for counters in [0, 1, 2] {
+            let plain = render_instrumented(&approval, counters, false);
+            let recorded = render_instrumented(&approval, counters, true);
+            assert!(!plain.contains("contacted") && !plain.contains("seen"));
+            assert_eq!(recorded.matches(" goto contacted\n").count(), 2);
+            let added = [
+                "\tcounter contacted {}\n".to_owned(),
+                "\tset seen4 {\n\t\ttype ipv4_addr . inet_proto . inet_service\n\t\tsize 1024\n\t\tflags dynamic\n\t\tcounter\n\t}\n".into(),
+                "\tset seen6 {\n\t\ttype ipv6_addr . inet_proto . inet_service\n\t\tsize 1024\n\t\tflags dynamic\n\t\tcounter\n\t}\n".into(),
+                format!("\t{}\n\t}}\n", chain(&recorded, "contacted")),
+            ];
+            let mut stripped = recorded.replace(" goto contacted\n", " accept\n");
+            for text in &added {
+                assert_eq!(stripped.matches(text.as_str()).count(), 1, "{text}");
+                stripped = stripped.replacen(text.as_str(), "", 1);
+            }
+            assert_eq!(stripped, plain);
+        }
+        let output = render_instrumented(&approval, 1, true);
+        assert!(output.contains(
+            "\t\tip daddr 192.0.2.0/30 ip daddr != { 192.0.2.0, 192.0.2.3 } tcp dport 8000-8002 counter name grant_1 goto contacted\n"
+        ));
+        let record = chain(&output, "contacted");
+        let at = |needle: &str| record.find(needle).unwrap_or(usize::MAX);
+        let order = [
+            "counter name \"contacted\"",
+            "meta nfproto ipv4 add @seen4 { ip daddr . meta l4proto . th dport }",
+            "meta nfproto ipv6 add @seen6 { ip6 daddr . meta l4proto . th dport }",
+            "\t\taccept",
+        ];
+        for pair in order.windows(2) {
+            assert!(at(pair[0]) < at(pair[1]), "{pair:?} in\n{record}");
+        }
+        assert!(record.ends_with("\t\taccept"), "{record}");
     }
 
     #[test]
@@ -692,6 +791,11 @@ mod tests {
                 .and_then(|text| text.strip_suffix(after)),
             Some(expected.as_str())
         );
+        // With the contacted record, the same lines end in the goto.
+        let recorded = render_instrumented(&Approval::new(rules.to_vec(), None), 0, true);
+        let goto = expected.replace(" accept\n", " goto contacted\n");
+        prop_assert_eq!(recorded.matches(goto.as_str()).count(), 1);
+        prop_assert_eq!(recorded.matches(" goto contacted\n").count(), rules.len());
         Ok(())
     }
 

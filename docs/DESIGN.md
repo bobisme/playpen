@@ -17,7 +17,8 @@ without any host privilege. The ruleset is passed to `nft` on stdin and is
 rendered only from typed values (parsed addresses, integers, an enum), so
 no command-line text can inject nftables syntax. A property test checks
 that every rendered allow line has the fixed shape
-`ip|ip6 daddr ADDR tcp|udp dport PORTS accept`.
+`ip|ip6 daddr ADDR tcp|udp dport PORTS accept`, and `goto contacted` in
+place of `accept` with `--report-contacts`.
 
 **pasta for connectivity.** It is the rootless user-mode network stack that
 is installed (slirp4netns is not). It attaches to an existing namespace
@@ -797,7 +798,9 @@ matter for safety:
    the JSON for its table with the typed approval before reporting ready.
    It checks table family, chain hooks, priorities and policies, ordered rule
    expressions and verdicts, and the accounting sets and counters,
-   including the time rule and the empty `cut` set. It normalizes the
+   including the time rule and the empty `cut` set, and with
+   `--report-contacts` the `contacted` chain and the empty `seen4` and
+   `seen6` sets. It normalizes the
    supported numeric and symbolic spellings (and reads the time, listed
    with `TZ=UTC0`, as UTC) and ignores handles, counter values and the
    elements of the drop sets. Unknown material
@@ -1189,12 +1192,91 @@ with more than the destination (the source port, the first bytes). It
 needs a listener in C with its own netlink code and rate limits, and it
 duplicates what the sets already count. Not done.
 
+## Contacted destinations (`--report-contacts`)
+
+The record lists what a wide approval was used for, so its owner can
+narrow it with `playpen suggest`. It is in the private report only.
+
+**A chain of its own, not an addition in the grant.** The obvious rule is
+`MATCH add @seen4 { ... } accept`. It is wrong. An addition to a full
+dynamic set fails, and a failed statement ends the rule: the `accept`
+after it never runs, and the approved packet falls through to the drop
+accounting and is refused. Measured on Linux 7.2.8 with nftables 1.1.7, in
+a throwaway `unshare -Urn` namespace: a set of size 2 and the rule `ip daddr
+192.0.2.0/24 udp dport 1-100 add @s4 { ip daddr . meta l4proto . th dport }
+counter name "c" accept`. Datagrams to ports 5, 6, 7, 5 and 8: the sends to
+5 and 6 succeeded and filled the set, the second send to 5 succeeded (its
+entry exists), and the sends to 7 and 8 failed with "Operation not
+permitted". They reached the counter after the rule, not `c`. So a run
+with more than 1024 destinations would lose approved traffic only because
+it was recorded.
+
+So each grant ends in `goto contacted`. The regular chain `contacted` has
+four rules: `counter name "contacted"`, the addition to `seen4` (IPv4
+only), the addition to `seen6` (IPv6 only), and `accept`. A failed
+addition ends only its own rule, and the `accept` still applies.
+`past_1024_destinations_the_record_is_truncated_and_nothing_is_dropped`
+connects to 1100 ports of a grant: every connection is refused by the
+address itself ("Connection refused"), none by the firewall, `dropped` is
+0, and the list has 1024 entries and is `truncated`. `goto`, not `jump`:
+the packet does not come back to the output chain, so nothing after the
+grants sees an approved packet. Without the option the grants still end in
+`accept`, and the ruleset is byte for byte what it was before the option
+existed.
+
+**Truncation from the counter.** The chain's counter comes before the
+additions, so it counts every packet that reaches the chain, also when an
+addition fails. An entry's counter counts the packet that added it and
+each later one. When the entries do not add up to the counter, a packet
+reached the chain and found no room, and the record is `truncated`. A
+duplicate entry, an entry or a set that cannot be read, and a missing set
+make it `truncated` too.
+
+**Flow starts, not volume.** The chain sees only what the grants see:
+packets in conntrack state new, because `ct state established,related
+accept` comes before the grants. Such a packet starts a flow, or repeats a
+start that got no reply (a SYN retransmit, a datagram to a peer that has
+not answered). So `packets` counts flow starts. The byte count is left
+out: it would be the bytes of these packets only. ICMP never reaches a
+grant.
+
+**Start empty.** The start-up readback requires both sets to be empty, as
+it does for `cut`. The rest of the record (counter, sets, chain, each
+grant's `goto`) is compared like the drop accounting. `nft --json` prints
+the two additions without their `meta nfproto` match, as it prints the
+additions to the drop sets; the comparator expects that form
+(`tests/fixtures/nft/contacts.json`).
+
+**`suggest` is never wider.** `playpen suggest` reads a full report as
+inert data, as `compare` does. It builds one rule of one address, one
+port and one protocol from each destination, and prints it only when the
+report's own `allowed` admits it, with the network and broadcast
+exclusions. A report that does not add up (a destination outside the
+grants, an entry twice) is refused, not trimmed: a list made from it could
+not be trusted to be complete. A truncated or unavailable record, or a
+command that did not run, is refused for the same reason. Text from the report
+reaches a message only quoted, with control and format characters
+escaped.
+
+**Under a pass, destinations, not options.** `--allow` cannot be added
+beside `--pass`, and only the pass's owner can write a narrower pass. So
+for a pass-backed report `suggest` prints the destinations without
+`--allow`, for the owner, and says that `--only LABEL` narrows the pass the
+caller has. It does not print the pass id or name: they are text from a
+file that someone else wrote.
+
+**One run.** A destination that this run did not use can be needed by
+the next one (a retry, a failover address, a monthly job). Every
+suggestion repeats that one quiet run does not show that a later run needs
+less.
+
 ## Leaks considered
 
 | Leak | How it is closed | Tested |
 |---|---|---|
 | Traffic to any unapproved address, port or protocol, IPv4 or IPv6 | output policy drop; only listed `daddr`+`dport`+protocol accepted | yes (TCP, UDP, IPv6, network ranges, protocol mismatch) |
 | The broadcast address of an approved network (one packet, every host on it), and its network address | a network rule does not accept the network and all-ones address of any listed IPv4 network of /30 or broader; dropped and counted unless listed on its own. Same rule as hallpass | yes (`network_and_broadcast_addresses_of_a_listed_network_are_dropped`) |
+| The record of contacted destinations changing what is admitted (`--report-contacts`) | each grant goes to the `contacted` chain, where every addition is a rule of its own before `accept`; a full set ends only that rule | yes (`past_1024_destinations_the_record_is_truncated_and_nothing_is_dropped`: 1100 destinations of one grant, none dropped; `contacts_count_flow_starts_beside_grant_use_in_both_families`: the same admissions, drops and grant counts with and without the record) |
 | IPv6 forgotten while IPv4 is filtered | `inet` family table covers both; an IPv4 approval never opens IPv6 | yes |
 | ICMP / ICMPv6 as a side channel | not approvable; only neighbour solicitation/advertisement with hop limit 255 (link-local by RFC 4861) pass; kernel MLD reports and router solicitations are dropped silently; ICMP errors for accepted flows pass as `related` | NDP needed for pasta works (IPv6 tests pass through pasta-configured namespaces); not tested separately |
 | pasta's gateway mapped to the host's loopback | `--map-host-loopback none`; and unless approved, the filter drops the gateway too | yes, end to end (`tests/gateway.rs`): playpen runs inside a throwaway network namespace whose only outside is a `dummy` interface, with gateway 192.0.2.1. With the gateway approved, a connection to it does not arrive at a listener on that namespace's wildcard address; with a pasta wrapper that drops the flag (the control) it does; unapproved, it is dropped and counted. The test reads the gateway pasta configured from `/proc/net/route` inside. The same for IPv6, with gateway 2001:db8::1 and a listener on `[::]`. Nothing can leave the machine: the dummy interface discards everything |

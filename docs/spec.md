@@ -553,6 +553,14 @@ scripts and logs that read it get the lines they got before unless the
 caller asks for more. DESIGN.md ("Drops while the command runs") has the
 reasons.
 
+**`--report-contacts`**. Record each address, protocol and port that the
+command opened a flow to through a grant, in the private report's
+`contacted` (see "Contacted destinations in private reports"). Needs
+`--report FILE` or `--format json`, as `--report-grant-use` does, and
+cannot be combined with `--shareable-report` (usage error, exit 2).
+`playpen suggest` turns the record into options (see "Suggesting a
+narrower allow list").
+
 **`--format text|pretty|json`**. With JSON and no report path, stdout carries
 one final JSON report. The workload’s stdout and stderr both stream to
 Playpen’s stderr alongside supervisor diagnostics. With `--report FILE`,
@@ -578,7 +586,8 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   ...`. It says nothing about ceilings. Then, with `--capture`,
   `; packet capture: PATH` (the absolute path). Then, with
   `--live-drops`, `; dropped destinations printed while the command runs
-  (the first 8)`. Then, always,
+  (the first 8)`. Then, with `--report-contacts`, `; contacted
+  destinations recorded`. Then, always,
   `; host Unix sockets: none reachable` (with `--without-landlock`: `;
   host Unix sockets: hidden under /run, /tmp, /var/tmp and the runtime
   directory only (--without-landlock); sockets elsewhere stay reachable`),
@@ -615,6 +624,11 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   read and is not 0, or playpen stopped the command because the approval
   ended or the pass withdrew it; then, with `--capture`, `packet capture
   PATH: N bytes, sha256 HEX`.
+- then, with `--report-contacts`: `the command contacted N approved
+  destination(s); the report lists them in contacted`, followed by `(the
+  list is incomplete or inconsistent)` when the record is truncated. When
+  the record could not be read: `could not read the contacted
+  destinations: WHY`.
 - then, when the command looked up names that no `--host` maps: `The
   command looked up names that have no --host mapping:`, one line `NAME: N
   lookup(s)` per name (as shown in "Name lookups"), `(the list is
@@ -744,7 +758,7 @@ mapping and argument order are preserved. With `--pass-hosts` the plan has
 `"pass_hosts": true`, and `hosts` lists the entries from the pass after the
 `--host` ones. Without it the field is absent, so plans without the option
 keep their digest. The same holds for `--live-drops` and `"live_drops":
-true`.
+true`, and for `--report-contacts` and `"report_contacts": true`.
 
 The top-level `digest` is SHA-256 of the compact JSON encoding of the v1
 plan (object keys in lexical order). Give it to `run --expect-plan DIGEST`
@@ -758,9 +772,10 @@ lifetimes.
 ### 4.3 `playpen rules`
 
 ```text
-playpen rules [--allow SPEC]... [--until RFC3339] [--format text|pretty|json]
-playpen rules --pass FILE [--only LABEL]... [--pass-hosts] [--until RFC3339]
+playpen rules [--allow SPEC]... [--until RFC3339] [--report-contacts]
               [--format text|pretty|json]
+playpen rules --pass FILE [--only LABEL]... [--pass-hosts] [--until RFC3339]
+              [--report-contacts] [--format text|pretty|json]
 ```
 
 Prints the ruleset that `run` would load for these rules. Sends nothing,
@@ -776,7 +791,11 @@ is accepted as by `run` and changes nothing in the output: host names add
 no rule. `--until` is checked as by `run` (a time in the past, or with
 `--pass` later than `valid_until`, is refused) and adds the time rule
 (section 6.1); with `--pass` and no `--until` the time rule is at
-`valid_until`.
+`valid_until`. `--report-contacts` prints the ruleset that `run
+--report-contacts` loads: each grant rule ends in `goto contacted` in
+place of `accept`, and the `contacted` counter, the `seen4` and `seen6`
+sets and the `contacted` chain are added (section 6.1, item 7). Without it
+the output is the same as before the option existed.
 
 ### 4.4 `playpen doctor`
 
@@ -928,6 +947,8 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `dropped_error` | string or null | why the counters could not be read |
 | `lookups` | object or null | the names the command looked up: `{"names": [{"name", "count", "mapped"}], "truncated": bool}`, in the order first asked, as shown in "Name lookups" (4.1); `mapped` is true for a `--host` name; null when the command did not run or the record could not be read |
 | `lookups_error` | string or null | why the record of names could not be read |
+| `contacted` | object or null | present only with `--report-contacts`: `{"destinations": [{"address", "protocol", "port", "packets"}], "truncated": bool}`, as shown in "Contacted destinations in private reports"; null when `outcome` is not `"ran"` or the record could not be read |
+| `contacted_error` | string or null | present only with `--report-contacts`: why the record of contacted destinations could not be read |
 | `refused_after_end` | integer or null | packets the command sent that the firewall refused because the approval had ended: by the time rule from the end second on, or by the cut once playpen stopped the command (section 6.1). Not part of `dropped`, not unapproved destinations, and not judged by `--fail-on-drop`. Null when the counters could not be read |
 | `socket_guard` | `"landlock"` or `"mounts_only"` | how host Unix sockets were kept from the command; `"mounts_only"` with `--without-landlock` |
 | `exposed` | array of strings | every exposed path (`--expose` and `--display`), canonical once checked; the `--expose` values as typed when refused |
@@ -983,6 +1004,55 @@ less permission. A `--no-network` report has an empty grant list. Grant
 telemetry cannot be combined with `--shareable-report`. Without the option,
 the report schema and the installed accept rules are unchanged.
 
+### Contacted destinations in private reports
+
+Use `--report-contacts` with `--report FILE` or `--format json` to include
+`contacted` and `contacted_error` in the private report. Without the
+option, neither field is in the report and the loaded ruleset does not
+change.
+
+With the option, each grant rule ends in `goto contacted` in place of
+`accept`. The regular chain `contacted` counts the packet in the counter
+`contacted`, adds its destination address, protocol and port to the set
+`seen4` (IPv4) or `seen6` (IPv6), and accepts the packet (section 6.1,
+item 7). Each set entry has its own packet counter. Each set holds 1024
+entries, as the drop sets do. The start-up check (section 5, step 6)
+compares this chain, the counter, both sets and the `goto` of every grant,
+and requires both sets to be empty. At teardown, the listing that gives
+the drop counters also gives the sets.
+
+`contacted` is `{"destinations": [{"address", "protocol", "port",
+"packets"}], "truncated": bool}`. The destinations are sorted by address
+(IPv4 first), then protocol, then port. `protocol` is `tcp` or `udp`:
+grants admit no other protocol.
+
+`packets` counts flow starts, not volume. A grant sees a packet only while
+conntrack has seen no reply in its flow, because `ct state
+established,related accept` comes before the grants (section 6.1). For
+TCP, that is the SYN of each connection, and each retransmitted SYN that
+got no answer. For UDP, a flow is conntrack's entry for the two addresses
+and the two ports: the first datagram counts, and each later datagram
+while the peer has not answered. When conntrack has removed an idle entry,
+the next datagram starts a new flow and counts again. ICMP is not
+recorded: no grant admits it (section 6.1 says what happens to it).
+
+`truncated` is true when the list can leave out a destination: when more
+destinations of one address family reached the chain than a set holds, or
+when the entries do not add up to the `contacted` counter, or when the
+listing has an entry or a set that playpen cannot read. A full set does not
+change what is admitted: the addition is a rule of its own in the chain,
+and a failed addition ends only that rule (DESIGN.md, "Contacted
+destinations").
+
+`contacted` is null when `outcome` is not `"ran"` (`contacted_error` is
+null too), and when the record could not be read (`contacted_error` says
+why). Otherwise `contacted_error` is null. A `--no-network` run has
+`{"destinations": [], "truncated": false}`. The record works beside
+`--report-grant-use`: a grant's counter comes before its `goto` in the
+same rule. The record cannot be combined with `--shareable-report`. The
+record shows what one run did. One quiet run does not show that a later
+run needs less.
+
 ### Shareable reports
 
 `--shareable-report --report FILE` writes a separate `playpen-shareable-v1`
@@ -1006,7 +1076,8 @@ the logs of every destination the command reached, so a reader who has
 such logs could find the destinations again. The full report has both
 times for the owner. The schema stays `playpen-shareable-v1`, unchanged.
 `capture` is never added: the capture holds payloads, and its path and
-digest name a file that must not travel with a shared report.
+digest name a file that must not travel with a shared report. `contacted`
+is never added either: it lists the destinations.
 
 Child output and files created by the caller or child are separate from this
 report and may contain sensitive data. Aggregate counts and the occurrence of
@@ -1020,7 +1091,8 @@ mappings (an entry from `--pass-hosts` counts as its `NAME=ADDR`), exposed
 sockets, display and socket guard independently of observed
 blocked endpoint tuples. Packet counts do not themselves trigger changes.
 `started_at`, `ended_at` and `capture` are ignored: two runs of the same
-policy differ in them by nature. Policy differences are shown before the
+policy differ in them by nature. `contacted` and `contacted_error` are
+ignored too. Policy differences are shown before the
 observations. A newly observed tuple
 requires a complete baseline; a no-longer-observed tuple requires a complete
 later report and does not mean it is allowed or fixed. Missing or partial
@@ -1041,6 +1113,68 @@ Exit 0 means comparable policy and complete observations with nothing new;
 comparison is indeterminate, policy differs without a new observation, or
 input is invalid. When new observations and a policy change coexist, exit
 1 reports them and the output still marks the policy change.
+
+### Suggesting a narrower allow list
+
+```text
+playpen suggest REPORT [--format text|pretty|json]
+```
+
+Reads one full 0.1.0 report as inert data (at most 1 MiB), as `compare`
+does, and prints the narrowest options that admit what the report's
+`contacted` lists:
+
+- one `--allow ADDR:PORT/PROTO` for each destination: one address, one
+  port, one protocol, sorted by address, then port, then protocol;
+- then one `--host NAME=ADDR` for each entry of the report's `hosts` whose
+  address is one of those destinations, in the report's order, once each.
+  An entry from `--pass-hosts` counts as its `NAME=ADDR`. The name is
+  lower-cased;
+- `--no-network` in place of the `--allow` lines when the command
+  contacted no destination.
+
+Each printed spec is built from a parsed address, protocol and port, and
+each host entry is parsed as `--host` parses it, before it is printed.
+Nothing else from the report reaches stdout. An error message shows text
+from the report only quoted, with control and format characters escaped.
+`suggest` never prints anything wider than the run's own grants: each
+destination must be admitted by the report's `allowed`, with the network
+and broadcast exclusions of section 6.1. A destination that is not is
+refused. The suggestion has only these options. Carry the run's other
+options (`--until`, `--expose` and others) yourself.
+
+Text and pretty output print one option per line on stdout, and on stderr
+`playpen: caution: this is what one run contacted. One quiet run does not
+show that a later run needs less.` So `playpen run $(playpen suggest
+REPORT) -- COMMAND` works. No option contains a space. An IPv6 spec
+contains `[` and `]`, which a shell can take as a file name pattern: run
+`set -f` before such a substitution. With nothing contacted, stderr also
+says that `--no-network` admits the same traffic.
+
+With `--pass` (the report's `pass` is an object), `--allow` cannot be
+added beside the pass. `suggest` then prints each destination without
+`--allow`: these are the destinations that a narrower pass from its owner
+would list. It prints the `--host` lines as above. stderr says so and
+names `--only LABEL`, which narrows the pass you have to some of its
+destinations. With nothing contacted under a pass, stdout is empty. The
+pass id is not printed.
+
+JSON: `{"source": "allow" or "pass", "allow": [SPEC...], "hosts":
+["NAME=ADDR"...], "no_network": bool, "advice": [...]}`. Under a pass,
+`allow` holds the destinations. The first advice has type `one-run` and
+the caution. A second advice has type `pass` or `nothing-contacted` when
+the text output prints that note.
+
+Exit 0 means printed. Exit 2 means refused, with nothing on stdout. The
+error type is `incomplete-record` when `outcome` is not `"ran"`, when the
+report has no `contacted` field (the run was without `--report-contacts`),
+when `contacted` is null (the record is unavailable; the message gives
+`contacted_error`), or when `truncated` is not `false`. It is
+`invalid-report` when the file cannot be read, is larger than 1 MiB, is
+not JSON or not a full 0.1.0 report (a shareable report is not), when a
+destination is not exactly an address, `tcp` or `udp`, a port and a packet
+count, when a destination is listed twice, when a destination is not
+admitted by `allowed`, or when `allowed` or `hosts` does not parse.
 
 ### Pass enforcement coverage
 
@@ -1136,7 +1270,9 @@ Each step either succeeds or stops the run with a message that ends
    schema-1 expressions cover connection state, interfaces, IP addresses
    and prefixes, IPv6 hop limits and ICMP types, transport ports and ranges,
    the packet mark against the `cut` set, the time, set additions, counters
-   and verdicts. The `cut` set must be empty. `nft --json` prints the time
+   and verdicts, `goto contacted` among them. The `cut` set must be empty.
+   With `--report-contacts`, the `contacted` chain, its counter and the
+   `seen4` and `seen6` sets are compared too, and both sets must be empty. `nft --json` prints the time
    rule's operand as a date without an offset (`"2026-12-01 12:34:56"`) in
    the time zone of the `nft` process, so C lists the table with
    `TZ=UTC0` and reads that date as UTC; the time rule must be at exactly
@@ -1251,7 +1387,8 @@ that status is the report's `ended_at`. C then closes D's
 control pipe; D stops and sends its record of names (within 2 seconds, or
 C kills it and reports why). C reports the record, lists the table again to
 read the counters (`dropped`, the drop sets, the grant counters, `late`
-and `cut`), reports them, and exits. P stops pasta
+and `cut`, and with `--report-contacts` the `contacted` counter and the
+`seen4` and `seen6` sets), reports them, and exits. P stops pasta
 if it is still running (pasta also exits when the namespace's process is
 gone; it looks once a second), removes pasta's PID file and its private
 directory, prints the summary, writes the report, and exits. With
@@ -1306,7 +1443,12 @@ In this order:
    host and is accepted on that rule's ports and protocol. /31 and /32 and
    IPv6 networks have no such addresses. Hallpass also refuses an edge
    address (`network-or-broadcast`) unless the full pass lists it as a
-   single host;
+   single host. With `--report-contacts` each of these rules ends in `goto
+   contacted` in place of `accept`. The regular chain `contacted` has four
+   rules: `counter name "contacted"`; `meta nfproto ipv4 add @seen4 { ip
+   daddr . meta l4proto . th dport }`; the same for IPv6 and `@seen6`; and
+   `accept`. A full set makes its addition fail, which ends only that rule,
+   so the packet is still accepted;
 8. everything else: added to a per-destination set with a counter
    (address, protocol, port; port 0 for protocols other than TCP and UDP),
    counted in the `dropped` counter, and rejected with ICMP
@@ -1448,6 +1590,11 @@ Not guarded against, or known limits:
   is what pasta saw on its side of the interface; playpen checks its
   header, size and digest, not its packets;
 - supplementary groups of the caller still apply to file access inside;
+- the record of contacted destinations (`--report-contacts`) holds 1024
+  destinations per address family, counts flow starts and not volume, and
+  has the same snapshot limits as the drop lists below. It shows what one
+  run did: a destination this run did not use can be needed by a later
+  run;
 - per-destination drop lists hold 1024 destinations per address family;
   `destinations_truncated` is true when the list is incomplete or its
   consistency cannot be established. A non-null `dropped.packets` is the

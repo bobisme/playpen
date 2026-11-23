@@ -61,6 +61,12 @@ enum Cmd {
     /// Compare two full reports without executing either command.
     #[command(display_order = 6, after_help = discovery::COMPARE)]
     Compare { before: PathBuf, after: PathBuf },
+    /// Print the narrowest --allow and --host options for what one run contacted.
+    #[command(display_order = 7, after_help = discovery::SUGGEST)]
+    Suggest {
+        /// A full private report of a run with --report-contacts.
+        report: PathBuf,
+    },
     /// Run COMMAND with egress limited to a pass's destinations or the --allow ones.
     #[command(display_order = 3, after_help = discovery::RUN)]
     Run(RunArgs),
@@ -88,6 +94,10 @@ enum Cmd {
         /// be earlier than the pass's window end.
         #[arg(long, value_name = "RFC3339")]
         until: Option<String>,
+        /// The ruleset run loads with --report-contacts: each grant goes to a
+        /// chain that records its destination, then accepts.
+        #[arg(long)]
+        report_contacts: bool,
     },
     /// Check that this machine can run playpen, and say exactly what is missing.
     #[command(display_order = 1, after_help = discovery::DOCTOR)]
@@ -97,7 +107,7 @@ enum Cmd {
         mode: crate::doctor::Mode,
     },
     /// Run native sandbox qualification scenarios and report what executed.
-    #[command(display_order = 7, after_help = discovery::QUALIFY)]
+    #[command(display_order = 8, after_help = discovery::QUALIFY)]
     Qualify {
         /// List scenario IDs and prerequisites without executing any probes or tests.
         #[arg(long, conflicts_with_all = ["source", "required"])]
@@ -110,10 +120,10 @@ enum Cmd {
         required: Vec<String>,
     },
     /// Show usage, examples and the suggested workflow for a public command.
-    #[command(display_order = 8, after_help = discovery::HELP)]
+    #[command(display_order = 9, after_help = discovery::HELP)]
     Help { command: Option<String> },
     /// Print the installed Playpen version.
-    #[command(display_order = 9, after_help = discovery::VERSION)]
+    #[command(display_order = 10, after_help = discovery::VERSION)]
     Version,
     /// Checks run inside the sandbox by doctor and the tests.
     #[command(hide = true)]
@@ -285,6 +295,15 @@ struct RunArgs {
         conflicts_with = "shareable_report"
     )]
     report_grant_use: bool,
+    /// Record each address, protocol and port the command opened a flow to
+    /// through a grant, in the private report's contacted (1024 per address
+    /// family), for playpen suggest.
+    #[arg(
+        help_heading = "Launch and reporting",
+        long,
+        conflicts_with = "shareable_report"
+    )]
+    report_contacts: bool,
     /// Write only the shareable allowlisted fields to the report.
     #[arg(help_heading = "Launch and reporting", long)]
     shareable_report: bool,
@@ -340,13 +359,22 @@ fn dispatch(cmd: Cmd, format: Format) -> i32 {
         Cmd::PolicyTest(args) => policy_test::run(&args, format),
         Cmd::Plan(args) => preview::print(&args, format),
         Cmd::Compare { before, after } => crate::compare::run_formatted(&before, &after, format),
+        Cmd::Suggest { report } => crate::suggest::run_formatted(&report, format),
         Cmd::Rules {
             allow,
             pass,
             only,
             until,
+            report_contacts,
             ..
-        } => rules(&allow, pass.as_deref(), &only, until.as_deref(), format),
+        } => rules(
+            &allow,
+            pass.as_deref(),
+            &only,
+            until.as_deref(),
+            report_contacts,
+            format,
+        ),
         Cmd::Doctor { mode } => crate::doctor::run_formatted(mode, format),
         Cmd::Qualify { list: true, .. } => crate::qualification::list(format),
         Cmd::Qualify {
@@ -361,6 +389,7 @@ fn rules(
     pass_file: Option<&Path>,
     only: &[String],
     until: Option<&str>,
+    report_contacts: bool,
     format: Format,
 ) -> i32 {
     let refuse =
@@ -403,7 +432,7 @@ fn rules(
     if let Err(e) = approval.check_active(now) {
         return refuse(&e.to_string());
     }
-    let text = crate::ruleset::render_approval(&approval);
+    let text = crate::ruleset::render_instrumented(&approval, 0, report_contacts);
     match format {
         Format::Text | Format::Pretty => print!("{text}"),
         Format::Json => println!(
@@ -1002,6 +1031,11 @@ fn start_line(c: &Checked, args: &RunArgs, capture: Option<&Path>) -> String {
     } else {
         String::new()
     };
+    let contacts = if args.report_contacts {
+        "; contacted destinations recorded"
+    } else {
+        ""
+    };
     let session = if args.private_tty {
         "; private controlling terminal"
     } else if c.new_session {
@@ -1010,7 +1044,7 @@ fn start_line(c: &Checked, args: &RunArgs, capture: Option<&Path>) -> String {
         ""
     };
     format!(
-        "{line}{capture}{drops}{}{session}{}",
+        "{line}{capture}{drops}{contacts}{}{session}{}",
         sockets_clause(c, !args.without_landlock),
         start_notes(c)
     )
@@ -1124,6 +1158,9 @@ fn base_report(args: &RunArgs) -> Report {
         dropped: None,
         refused_after_end: None,
         grant_use: None,
+        contacts: args
+            .report_contacts
+            .then(crate::contacts::ContactFields::default),
         drop_assertion: None,
         dropped_error: None,
         lookups: None,
@@ -1182,7 +1219,10 @@ fn write_report(
 )]
 fn run(args: &RunArgs, format: Format) -> i32 {
     let stdout_report = format == Format::Json && args.report.is_none();
-    if (args.shareable_report || args.report_grant_use) && args.report.is_none() && !stdout_report {
+    if (args.shareable_report || args.report_grant_use || args.report_contacts)
+        && args.report.is_none()
+        && !stdout_report
+    {
         return discovery::error(
             format,
             "missing-report",
@@ -1358,6 +1398,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         hosts,
         network: !args.no_network,
         grant_counters,
+        report_contacts: args.report_contacts,
         lo_addrs: checked.lo_addrs,
         hide,
         exposed: checked.exposed,
@@ -1444,6 +1485,12 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     match result.lookups {
         Ok(l) => report.lookups = Some(l),
         Err(e) => report.lookups_error = Some(e),
+    }
+    if let (Some(fields), Some(read)) = (report.contacts.as_mut(), result.contacts) {
+        match read {
+            Ok(c) => fields.contacted = Some(c),
+            Err(e) => fields.contacted_error = Some(e),
+        }
     }
     report.refused_after_end = result.refused_after_end;
     let code = apply_drop_assertion(&mut report, code, args.fail_on_drop);

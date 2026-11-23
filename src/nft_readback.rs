@@ -6,6 +6,7 @@ use std::net::IpAddr;
 use serde_json::{Value, json};
 
 use crate::approval::{AllowRule, Approval, Proto};
+use crate::contacts;
 use crate::ruleset::{CUT_COUNTER, CUT_SET, DROP_SET_SIZE, LATE_COUNTER, TABLE, end_second};
 
 /// The time zone `nft` is run in when it lists the table. `nft --json`
@@ -84,14 +85,24 @@ fn end_rules(end: Option<i64>, output: bool) -> Vec<Value> {
     rules
 }
 
-/// The table, its chains (without rules), counters and sets.
-fn declarations(timed: bool, grant_counters: usize) -> Table {
+/// The table, its chains (without rules), counters and sets. With
+/// `record_contacts`, also the chain, counter and sets of
+/// [`crate::contacts`].
+fn declarations(timed: bool, grant_counters: usize, record_contacts: bool) -> Table {
     let mut table = Table::default();
     let mut counters = vec![String::from("dropped"), CUT_COUNTER.to_owned()];
     if timed {
         counters.push(LATE_COUNTER.to_owned());
     }
     counters.extend((0..grant_counters).map(crate::grant_use::counter_name));
+    if record_contacts {
+        counters.push(contacts::COUNTER.to_owned());
+        table.objects.insert(
+            (String::from("chain"), contacts::CHAIN.to_owned()),
+            json!({"family":"inet","table":TABLE,"name":contacts::CHAIN}),
+        );
+        table.chains.insert(contacts::CHAIN.to_owned(), Vec::new());
+    }
     table.objects.extend(counters.into_iter().map(|name| {
         let fields = json!({"family":"inet","table":TABLE,"name":name});
         ((String::from("counter"), name), fields)
@@ -112,7 +123,15 @@ fn declarations(timed: bool, grant_counters: usize) -> Table {
         );
         table.chains.insert(hook.to_owned(), Vec::new());
     }
-    for (name, kind) in [("drop4", "ipv4_addr"), ("drop6", "ipv6_addr")] {
+    let mut sets = vec![("drop4", "ipv4_addr"), ("drop6", "ipv6_addr")];
+    if record_contacts {
+        // Empty at start, like the cut set (see `parse`).
+        sets.extend([
+            (contacts::SEEN4, "ipv4_addr"),
+            (contacts::SEEN6, "ipv6_addr"),
+        ]);
+    }
+    for (name, kind) in sets {
         table.objects.insert(
             (String::from("set"), name.to_owned()),
             json!({"family":"inet","table":TABLE,"name":name,"type":[kind,"inet_proto","inet_service"],
@@ -122,9 +141,9 @@ fn declarations(timed: bool, grant_counters: usize) -> Table {
     table
 }
 
-fn expected(approval: &Approval, grant_counters: usize) -> Table {
+fn expected(approval: &Approval, grant_counters: usize, record_contacts: bool) -> Table {
     let end = end_second(approval);
-    let mut table = declarations(end.is_some(), grant_counters);
+    let mut table = declarations(end.is_some(), grant_counters, record_contacts);
     let established = json!([
         matcher("in", json!({"ct":{"key":"state"}}), [2, 4].map(Value::from).to_vec().into()),
         {"accept":null}
@@ -162,7 +181,7 @@ fn expected(approval: &Approval, grant_counters: usize) -> Table {
     output.push(neighbour_discovery.clone());
     output.extend(approval.rules().iter().enumerate().map(|(index, rule)| {
         let counter = (index < grant_counters).then(|| crate::grant_use::counter_name(index));
-        grant(approval, rule, counter.as_deref())
+        grant(approval, rule, counter.as_deref(), record_contacts)
     }));
     for (family, set) in [("ip", "@drop4"), ("ip6", "@drop6")] {
         for (operation, port) in [("==", payload("th", "dport")), ("!=", json!(0))] {
@@ -178,10 +197,26 @@ fn expected(approval: &Approval, grant_counters: usize) -> Table {
     input.push(json!([matcher("==", meta("iif"), json!("lo")), {"accept":null}]));
     input.extend(end_rules(end, false));
     input.extend([established, neighbour_discovery]);
+    if let Some(chain) = table.chains.get_mut(contacts::CHAIN) {
+        chain.push(json!([{"counter":contacts::COUNTER}]));
+        for (family, set) in [("ip", contacts::SEEN4), ("ip6", contacts::SEEN6)] {
+            chain.push(json!([
+                {"set":{"op":"add","elem":{"concat":[payload(family,"daddr"),meta("l4proto"),payload("th","dport")]},"set":format!("@{set}")}}
+            ]));
+        }
+        chain.push(json!([{"accept":null}]));
+    }
     table
 }
 
-fn grant(approval: &Approval, rule: &AllowRule, counter: Option<&str>) -> Value {
+/// A grant rule: its matches, its counter with `--report-grant-use`, and
+/// `accept`, or with `record_contacts` `goto contacted`.
+fn grant(
+    approval: &Approval,
+    rule: &AllowRule,
+    counter: Option<&str>,
+    record_contacts: bool,
+) -> Value {
     let family = if rule.net.addr().is_ipv4() {
         "ip"
     } else {
@@ -217,7 +252,11 @@ fn grant(approval: &Approval, rule: &AllowRule, counter: Option<&str>) -> Value 
     if let Some(name) = counter {
         expr.push(json!({"counter":name}));
     }
-    expr.push(json!({"accept":null}));
+    if record_contacts {
+        expr.push(json!({"goto":{"target":contacts::CHAIN}}));
+    } else {
+        expr.push(json!({"accept":null}));
+    }
     Value::Array(expr)
 }
 
@@ -404,9 +443,13 @@ fn parse(mut value: Value) -> Result<Table, String> {
                 }
                 // An element in the cut set would close all egress from the
                 // start: the run would start with a firewall that is not
-                // the one rendered.
-                if kind == "set" && name == CUT_SET && data.contains_key("elem") {
-                    return Err(format!("the {CUT_SET} set is not empty"));
+                // the one rendered. One in a set of contacted destinations
+                // would report a destination nothing contacted.
+                if kind == "set"
+                    && [CUT_SET, contacts::SEEN4, contacts::SEEN6].contains(&name.as_str())
+                    && data.contains_key("elem")
+                {
+                    return Err(format!("the {name} set is not empty"));
                 }
                 if kind == "set"
                     && let Some(elements) = data.remove("elem")
@@ -436,18 +479,24 @@ fn parse(mut value: Value) -> Result<Table, String> {
 /// # Errors
 /// When nft's JSON is invalid, unsupported, or differs from the approval.
 pub fn verify_policy(json: &str, approval: &Approval) -> Result<(), String> {
-    verify_instrumented(json, approval, 0)
+    verify_instrumented(json, approval, 0, false)
 }
 
+/// [`verify_policy`] for the ruleset of
+/// [`crate::ruleset::render_instrumented`] with the same records.
+///
+/// # Errors
+/// As [`verify_policy`].
 pub fn verify_instrumented(
     json: &str,
     approval: &Approval,
     grant_counters: usize,
+    record_contacts: bool,
 ) -> Result<(), String> {
     let value: Value =
         serde_json::from_str(json).map_err(|e| format!("nft printed invalid JSON: {e}"))?;
     let actual = parse(value)?;
-    let expected = expected(approval, grant_counters);
+    let expected = expected(approval, grant_counters, record_contacts);
     if actual.objects != expected.objects {
         return Err("nft table, chains, or accounting declarations differ".into());
     }
@@ -635,6 +684,96 @@ mod tests {
             assert_ne!(RULES, altered);
             assert!(verify_policy(&altered, &approval()).is_err());
         }
+    }
+
+    const CONTACTS: &str = include_str!("../tests/fixtures/nft/contacts.json");
+
+    fn contacts(json: &str, grant_counters: usize) -> Result<(), String> {
+        verify_instrumented(json, &approval(), grant_counters, true)
+    }
+
+    #[test]
+    fn readback_of_the_contacted_record_matches() {
+        contacts(CONTACTS, 0).expect("recorded contacted record");
+        // The record is part of the policy: neither readback passes for
+        // the other.
+        assert!(verify_policy(CONTACTS, &approval()).is_err());
+        assert!(contacts(RULES, 0).is_err());
+    }
+
+    #[test]
+    fn grants_must_go_to_the_record_and_the_record_must_accept() {
+        let accepted = CONTACTS.replacen(
+            "{\"goto\": {\"target\": \"contacted\"}}",
+            "{\"accept\": null}",
+            1,
+        );
+        assert_ne!(CONTACTS, accepted);
+        assert_eq!(contacts(&accepted, 0), Err("output rule 7 differs".into()));
+        let elsewhere = CONTACTS.replacen("\"target\": \"contacted\"", "\"target\": \"input\"", 1);
+        assert_eq!(contacts(&elsewhere, 0), Err("output rule 7 differs".into()));
+        let dropped = CONTACTS.replace(
+            "\"chain\": \"contacted\", \"handle\": 38, \"expr\": [{\"accept\": null}]",
+            "\"chain\": \"contacted\", \"handle\": 38, \"expr\": [{\"drop\": null}]",
+        );
+        assert_ne!(CONTACTS, dropped);
+        assert_eq!(
+            contacts(&dropped, 0),
+            Err("contacted rule 4 differs".into())
+        );
+        // The addition in the grant rule itself, as first tried: a full set
+        // would end the grant and drop the packet.
+        let inline = CONTACTS.replacen(
+            "{\"goto\": {\"target\": \"contacted\"}}",
+            "{\"set\": {\"op\": \"add\", \"elem\": {\"concat\": [{\"payload\": {\"protocol\": \"ip\", \"field\": \"daddr\"}}, {\"meta\": {\"key\": \"l4proto\"}}, {\"payload\": {\"protocol\": \"th\", \"field\": \"dport\"}}]}, \"set\": \"@seen4\"}}, {\"accept\": null}",
+            1,
+        );
+        assert_eq!(contacts(&inline, 0), Err("output rule 7 differs".into()));
+        // The sets swapped between the families.
+        let swapped = CONTACTS
+            .replace("\"set\": \"@seen4\"", "\"set\": \"@seenX\"")
+            .replace("\"set\": \"@seen6\"", "\"set\": \"@seen4\"");
+        assert_eq!(
+            contacts(&swapped, 0),
+            Err("contacted rule 2 differs".into())
+        );
+    }
+
+    #[test]
+    fn the_contacted_sets_must_start_empty() {
+        let filled = CONTACTS.replacen(
+            "\"name\": \"seen4\", \"table\": \"playpen\", \"type\": [\"ipv4_addr\", \"inet_proto\", \"inet_service\"], \"handle\": 10, \"size\": 1024, \"flags\": [\"dynamic\"]",
+            "\"name\": \"seen4\", \"table\": \"playpen\", \"type\": [\"ipv4_addr\", \"inet_proto\", \"inet_service\"], \"handle\": 10, \"size\": 1024, \"flags\": [\"dynamic\"], \"elem\": []",
+            1,
+        );
+        assert_ne!(CONTACTS, filled);
+        assert_eq!(
+            contacts(&filled, 0),
+            Err("the seen4 set is not empty".into())
+        );
+        let smaller = CONTACTS.replacen(
+            "\"handle\": 11, \"size\": 1024",
+            "\"handle\": 11, \"size\": 2",
+            1,
+        );
+        assert_ne!(CONTACTS, smaller);
+        assert!(contacts(&smaller, 0).is_err());
+    }
+
+    #[test]
+    fn a_grant_counter_comes_before_the_goto() {
+        let counter = "{\"counter\": {\"family\": \"inet\", \"name\": \"grant_1\", \"table\": \"playpen\", \"handle\": 99, \"packets\": 0, \"bytes\": 0}},\n  {\"set\": {\"family\": \"inet\", \"name\": \"drop4\"";
+        let declared = CONTACTS.replacen(
+            "{\"set\": {\"family\": \"inet\", \"name\": \"drop4\"",
+            counter,
+            1,
+        );
+        let goto = "{\"goto\": {\"target\": \"contacted\"}}";
+        let before = declared.replacen(goto, &format!("{{\"counter\": \"grant_1\"}}, {goto}"), 1);
+        contacts(&before, 1).expect("counter, then goto");
+        let after = declared.replacen(goto, &format!("{goto}, {{\"counter\": \"grant_1\"}}"), 1);
+        assert_eq!(contacts(&after, 1), Err("output rule 7 differs".into()));
+        assert!(contacts(&before, 0).is_err());
     }
 
     #[test]

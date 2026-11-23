@@ -134,6 +134,9 @@ pub struct Plan {
     pub network: bool,
     /// Number of grants instrumented for first-match packet counts.
     pub grant_counters: usize,
+    /// Record the destinations the command contacts through a grant
+    /// (`--report-contacts`).
+    pub report_contacts: bool,
     /// Addresses to add to `lo` before the ruleset loads (test aid).
     pub lo_addrs: Vec<IpAddr>,
     /// Extra paths to hide from the command (`--hide`).
@@ -202,6 +205,9 @@ pub struct RunResult {
     /// Packets the time rule or the cut refused on their way out; `None`
     /// when the counters could not be read.
     pub refused_after_end: Option<u64>,
+    /// With `--report-contacts`: the destinations the command contacted
+    /// through a grant, or why they could not be read. `None` without it.
+    pub contacts: Option<Result<crate::contacts::Contacted, String>>,
 }
 
 /// Whether egress was closed in the firewall when playpen began to stop
@@ -780,7 +786,8 @@ fn run_sandbox(
     let job =
         JobControl::for_run(plan.new_session, private_terminal_requested).map_err(not_started)?;
     let grant_counters = plan.grant_counter_count();
-    let ruleset_text = ruleset::render_instrumented(&plan.approval, grant_counters);
+    let ruleset_text =
+        ruleset::render_instrumented(&plan.approval, grant_counters, plan.report_contacts);
     let files = SandboxFiles::build(plan);
 
     match fork_checked().map_err(not_started)? {
@@ -935,6 +942,8 @@ struct ParentState {
     /// Why C could not read the drop counter while the command ran, not yet
     /// reported.
     denied_error: Option<String>,
+    /// The contacted destinations C read at teardown, or why it could not.
+    contacts: Option<Result<crate::contacts::Contacted, String>>,
 }
 
 impl ParentState {
@@ -986,6 +995,13 @@ impl ParentState {
                 );
             }
             "lookupserr" => self.lookups = Some(Err(rest.to_owned())),
+            "contacts" => {
+                self.contacts = Some(
+                    serde_json::from_str(rest)
+                        .map_err(|e| format!("bad report of contacted destinations: {e}")),
+                );
+            }
+            "contactserr" => self.contacts = Some(Err(rest.to_owned())),
             _ => {}
         }
     }
@@ -1456,6 +1472,10 @@ fn parent(
             .lookups
             .unwrap_or_else(|| Err("the names the command looked up were not reported".into())),
         refused_after_end: st.refused_after_end,
+        contacts: plan.report_contacts.then(|| {
+            st.contacts
+                .unwrap_or_else(|| Err("the contacted destinations were not reported".into()))
+        }),
     })
 }
 
@@ -1844,7 +1864,12 @@ fn stage_c(
     }
     load_ruleset(&plan.nft, ruleset_text)?;
     let grant_counters = plan.grant_counter_count();
-    verify_ruleset(&plan.nft, &plan.approval, grant_counters)?;
+    verify_ruleset(
+        &plan.nft,
+        &plan.approval,
+        grant_counters,
+        plan.report_contacts,
+    )?;
     // Made now, so that C can watch S and P's control pipe at once later,
     // and a failure stops the run before anything runs.
     let mut chld = SigSet::empty();
@@ -1901,6 +1926,7 @@ fn stage_c(
         &plan.nft,
         grant_counters,
         plan.approval.ends_at.is_some(),
+        plan.report_contacts,
         up_w,
     );
     Ok(())
@@ -2161,13 +2187,24 @@ fn list_table(nft: &Path) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|_| "nft printed non-UTF-8 output".into())
 }
 
-fn verify_ruleset(nft: &Path, approval: &Approval, grant_counters: usize) -> Result<(), String> {
+fn verify_ruleset(
+    nft: &Path,
+    approval: &Approval,
+    grant_counters: usize,
+    record_contacts: bool,
+) -> Result<(), String> {
     let json = list_table(nft).map_err(|e| format!("cannot verify the ruleset: {e}"))?;
-    crate::nft_readback::verify_instrumented(&json, approval, grant_counters)
+    crate::nft_readback::verify_instrumented(&json, approval, grant_counters, record_contacts)
         .map_err(|e| format!("the loaded ruleset is not the one playpen built: {e}"))
 }
 
-fn report_counters(nft: &Path, grant_counters: usize, timed: bool, up: &OwnedFd) {
+fn report_counters(
+    nft: &Path,
+    grant_counters: usize,
+    timed: bool,
+    record_contacts: bool,
+    up: &OwnedFd,
+) {
     let snapshot = list_table(nft);
     match snapshot
         .as_ref()
@@ -2187,12 +2224,30 @@ fn report_counters(nft: &Path, grant_counters: usize, timed: bool, up: &OwnedFd)
     {
         write_line(up, &format!("afterend {refused}"));
     }
+    if record_contacts {
+        report_contacts(snapshot.as_deref(), up);
+    }
     if grant_counters != 0
         && let Ok(snapshot) = snapshot
     {
         let counters = crate::grant_use::read_packets(&snapshot, grant_counters);
         let json = serde_json::to_string(&counters).unwrap_or_default();
         write_line(up, &format!("grants {json}"));
+    }
+}
+
+/// With `--report-contacts`: the destinations in the teardown listing, as
+/// one `contacts JSON` line, or `contactserr WHY`.
+fn report_contacts(snapshot: Result<&str, &String>, up: &OwnedFd) {
+    match snapshot
+        .map_err(Clone::clone)
+        .and_then(crate::contacts::parse)
+    {
+        Ok(contacted) => {
+            let json = serde_json::to_string(&contacted).unwrap_or_default();
+            write_line(up, &format!("contacts {json}"));
+        }
+        Err(e) => write_line(up, &format!("contactserr {e}")),
     }
 }
 
@@ -3288,6 +3343,7 @@ mod tests {
             refused_after_end: None,
             denied: Vec::new(),
             denied_error: None,
+            contacts: None,
         };
         st.handle_line("cuterr nft could not close egress");
         assert_eq!(st.cut, Some(Err("nft could not close egress".into())));
@@ -3295,6 +3351,18 @@ mod tests {
         assert_eq!(st.cut, Some(Ok(())));
         st.handle_line("afterend 12");
         assert_eq!(st.refused_after_end, Some(12));
+        st.handle_line(r#"contacts {"destinations":[{"address":"192.0.2.1","protocol":"tcp","port":443,"packets":1}],"truncated":false}"#);
+        let Some(Ok(contacted)) = &st.contacts else {
+            panic!("{:?}", st.contacts)
+        };
+        assert_eq!(contacted.destinations[0].port, 443);
+        st.handle_line("contacts {\"destinations\":[{\"port\":-1}]}");
+        assert!(matches!(&st.contacts, Some(Err(e)) if e.starts_with("bad report")));
+        st.handle_line("contactserr nft could not list the table");
+        assert_eq!(
+            st.contacts,
+            Some(Err("nft could not list the table".into()))
+        );
         st.handle_line("own 192.0.2.10 2001:db8::10 nonsense");
         let own: Vec<IpAddr> = ["192.0.2.10", "2001:db8::10"]
             .iter()

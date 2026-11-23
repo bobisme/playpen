@@ -281,6 +281,33 @@ file with mode 0600. It refuses a name that exists, a symbolic link, and a
 directory that its group or others can write to (a sticky directory such
 as `/tmp` is accepted). The command cannot open the file while it runs.
 
+### Narrow a wide approval
+
+`--report-contacts` records each address, protocol and port that the
+command opened a flow to through a grant. `playpen suggest` reads that
+report and prints one exact `--allow` for each, with the `--host` entries
+that point at them:
+
+```console
+$ playpen run --allow 198.51.100.0/24:9550-9560/tcp --report-contacts \
+              --report wide.json -- ./client
+$ playpen suggest wide.json
+--allow 198.51.100.7:9557/tcp
+--allow 198.51.100.7:9558/tcp
+--host app.example.test=198.51.100.7
+playpen: caution: this is what one run contacted. One quiet run does not show that a later run needs less.
+$ playpen run $(playpen suggest wide.json) -- ./client
+```
+
+The options go to stdout and the caution goes to stderr. `suggest` never
+prints a destination that the run's own grants did not admit. It refuses a
+record that is truncated or unavailable, and a report whose `outcome` is
+not `ran`. A
+set holds 1024 destinations of each address family. Each destination's
+`packets` counts flow starts, not volume. Review the list before you use
+it: a later run can need a destination that this run did not use. The
+record is only in the private report.
+
 ### Run an HTTP client offline
 
 Save one response in a fixture file, then run a client against it:

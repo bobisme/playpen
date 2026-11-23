@@ -12,11 +12,14 @@ playpen rules --allow 192.0.2.0/30:8000-8002/tcp \
 playpen rules --allow 192.0.2.0/28:444/tcp --allow 192.0.2.6/31:445/udp \
     --allow 192.0.2.4/30:443/tcp --allow '[2001:db8::1]:1024/tcp' > edges.nft
 playpen rules --allow 192.0.2.0/30:8000-8002/tcp --until 2026-12-01T12:34:56Z > until.nft
+playpen rules --allow 192.0.2.0/30:8000-8002/tcp --allow 192.0.2.4/32:53/udp \
+    --allow '[2001:db8::/124]:80/udp' --report-contacts > contacts.nft
 list='nft -f "$1" && TZ=UTC0 nft --json list table inet playpen'
 unshare -Urn sh -c "$list" _ edges.nft
 unshare -Urn sh -c "$list" _ empty.nft
 unshare -Urn sh -c "$list" _ nonempty.nft
 unshare -Urn sh -c "$list" _ until.nft
+unshare -Urn sh -c "$list" _ contacts.nft
 unshare -Urn sh -c 'nft -f "$1" && TZ=UTC0 nft --numeric --json list table inet playpen' _ nonempty.nft
 unshare -Urn sh -c 'nft -f "$1" && TZ=Asia/Kolkata nft --json list table inet playpen' _ until.nft
 ```
@@ -30,13 +33,14 @@ the `nft` process, with or without `--numeric`. Playpen lists the table with
 The comparator accepts the following expression vocabulary from these dumps.
 It checks connection state, interface, IP destination and prefix, IPv6 hop
 limit and ICMP type, transport protocol and inclusive ports, the packet
-mark against the `cut` set, the time, the four dynamic set additions, the
-named counters, and accept, drop and ICMPx reject verdicts. Named and
+mark against the `cut` set, the time, the four dynamic additions to the
+drop sets and the two to the `seen` sets, the named counters, and accept,
+drop, `goto contacted` and ICMPx reject verdicts. Named and
 numeric spellings from the recorded dumps are equivalent, as are anonymous
 set member permutations and textual IP address spellings. Rule order and
 expression order are checked. Handles, counter values and the elements of
-the dynamic drop sets vary at runtime. The `cut` set must be empty. Unknown
-material objects and expressions are refused.
+the dynamic drop sets vary at runtime. The `cut`, `seen4` and `seen6` sets
+must be empty. Unknown material objects and expressions are refused.
 
 Startup qualification used Playpen's normal `run` path on the same host
 with pasta 2026_09_25.df90211. A temporary forwarding adapter captured the
@@ -47,3 +51,10 @@ respectively, with four input rules and an empty forward chain; an end
 time adds one rule to each of the two chains. The integration suite separately checks rejection of
 a failing load, an empty readback and a narrower reported range. The
 narrower-readback adapter delegates the real load unchanged.
+
+`contacts.json` is the `nonempty.json` approval with `--report-contacts`,
+recorded on the same host with nftables 1.1.7. It differs from
+`nonempty.json` only in the `contacted` counter, the `seen4` and `seen6`
+sets, the regular `contacted` chain with its four rules, and `goto
+contacted` in place of `accept` in the three grant rules. nft prints the two
+additions in that chain without their `meta nfproto` matches.

@@ -69,6 +69,10 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
     if args.live_drops {
         scope["live_drops"] = json!(true);
     }
+    // And for runs that do not record the contacted destinations.
+    if args.report_contacts {
+        scope["report_contacts"] = json!(true);
+    }
     Ok(scope)
 }
 

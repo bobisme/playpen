@@ -23,6 +23,7 @@ pub(super) const RUN: &str = "Examples
   playpen run --pass engagement.pass.toml --pass-hosts -- curl -sS https://app.example.test/
   playpen run --allow 192.0.2.10:443/tcp --capture run.pcap --report run.json -- true
   playpen run --allow 192.0.2.10:443/tcp --live-drops --events-fd 3 -- ./scan 3> >(jq -c .)
+  playpen run --allow 192.0.2.0/24:8000-8099/tcp --report-contacts --report wide.json -- true
 
 Agent workflow
   Choose --no-network, explicit --allow grants, or --pass FILE. Use plan with the same command and policy first, then pass its digest to --expect-plan.
@@ -30,6 +31,7 @@ Agent workflow
   In JSON mode the final report goes to stdout and workload output streams to stderr. With --report FILE, the file gets the report and stdout belongs to the workload.
   To learn of a refused destination while the command runs, read --events-fd: one denied record per new dropped destination, within about 2 s. --live-drops also prints the first 8 on stderr. The report's dropped field remains the complete record.
   --capture FILE keeps a pcap of what crossed the sandbox's outside interface, and the report gives its size and sha256. It holds payloads, credentials sent in clear included: keep it like the pass.
+  --report-contacts lists in the report each address, protocol and port the command reached through a grant. playpen suggest REPORT turns that list into the narrowest --allow and --host options.
   Read startup_evidence before retrying a job with side effects. not_started permits a retry after fixing the cause. unknown requires investigation.
   A policy refusal exits 2, a setup error exits 1, and a launched command normally supplies its own exit status. --fail-on-drop can turn child success into exit 1.";
 pub(super) const PLAN: &str = "Examples
@@ -40,6 +42,7 @@ Agent workflow
   Read plan and digest from stdout, then use playpen run --expect-plan DIGEST with the same policy and argv. Planning starts no workload, probes no host capabilities and writes no report. Exit 0 means the plan validated. Invalid policy exits 2.";
 pub(super) const RULES: &str = "Examples
   playpen rules --allow 192.0.2.10:443/tcp
+  playpen rules --allow 192.0.2.0/24:8000-8099/tcp --report-contacts
   playpen rules --format json
 
 Agent workflow
@@ -57,6 +60,14 @@ pub(super) const COMPARE: &str = "Examples
 
 Agent workflow
   Supply two full private run reports. Read policy, evidence, new_denials and new_unmapped_lookups together. Exit 1 means new denials or new lookups of names without a --host mapping. Otherwise exit 2 means policy changed, evidence was incomplete or input was invalid. Exit 0 means comparable policy with complete evidence and nothing new.";
+pub(super) const SUGGEST: &str = "Examples
+  playpen run --allow 192.0.2.0/24:8000-8099/tcp --report-contacts --report wide.json -- ./scan
+  playpen suggest wide.json
+  playpen suggest wide.json --format json
+
+Agent workflow
+  Supply one full private report of a run with --report-contacts. Text output prints one option per line on stdout, ready for playpen run, and the caution on stderr. In JSON, read source, allow, hosts and no_network: each allow entry is one contacted address, port and protocol, never wider than the run's own grants. With source pass the entries are destinations for a narrower pass from its owner, not --allow options. One quiet run does not show that a later run needs less: review the list before narrowing an approval.
+  Exit 0 means printed. Exit 2 means the report's outcome is not ran, the record is missing, truncated or unavailable, or the report is invalid.";
 pub(super) const DOCTOR: &str = "Examples
   playpen doctor --mode offline --format json
   playpen doctor --mode egress

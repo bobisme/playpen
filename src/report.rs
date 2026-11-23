@@ -106,6 +106,11 @@ pub struct Report {
     /// Optional observations for explicit accept rules.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grant_use: Option<crate::grant_use::GrantUse>,
+    /// With `--report-contacts`, the fields `contacted` and
+    /// `contacted_error`; neither is in the report without it. Never in the
+    /// shareable report.
+    #[serde(flatten)]
+    pub contacts: Option<crate::contacts::ContactFields>,
     /// Result of --fail-on-drop, absent when not requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drop_assertion: Option<DropAssertion>,
@@ -298,8 +303,35 @@ pub fn text_summary(r: &Report) -> String {
             c.file, c.bytes, c.sha256
         );
     }
+    contacts_summary(&mut out, r);
     lookups_summary(&mut out, r);
     out
+}
+
+/// The line about the contacted destinations, with `--report-contacts`.
+fn contacts_summary(out: &mut String, r: &Report) {
+    let Some(fields) = &r.contacts else {
+        return;
+    };
+    match (&fields.contacted, &fields.contacted_error) {
+        (Some(c), _) => {
+            let _ = writeln!(
+                out,
+                "playpen: the command contacted {} approved destination(s); the report lists them in contacted",
+                c.destinations.len()
+            );
+            if c.truncated {
+                out.push_str("playpen:   (the list is incomplete or inconsistent)\n");
+            }
+        }
+        (None, Some(e)) => {
+            let _ = writeln!(
+                out,
+                "playpen: could not read the contacted destinations: {e}"
+            );
+        }
+        (None, None) => {}
+    }
 }
 
 /// The text block for names looked up without a `--host` mapping.
@@ -377,6 +409,7 @@ mod tests {
             dropped: Some(DropSummary::default()),
             refused_after_end: Some(0),
             grant_use: None,
+            contacts: None,
             drop_assertion: None,
             dropped_error: None,
             lookups: Some(Lookups::default()),
@@ -416,6 +449,18 @@ mod tests {
             valid_until: None,
             labels: vec!["private-label".into()],
         });
+        r.contacts = Some(crate::contacts::ContactFields {
+            contacted: Some(crate::contacts::Contacted {
+                destinations: vec![crate::contacts::ContactedDest {
+                    address: "private-contact".into(),
+                    protocol: "tcp".into(),
+                    port: 4242,
+                    packets: 1,
+                }],
+                truncated: false,
+            }),
+            contacted_error: Some("private-contact-error".into()),
+        });
         r.started_at = Some("2026-11-22T10:00:00.123456789Z".into());
         r.ended_at = Some("2026-11-22T10:00:02.5Z".into());
         r.capture = Some(crate::capture::CaptureReport {
@@ -430,6 +475,7 @@ mod tests {
             assert!(!serialized.contains("private-"), "{serialized}");
             assert!(!serialized.contains("2026-11-22"), "{serialized}");
             assert!(!serialized.contains("4096"), "{serialized}");
+            assert!(!serialized.contains("4242"), "{serialized}");
             let keys: std::collections::BTreeSet<_> = value
                 .as_object()
                 .unwrap_or_else(|| panic!("not object"))
@@ -531,6 +577,59 @@ mod tests {
         r.refused_after_end = None;
         assert!(!text_summary(&r).contains("refused after"));
         assert!(serde_json::to_value(&r).unwrap_or_default()["refused_after_end"].is_null());
+    }
+
+    #[test]
+    fn contacted_fields_only_with_the_option() {
+        use crate::contacts::{ContactFields, Contacted, ContactedDest};
+        let mut r = base();
+        let json = serde_json::to_value(&r).unwrap_or_default();
+        assert!(json.get("contacted").is_none() && json.get("contacted_error").is_none());
+        assert!(!text_summary(&r).contains("contacted"));
+        // Asked for, and nothing ran: both null.
+        r.contacts = Some(ContactFields::default());
+        let json = serde_json::to_value(&r).unwrap_or_default();
+        assert!(json["contacted"].is_null() && json.get("contacted").is_some());
+        assert!(json["contacted_error"].is_null() && json.get("contacted_error").is_some());
+        r.contacts = Some(ContactFields {
+            contacted: Some(Contacted {
+                destinations: vec![ContactedDest {
+                    address: "192.0.2.7".into(),
+                    protocol: "udp".into(),
+                    port: 53,
+                    packets: 2,
+                }],
+                truncated: true,
+            }),
+            contacted_error: None,
+        });
+        let json = serde_json::to_value(&r).unwrap_or_default();
+        assert_eq!(
+            json["contacted"],
+            serde_json::json!({"destinations":[{"address":"192.0.2.7","protocol":"udp","port":53,"packets":2}],"truncated":true})
+        );
+        let t = text_summary(&r);
+        assert!(
+            t.contains("playpen: the command contacted 1 approved destination(s); the report lists them in contacted\n"),
+            "{t}"
+        );
+        assert!(
+            t.contains("(the list is incomplete or inconsistent)"),
+            "{t}"
+        );
+        r.contacts = Some(ContactFields {
+            contacted: None,
+            contacted_error: Some("nft could not list the table".into()),
+        });
+        assert!(
+            text_summary(&r).contains(
+                "could not read the contacted destinations: nft could not list the table"
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(&r).unwrap_or_default()["contacted_error"],
+            "nft could not list the table"
+        );
     }
 
     #[test]

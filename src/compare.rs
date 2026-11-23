@@ -30,19 +30,22 @@ struct Input {
     lookups_complete: bool,
 }
 
+/// One entry of a report's `hosts`. An entry from `--pass-hosts` ends in
+/// ` (pass: LABEL, ...)`; the mapping is the same whichever option gave it.
+pub fn host_entry(raw: &Value) -> Result<crate::resolver::HostEntry, String> {
+    let raw = raw.as_str().ok_or("invalid host")?;
+    let entry = raw
+        .strip_suffix(')')
+        .and_then(|r| r.split_once(" (pass: "))
+        .map_or(raw, |(entry, _)| entry);
+    crate::resolver::parse_host(entry).map_err(|e| e.to_string())
+}
+
 /// The report's `hosts` as a map from each name to its addresses.
-///
-/// An entry from `--pass-hosts` ends in ` (pass: LABEL, ...)`; the mapping
-/// is the same whichever option gave it.
 fn host_mappings(field: &Value) -> Result<Value, String> {
     let mut mappings = std::collections::BTreeMap::<String, Vec<IpAddr>>::new();
     for raw in field.as_array().into_iter().flatten() {
-        let raw = raw.as_str().ok_or("invalid host")?;
-        let entry = raw
-            .strip_suffix(')')
-            .and_then(|r| r.split_once(" (pass: "))
-            .map_or(raw, |(entry, _)| entry);
-        let h = crate::resolver::parse_host(entry).map_err(|e| e.to_string())?;
+        let h = host_entry(raw)?;
         mappings.entry(h.name).or_default().push(h.addr);
     }
     Ok(serde_json::json!(mappings))
@@ -125,7 +128,12 @@ fn dropped_endpoints(v: &Value) -> (BTreeSet<Endpoint>, bool) {
     (endpoints, complete)
 }
 
-fn read(path: &Path) -> Result<Input, String> {
+/// A full report as inert JSON: at most 1 MiB, of the 0.1.0 schema.
+///
+/// # Errors
+/// When the file cannot be read, is too large, is not JSON, or is not a
+/// full 0.1.0 report.
+pub fn read_report(path: &Path) -> Result<Value, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
     file.take(1_048_577)
@@ -138,6 +146,11 @@ fn read(path: &Path) -> Result<Input, String> {
     if v["playpen_version"] != "0.1.0" {
         return Err("unsupported or reduced report schema".into());
     }
+    Ok(v)
+}
+
+fn read(path: &Path) -> Result<Input, String> {
+    let v = read_report(path)?;
     let mut policy = Vec::new();
     for key in [
         "allowed",
