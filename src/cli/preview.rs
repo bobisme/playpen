@@ -136,17 +136,17 @@ pub(super) fn print(args: &RunArgs, format: Format) -> i32 {
     let at_launch = "Helper availability, namespace setup, live pass validity and installation of the firewall are checked at launch.";
     let digest = digest(&scope);
     match format {
-        Format::Json => println!(
+        Format::Json => outln!(
             "{}",
             json!({"advice":[], "plan":scope, "digest":digest.to_string(), "at_launch":at_launch})
         ),
         Format::Text | Format::Pretty => {
             let sep = if format == Format::Pretty { ": " } else { "  " };
             for (key, value) in scope.as_object().into_iter().flatten() {
-                println!("{key}{sep}{value}");
+                outln!("{key}{sep}{value}");
             }
-            println!("digest{sep}{digest}");
-            println!("{at_launch}");
+            outln!("digest{sep}{digest}");
+            outln!("{at_launch}");
         }
     }
     0

@@ -17,6 +17,11 @@
 //! datagram every MS milliseconds and logs each attempt with the
 //! wall-clock time.
 
+#![allow(
+    clippy::disallowed_macros,
+    reason = "test code may print with the std macros"
+)]
+
 use std::collections::BTreeSet;
 use std::io::{BufRead as _, BufReader};
 use std::os::fd::AsRawFd as _;

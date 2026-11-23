@@ -5,6 +5,11 @@
 //! with `--allow` approve documentation addresses and send nothing to
 //! them; nothing is sent to another host.
 
+#![allow(
+    clippy::disallowed_macros,
+    reason = "test code may print with the std macros"
+)]
+
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};

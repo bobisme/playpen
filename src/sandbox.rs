@@ -2750,7 +2750,7 @@ fn init_loop(
         if !asked && heard.elapsed() >= SILENCE_LIMIT {
             if !silent {
                 silent = true;
-                eprintln!(
+                sayln!(
                     "playpen: playpen itself has been stopped or stuck for {} s, so nothing enforces the end time or re-reads the pass; the command is paused until playpen continues (`fg`, or `kill -CONT` its process)",
                     SILENCE_LIMIT.as_secs()
                 );

@@ -104,7 +104,7 @@ fn evaluate(args: &PolicyTestArgs, format: Format) -> Result<bool, String> {
             if format == Format::Json {
                 results.push(serde_json::json!({"index":index + 1, "name":case.name, "address":ip, "port":case.port, "protocol":case.protocol, "expect":case.expect, "actual":verdict, "ok":actual == expected, "reason":reason}));
             } else {
-                println!(
+                outln!(
                     "{}: expected {}, got {verdict} ({reason})",
                     case.name.as_deref().unwrap_or("unnamed"),
                     case.expect
@@ -113,7 +113,7 @@ fn evaluate(args: &PolicyTestArgs, format: Format) -> Result<bool, String> {
         }
     }
     if format == Format::Json {
-        println!(
+        outln!(
             "{}",
             serde_json::json!({"ok":!failed,"cases":results,"advice":[]})
         );

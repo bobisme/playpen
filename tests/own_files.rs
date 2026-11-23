@@ -5,6 +5,11 @@
 //! files the way an evaluation did (bn-2sa, bn-33k), or by a variant: a
 //! rename of the parent directory, a hard link, a symbolic link.
 
+#![allow(
+    clippy::disallowed_macros,
+    reason = "test code may print with the std macros"
+)]
+
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};

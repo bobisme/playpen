@@ -357,7 +357,7 @@ pub fn listen_tcp(target: Target, ms: u64) -> Result<Value, String> {
     let listener =
         TcpListener::bind(target.addr).map_err(|e| format!("listen {}: {e}", target.addr))?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-    println!("{}", json!({"listening": target.addr.to_string()}));
+    outln!("{}", json!({"listening": target.addr.to_string()}));
     let _ = std::io::stdout().flush();
     let end = std::time::Instant::now() + Duration::from_millis(ms);
     let mut accepted = 0u32;
@@ -365,7 +365,7 @@ pub fn listen_tcp(target: Target, ms: u64) -> Result<Value, String> {
         match listener.accept() {
             Ok((_, from)) => {
                 accepted += 1;
-                println!("{}", json!({"accepted": from.to_string()}));
+                outln!("{}", json!({"accepted": from.to_string()}));
                 let _ = std::io::stdout().flush();
             }
             Err(_) => std::thread::sleep(Duration::from_millis(20)),
@@ -579,13 +579,13 @@ pub fn signals() -> Result<Value, String> {
     set.add(Signal::SIGUSR1);
     set.add(Signal::SIGTERM);
     sigprocmask(SigmaskHow::SIG_BLOCK, Some(&set), None).map_err(|e| e.to_string())?;
-    println!("ready");
+    outln!("ready");
     let mut usr1 = 0u32;
     loop {
         match set.wait() {
             Ok(Signal::SIGUSR1) => {
                 usr1 += 1;
-                println!("usr1");
+                outln!("usr1");
             }
             Ok(_) => return Ok(json!({ "usr1": usr1 })),
             Err(Errno::EINTR) => {}

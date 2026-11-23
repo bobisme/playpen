@@ -16,6 +16,11 @@
 //! listener logs each datagram it gets with the wall-clock time. Both read
 //! the clock that the firewall's `meta time` reads.
 
+#![allow(
+    clippy::disallowed_macros,
+    reason = "test code may print with the std macros"
+)]
+
 use std::collections::BTreeSet;
 use std::io::{BufRead as _, BufReader};
 use std::os::unix::fs::PermissionsExt as _;

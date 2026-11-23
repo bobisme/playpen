@@ -6,6 +6,11 @@
 //! machine even if the filter were broken. Windows are set relative to the
 //! real clock (an hour either side), so no test clock is needed.
 
+#![allow(
+    clippy::disallowed_macros,
+    reason = "test code may print with the std macros"
+)]
+
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;

@@ -1,0 +1,6 @@
+disallowed-macros = [
+    { path = "std::eprintln", reason = "panics when stderr cannot be written; use sayln! from src/say.rs" },
+    { path = "std::eprint", reason = "panics when stderr cannot be written; use say! from src/say.rs" },
+    { path = "std::println", reason = "panics when stdout cannot be written; use outln! from src/say.rs" },
+    { path = "std::print", reason = "panics when stdout cannot be written; use out! from src/say.rs" },
+]

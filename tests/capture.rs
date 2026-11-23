@@ -7,6 +7,11 @@
 //! that address is the approved destination. Nothing can leave the
 //! machine, even if the filter were wrong.
 
+#![allow(
+    clippy::disallowed_macros,
+    reason = "test code may print with the std macros"
+)]
+
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};

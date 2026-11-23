@@ -3,6 +3,17 @@
 //!
 //! See `README.md` for usage and `docs/DESIGN.md` for the mechanism.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_macros,
+        reason = "unit tests may print with the std macros"
+    )
+)]
+
+#[macro_use]
+mod say;
+
 pub mod approval;
 pub mod capture;
 pub mod cli;

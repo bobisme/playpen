@@ -13,6 +13,11 @@
 //! Its interfaces are `dummy` interfaces, which discard what is sent to
 //! them, so nothing can leave the machine.
 
+#![allow(
+    clippy::disallowed_macros,
+    reason = "test code may print with the std macros"
+)]
+
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

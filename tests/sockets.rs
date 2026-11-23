@@ -5,6 +5,11 @@
 //! nothing off the machine; nothing is ever written into a connected
 //! socket. All sandboxes here use `--no-network`.
 
+#![allow(
+    clippy::disallowed_macros,
+    reason = "test code may print with the std macros"
+)]
+
 use std::os::linux::net::SocketAddrExt as _;
 use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::fs::PermissionsExt as _;

@@ -6,6 +6,10 @@
     dead_code,
     reason = "every test crate includes the whole module and uses part of it"
 )]
+#![allow(
+    clippy::disallowed_macros,
+    reason = "test code may print with the std macros"
+)]
 
 use std::io;
 use std::ops::{Deref, DerefMut};

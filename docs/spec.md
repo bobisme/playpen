@@ -780,6 +780,8 @@ Playpen’s stderr alongside supervisor diagnostics. With `--report FILE`,
 the workload keeps its original stdout and stderr and the file receives the
 report in every format. Keep stdout and stderr separate when parsing JSON.
 
+playpen ignores a failed write to stderr (for example `EIO` after the terminal went away): it never panics, and the run, its teardown, its report and its exit status are the same as with a working stderr. After a failed write to stdout (a reader that closed the pipe early) it writes nothing more there.
+
 The supervisor’s human-readable diagnostics on stderr include the following messages.
 
 - just before the command starts, the start line. The first line is short:
@@ -918,6 +920,8 @@ When the `--report` file was replaced while the command ran (see
 it would have exited 0. Any other status is kept: a command that exited 3
 gives 3, and one killed by SIGTERM 143. The report's `playpen_exit_status`
 holds the status playpen exits with.
+
+A stdout that cannot be written never changes an exit status. The listing commands (`rules`, `plan`, `suggest`, `doctor`, `compare`, `help`) stop writing at the first failed write and exit with the status they would have had, normally 0. With `--format json` and no `--report`, `run` loses the report when stdout is closed (`EPIPE` or `EIO`), says so on stderr, and exits with the status it would have had.
 
 With `--on-drop stop`, a run whose cut tripped never exits 0. That covers
 a command that catches SIGTERM and exits 0 in its grace, and one that

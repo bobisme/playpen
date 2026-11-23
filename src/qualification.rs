@@ -400,7 +400,7 @@ pub(crate) fn list(format: Format) -> i32 {
         if format == Format::Json {
             scenarios.push(serde_json::json!({"id":scenario.id,"mode":scenario.mode,"evidence":source,"prerequisites":scenario.prerequisites}));
         } else {
-            println!(
+            outln!(
                 "{}  {}  {}  {}",
                 scenario.id,
                 scenario.mode,
@@ -410,7 +410,7 @@ pub(crate) fn list(format: Format) -> i32 {
         }
     }
     if format == Format::Json {
-        println!("{}", serde_json::json!({"scenarios":scenarios,"advice":[]}));
+        outln!("{}", serde_json::json!({"scenarios":scenarios,"advice":[]}));
     }
     0
 }
@@ -517,20 +517,23 @@ pub(crate) fn run_formatted(required: &[String], source: Option<&Path>, format: 
 
 fn print_qualification(qualification: &Qualification, format: Format) {
     if format == Format::Json {
-        println!(
+        outln!(
             "{}",
             serde_json::json!({"ok":qualification.ok,"scenarios":qualification.scenarios,"advice":[]})
         );
     } else if format == Format::Text {
         for scenario in &qualification.scenarios {
-            println!(
+            outln!(
                 "{}  {}  {}  {}",
-                scenario.id, scenario.status, scenario.evidence, scenario.detail
+                scenario.id,
+                scenario.status,
+                scenario.evidence,
+                scenario.detail
             );
         }
     } else {
         for scenario in &qualification.scenarios {
-            println!(
+            outln!(
                 "{} {}{} (requires {}): {}",
                 scenario.status,
                 scenario.id,
@@ -539,7 +542,7 @@ fn print_qualification(qualification: &Qualification, format: Format) {
                 scenario.detail
             );
         }
-        println!(
+        outln!(
             "{}",
             if qualification.ok {
                 "playpen qualification requirements met."

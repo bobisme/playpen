@@ -8,6 +8,11 @@
 //! numbered datagram every 100 ms and logs each attempt with the wall-clock
 //! time, and `playpen probe reach`, which tries each target once.
 
+#![allow(
+    clippy::disallowed_macros,
+    reason = "test code may print with the std macros"
+)]
+
 use std::collections::BTreeSet;
 use std::io::{BufRead as _, BufReader};
 use std::os::fd::AsRawFd as _;

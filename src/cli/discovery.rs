@@ -135,9 +135,9 @@ pub fn error(format: Format, kind: &str, message: &str, status: i32) -> i32 {
         if !problems.is_empty() {
             error["problems"] = json!(problems);
         }
-        eprintln!("{}", json!({"error":error,"exit_code":status,"advice":[]}));
+        sayln!("{}", json!({"error":error,"exit_code":status,"advice":[]}));
     } else {
-        eprintln!("playpen: {message}");
+        sayln!("playpen: {message}");
     }
     status
 }
@@ -261,9 +261,9 @@ pub(super) fn help(topic: Option<&str>, format: Format) -> i32 {
             "workflow": workflow.trim(),
             "advice": [],
         });
-        println!("{document}");
+        outln!("{document}");
     } else {
-        print!("{}", cmd.render_long_help());
+        out!("{}", cmd.render_long_help());
     }
     0
 }
@@ -297,12 +297,12 @@ fn command_description(cmd: &Command) -> serde_json::Value {
 pub(super) fn version(format: Format) -> i32 {
     let version = env!("CARGO_PKG_VERSION");
     if format == Format::Json {
-        println!(
+        outln!(
             "{}",
             json!({"name":"playpen","version":version,"advice":[]})
         );
     } else {
-        println!("playpen {version}");
+        outln!("playpen {version}");
     }
     0
 }

@@ -399,7 +399,7 @@ fn print(result: &Comparison, format: Format) {
         } else {
             serde_json::json!([])
         };
-        println!(
+        outln!(
             "{}",
             serde_json::json!({
                 "policy": result.policy,
@@ -413,16 +413,16 @@ fn print(result: &Comparison, format: Format) {
             })
         );
     } else if format == Format::Text {
-        println!("policy  {}\nevidence  {}", result.policy, result.evidence);
+        outln!("policy  {}\nevidence  {}", result.policy, result.evidence);
         for line in change_lines(&result.policy_changes, "  ") {
-            println!("policy-change  {line}");
+            outln!("policy-change  {line}");
         }
         for (kind, endpoints) in [
             ("new", &result.new_denials),
             ("no-longer-observed", &result.no_longer_observed),
         ] {
             for e in endpoints {
-                println!(
+                outln!(
                     "{kind}  {}  {}  {}",
                     e.address,
                     e.protocol,
@@ -438,28 +438,30 @@ fn print(result: &Comparison, format: Format) {
             ),
         ] {
             for name in names {
-                println!("{kind}  {name}");
+                outln!("{kind}  {name}");
             }
         }
     } else {
-        println!("policy: {}; evidence: {}", result.policy, result.evidence);
+        outln!("policy: {}; evidence: {}", result.policy, result.evidence);
         for line in change_lines(&result.policy_changes, " ") {
-            println!("policy change: {line}");
+            outln!("policy change: {line}");
         }
         for e in &result.new_denials {
-            println!("new: {} {} {:?}", e.address, e.protocol, e.port);
+            outln!("new: {} {} {:?}", e.address, e.protocol, e.port);
         }
         for e in &result.no_longer_observed {
-            println!(
+            outln!(
                 "no longer observed: {} {} {:?}",
-                e.address, e.protocol, e.port
+                e.address,
+                e.protocol,
+                e.port
             );
         }
         for name in &result.new_unmapped_lookups {
-            println!("new lookup without --host: {name}");
+            outln!("new lookup without --host: {name}");
         }
         for name in &result.unmapped_lookups_no_longer_observed {
-            println!("lookup without --host no longer observed: {name}");
+            outln!("lookup without --host no longer observed: {name}");
         }
     }
 }

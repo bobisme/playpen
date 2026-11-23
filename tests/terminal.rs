@@ -5,6 +5,11 @@
 //! Every sandbox here uses `--no-network`; the only sockets are on the
 //! host's loopback or Unix socket pairs.
 
+#![allow(
+    clippy::disallowed_macros,
+    reason = "test code may print with the std macros"
+)]
+
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream, UdpSocket};

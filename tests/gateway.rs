@@ -19,6 +19,11 @@
 //! The same is done for IPv6: the dummy interface also has `2001:db8::10/64`
 //! with gateway `2001:db8::1`, and a second listener waits on `[::]`.
 
+#![allow(
+    clippy::disallowed_macros,
+    reason = "test code may print with the std macros"
+)]
+
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;

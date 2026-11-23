@@ -6,6 +6,11 @@
 //! host, even if the filter were broken: packets to an address on the
 //! sandbox's `lo` never reach pasta.
 
+#![allow(
+    clippy::disallowed_macros,
+    reason = "test code may print with the std macros"
+)]
+
 use std::io::Read as _;
 use std::net::{TcpListener, UdpSocket};
 use std::os::unix::fs::PermissionsExt as _;

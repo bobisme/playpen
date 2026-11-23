@@ -728,7 +728,7 @@ fn print_result(
     format: Format,
 ) {
     if format == Format::Json {
-        println!(
+        outln!(
             "{}",
             serde_json::json!({
                 "ok": ok,
@@ -739,9 +739,9 @@ fn print_result(
             })
         );
     } else if format == Format::Text {
-        println!("{}  {}", mode.name(), capability.status);
+        outln!("{}  {}", mode.name(), capability.status);
         for c in checks {
-            println!(
+            outln!(
                 "{}  {}  {}",
                 c.name,
                 if c.ok { "ok" } else { "failed" },
@@ -749,11 +749,11 @@ fn print_result(
             );
         }
         for p in probes.iter().filter(|p| p.status == "untested") {
-            println!("{}  untested  {}", p.name, p.detail);
+            outln!("{}  untested  {}", p.name, p.detail);
         }
     } else {
         for c in checks {
-            println!(
+            outln!(
                 "{} {}: {}",
                 if c.ok { "ok  " } else { "FAIL" },
                 c.name,
@@ -762,10 +762,10 @@ fn print_result(
         }
         for probe in probes {
             if probe.status == "untested" {
-                println!("untested {}: {}", probe.name, probe.detail);
+                outln!("untested {}: {}", probe.name, probe.detail);
             }
         }
-        println!(
+        outln!(
             "{}",
             if ok {
                 format!("playpen {} mode is available.", mode.name())

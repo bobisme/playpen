@@ -297,7 +297,7 @@ pub fn run_formatted(path: &Path, format: Format) -> i32 {
         if let Some(message) = s.unanswered_note() {
             advice.push(json!({"level":"warn","type":"unanswered","message":message}));
         }
-        println!(
+        outln!(
             "{}",
             json!({
                 "source": if s.pass { "pass" } else { "allow" },
@@ -310,14 +310,14 @@ pub fn run_formatted(path: &Path, format: Format) -> i32 {
         );
     } else {
         // Only the options go to stdout, so it can be given to run as it is.
-        print!("{}", s.lines());
+        out!("{}", s.lines());
         if let Some((_, message)) = note {
-            eprintln!("playpen: {message}");
+            sayln!("playpen: {message}");
         }
         if let Some(message) = s.unanswered_note() {
-            eprintln!("playpen: {message}");
+            sayln!("playpen: {message}");
         }
-        eprintln!("playpen: caution: {CAUTION}");
+        sayln!("playpen: caution: {CAUTION}");
     }
     0
 }

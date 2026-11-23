@@ -10,6 +10,11 @@
 //! The other tests use the sandbox's own loopback addresses (`--lo-addr`),
 //! as `tests/run.rs` does.
 
+#![allow(
+    clippy::disallowed_macros,
+    reason = "test code may print with the std macros"
+)]
+
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};

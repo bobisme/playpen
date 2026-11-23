@@ -469,9 +469,9 @@ fn rules(
     match format {
         Format::Text | Format::Pretty => {
             for note in &notes {
-                eprintln!("playpen: NOTE: {note}");
+                sayln!("playpen: NOTE: {note}");
             }
-            print!("{text}");
+            out!("{text}");
         }
         Format::Json => {
             let mut out = serde_json::json!({
@@ -483,7 +483,7 @@ fn rules(
             if let Some(on_drop) = on_drop {
                 out["on_drop"] = serde_json::json!(on_drop);
             }
-            println!("{out}");
+            outln!("{out}");
         }
     }
     0
@@ -507,12 +507,12 @@ fn print_probe_lines(result: Result<Vec<serde_json::Value>, String>) -> i32 {
     match result {
         Ok(lines) => {
             for line in lines {
-                println!("{line}");
+                outln!("{line}");
             }
             0
         }
         Err(e) => {
-            eprintln!("probe: {e}");
+            sayln!("probe: {e}");
             EXIT_ERROR
         }
     }
@@ -523,7 +523,7 @@ fn probe(what: ProbeCmd) -> i32 {
         ProbeCmd::HttpFixture => match crate::fixture::serve() {
             Ok(()) => 0,
             Err(e) => {
-                eprintln!("fixture: {e}");
+                sayln!("fixture: {e}");
                 EXIT_ERROR
             }
         },
@@ -537,55 +537,55 @@ fn probe(what: ProbeCmd) -> i32 {
             print_probe_lines(result)
         }
         ProbeCmd::Privs { nft } => {
-            println!("{}", crate::probe::privs(&nft));
+            outln!("{}", crate::probe::privs(&nft));
             0
         }
         ProbeCmd::Resolve { name } => {
-            println!("{}", crate::probe::resolve(&name));
+            outln!("{}", crate::probe::resolve(&name));
             0
         }
         ProbeCmd::Dns { tcp, message } => {
-            println!("{}", crate::probe::dns(&message, tcp));
+            outln!("{}", crate::probe::dns(&message, tcp));
             0
         }
         ProbeCmd::Unix { listen, tries } => print_probe_lines(crate::probe::unix(&listen, &tries)),
         ProbeCmd::Fds => {
-            println!("{}", crate::probe::fds());
+            outln!("{}", crate::probe::fds());
             0
         }
         ProbeCmd::Interfaces => {
-            println!("{}", crate::probe::interfaces());
+            outln!("{}", crate::probe::interfaces());
             0
         }
         ProbeCmd::UnixSend { path } => {
-            println!("{}", crate::probe::unix_send(&path));
+            outln!("{}", crate::probe::unix_send(&path));
             0
         }
         ProbeCmd::UnixRecvFd { path, to } => match to.parse() {
             Ok(to) => {
-                println!("{}", crate::probe::unix_recv_fd(&path, to));
+                outln!("{}", crate::probe::unix_recv_fd(&path, to));
                 0
             }
             Err(e) => {
-                eprintln!("probe: {to:?}: {e}");
+                sayln!("probe: {to:?}: {e}");
                 EXIT_ERROR
             }
         },
         ProbeCmd::StdoutReconnect { target } => {
-            eprintln!("{}", crate::probe::stdout_reconnect(&target));
+            sayln!("{}", crate::probe::stdout_reconnect(&target));
             0
         }
         ProbeCmd::Tty => {
-            println!("{}", crate::probe::tty());
+            outln!("{}", crate::probe::tty());
             0
         }
         ProbeCmd::Signals => match crate::probe::signals() {
             Ok(v) => {
-                println!("{v}");
+                outln!("{v}");
                 0
             }
             Err(e) => {
-                eprintln!("probe: {e}");
+                sayln!("probe: {e}");
                 EXIT_ERROR
             }
         },
@@ -616,11 +616,11 @@ fn probe_traffic(what: ProbeCmd) -> i32 {
     };
     match result {
         Ok(v) => {
-            println!("{v}");
+            outln!("{v}");
             0
         }
         Err(e) => {
-            eprintln!("probe: {e}");
+            sayln!("probe: {e}");
             EXIT_ERROR
         }
     }
@@ -951,7 +951,7 @@ impl Events for StderrEvents<'_> {
 
     fn starting(&mut self) {
         self.pipe.send("starting", &serde_json::Value::Null);
-        eprintln!("{}", self.start_line);
+        sayln!("{}", self.start_line);
     }
     fn released(&mut self, at: OffsetDateTime) {
         self.started_at = Some(at);
@@ -964,7 +964,7 @@ impl Events for StderrEvents<'_> {
             "stopping",
             &serde_json::json!({"reason":"expiry","egress_closed":*cut == sandbox::Cut::Closed}),
         );
-        eprintln!(
+        sayln!(
             "playpen: the approval ended at {}; {}",
             self.until.as_deref().unwrap_or("?"),
             stopping(cut)
@@ -977,25 +977,25 @@ impl Events for StderrEvents<'_> {
         } else {
             ("are", "them")
         };
-        eprintln!(
+        sayln!(
             "playpen: NOTE: {} {verb} approved, but the sandbox has the same address on its own interface (it gets this host's addresses), so connections to {it} stay inside the sandbox and do not reach this host. A service on this host is reachable only at an address the sandbox does not have (docs/DESIGN.md, \"The host's own addresses\")",
             list.join(", ")
         );
     }
     fn uncounted(&mut self, why: &str) {
-        eprintln!(
+        sayln!(
             "playpen: NOTE: {why}. The drop counts of this run are incomplete: --fail-on-drop says unknown, and --on-drop and --live-drops do not see these packets"
         );
     }
     fn pass_edited(&mut self, message: &str) {
-        eprintln!("playpen: {message}");
+        sayln!("playpen: {message}");
     }
     fn pass_withdrawn(&mut self, reason: &str, cut: &sandbox::Cut) {
         self.pipe.send(
             "stopping",
             &serde_json::json!({"reason":"pass_withdrawn","egress_closed":*cut == sandbox::Cut::Closed}),
         );
-        eprintln!("playpen: {reason}; {}", stopping(cut));
+        sayln!("playpen: {reason}; {}", stopping(cut));
     }
     fn denied(&mut self, dest: &crate::ruleset::DroppedDest) {
         self.pipe.send(
@@ -1008,12 +1008,12 @@ impl Events for StderrEvents<'_> {
         }
         self.live_shown += 1;
         if self.live_shown <= crate::live_drops::SHOWN {
-            eprintln!(
+            sayln!(
                 "playpen: dropped: {} (not approved)",
                 tripwire::destination(dest)
             );
         } else if self.live_shown == crate::live_drops::SHOWN + 1 {
-            eprintln!(
+            sayln!(
                 "playpen: dropped: more than {} destinations; see the summary at the end",
                 crate::live_drops::SHOWN
             );
@@ -1021,7 +1021,7 @@ impl Events for StderrEvents<'_> {
     }
     fn denied_unreadable(&mut self, why: &str) {
         if self.args.live_drops {
-            eprintln!(
+            sayln!(
                 "playpen: could not read the drop counter while the command runs: {why}; playpen tries again every {} s, and the summary at the end reports the drops as usual",
                 crate::live_drops::INTERVAL.as_secs()
             );
@@ -1036,9 +1036,9 @@ impl Events for StderrEvents<'_> {
                     "stopping",
                     &serde_json::json!({"reason":"drop","egress_closed":*cut == sandbox::Cut::Closed}),
                 );
-                eprintln!("playpen: {reason}; {}", stopping(cut));
+                sayln!("playpen: {reason}; {}", stopping(cut));
             }
-            None => eprintln!(
+            None => sayln!(
                 "playpen: {reason}; the firewall now refuses all traffic but loopback, and the command keeps running"
             ),
         }
@@ -1415,15 +1415,23 @@ fn write_report(
         Some(f) => f.write(&bytes),
         None if stdout_report => {
             let mut out = std::io::stdout().lock();
-            out.write_all(&bytes)?;
-            out.flush()
+            match out.write_all(&bytes).and_then(|()| out.flush()) {
+                // Nobody reads stdout any more: the report is lost, but
+                // the run and playpen's exit status are not changed.
+                Err(e) if crate::say::stdout_reader_gone(&e) => {
+                    crate::say::stdout_lost();
+                    sayln!("playpen: the report was not written: stdout is closed ({e})");
+                    Ok(())
+                }
+                other => other,
+            }
         }
         None => Ok(()),
     });
     match (written, replaced) {
         (Ok(()), None) => Ok(()),
         (Ok(()), Some((why, shown))) => {
-            eprintln!(
+            sayln!(
                 "playpen: WARNING: the report file {shown} was replaced while the command ran ({why}); playpen wrote its report there again, and exits with status {}",
                 report.playpen_exit_status
             );
@@ -1520,9 +1528,9 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     }) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("playpen: refused: {e}");
+            sayln!("playpen: refused: {e}");
             if !e.contains("nothing was run") {
-                eprintln!("playpen: nothing was run");
+                sayln!("playpen: nothing was run");
             }
             report.message = Some(e);
             return finish(report_file.as_mut(), &mut report);
@@ -1530,7 +1538,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     };
     report.enforcement_coverage = checked.from_pass.as_ref().map(|p| p.coverage.clone());
     if let Err(e) = enforce_coverage(args, &checked) {
-        eprintln!("playpen: refused: {e}; nothing was run");
+        sayln!("playpen: refused: {e}; nothing was run");
         report.message = Some(e);
         return finish(report_file.as_mut(), &mut report);
     }
@@ -1539,7 +1547,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     let capture = match args.capture.as_deref().map(Capture::create).transpose() {
         Ok(c) => c.map(Arc::new),
         Err(e) => {
-            eprintln!("playpen: refused: {e}; nothing was run");
+            sayln!("playpen: refused: {e}; nothing was run");
             report.message = Some(e);
             return finish(report_file.as_mut(), &mut report);
         }
@@ -1562,7 +1570,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         .extend(checked.pass_entries().iter().map(ToString::to_string));
     for path in &args.hide {
         if explicitly_missing(path) {
-            eprintln!(
+            sayln!(
                 "playpen: NOTE: --hide path {} does not exist; nothing was hidden there",
                 path.display()
             );
@@ -1573,7 +1581,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         report.pass = Some(pass_report(&p.identity));
     }
     let fail = |report: &mut Report, file: Option<&mut ReportFile>, outcome, msg: String| {
-        eprintln!("playpen: {msg}");
+        sayln!("playpen: {msg}");
         report.outcome = outcome;
         if outcome == Outcome::Error {
             report.startup_evidence = StartupEvidence::Unknown;
@@ -1665,7 +1673,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
             match c.summary() {
                 Ok(s) => report.capture = Some(s),
                 Err(e) => {
-                    eprintln!("playpen: {e}");
+                    sayln!("playpen: {e}");
                     report.message.get_or_insert(e);
                 }
             }
@@ -1754,7 +1762,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     let code = apply_drop_assertion(&mut report, code, args.fail_on_drop);
     let code = tripwire::exit_status(report.on_drop.as_ref(), code);
     report.playpen_exit_status = code;
-    eprint!("{}", text_summary(&report));
+    say!("{}", text_summary(&report));
     finish(report_file.as_mut(), &mut report)
 }
 
