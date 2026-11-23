@@ -65,6 +65,12 @@ pub struct Report {
     pub hosts: Vec<String>,
     /// When the approval ends (RFC 3339, UTC), if given.
     pub until: Option<String>,
+    /// When the command was released (RFC 3339, UTC); null when nothing
+    /// was run.
+    pub started_at: Option<String>,
+    /// When playpen learned that the command had ended (RFC 3339, UTC);
+    /// null when nothing was run.
+    pub ended_at: Option<String>,
     /// `"pasta"` or `"none"`.
     pub network: &'static str,
     /// The command's exit code when it exited normally.
@@ -84,6 +90,9 @@ pub struct Report {
     pub enforcement_coverage: Option<crate::pass::Coverage>,
     /// The pass, with `--pass`.
     pub pass: Option<PassReport>,
+    /// The packet capture, with `--capture`, read after pasta exited;
+    /// null when nothing was run.
+    pub capture: Option<crate::capture::CaptureReport>,
     /// The exit status playpen itself returns.
     pub playpen_exit_status: i32,
     /// Drop counters, when they could be read.
@@ -114,6 +123,11 @@ pub struct Report {
 }
 
 /// Explicit allowlist for reports intended to be shared.
+///
+/// It leaves out `started_at` and `ended_at` (exact times let a reader
+/// match the report to a destination's own logs, and so recover the
+/// destinations it leaves out) and `capture` (the capture holds payloads).
+/// See docs/spec.md, "Shareable reports".
 #[derive(Serialize)]
 pub struct ShareableReport {
     // An empty, fixed-size array cannot carry private diagnostic strings.
@@ -176,6 +190,14 @@ pub struct PassReport {
     pub valid_until: Option<String>,
     /// Labels of the destinations in use.
     pub labels: Vec<String>,
+}
+
+/// A moment as the report writes it: RFC 3339 in UTC, like `until`.
+#[must_use]
+pub fn stamp(at: time::OffsetDateTime) -> String {
+    at.to_offset(time::UtcOffset::UTC)
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| at.unix_timestamp().to_string())
 }
 
 /// The closing text summary for stderr.
@@ -246,6 +268,13 @@ pub fn text_summary(r: &Report) -> String {
         }
         (None, None) => {}
     }
+    if let Some(c) = &r.capture {
+        let _ = writeln!(
+            out,
+            "playpen: packet capture {}: {} bytes, sha256 {}",
+            c.file, c.bytes, c.sha256
+        );
+    }
     out
 }
 
@@ -264,6 +293,8 @@ mod tests {
             allowed: vec![],
             hosts: vec![],
             until: None,
+            started_at: None,
+            ended_at: None,
             network: "none",
             exit_code: Some(0),
             signal: None,
@@ -272,6 +303,7 @@ mod tests {
             stop_reason: None,
             enforcement_coverage: None,
             pass: None,
+            capture: None,
             playpen_exit_status: 0,
             dropped: Some(DropSummary::default()),
             grant_use: None,
@@ -302,11 +334,20 @@ mod tests {
             valid_until: None,
             labels: vec!["private-label".into()],
         });
+        r.started_at = Some("2026-11-22T10:00:00.123456789Z".into());
+        r.ended_at = Some("2026-11-22T10:00:02.5Z".into());
+        r.capture = Some(crate::capture::CaptureReport {
+            file: "/private-capture.pcap".into(),
+            bytes: 4096,
+            sha256: "private-digest".into(),
+        });
         for outcome in [Outcome::Ran, Outcome::Refused, Outcome::Error] {
             r.outcome = outcome;
             let value = serde_json::to_value(ShareableReport::from(&r)).unwrap_or_default();
             let serialized = value.to_string();
             assert!(!serialized.contains("private-"), "{serialized}");
+            assert!(!serialized.contains("2026-11-22"), "{serialized}");
+            assert!(!serialized.contains("4096"), "{serialized}");
             let keys: std::collections::BTreeSet<_> = value
                 .as_object()
                 .unwrap_or_else(|| panic!("not object"))
@@ -392,6 +433,30 @@ mod tests {
         assert!(t.contains("exited with status 0"));
         assert!(t.contains("no packets"));
         assert!(!t.contains("WARNING"));
+        assert!(!t.contains("capture"));
+    }
+
+    #[test]
+    fn times_and_capture_in_the_full_report() {
+        let mut r = base();
+        let at = time::macros::datetime!(2026-11-22 11:00:00.25 +01:00);
+        r.started_at = Some(stamp(at));
+        assert_eq!(r.started_at.as_deref(), Some("2026-11-22T10:00:00.25Z"));
+        r.capture = Some(crate::capture::CaptureReport {
+            file: "/w/run.pcap".into(),
+            bytes: 24,
+            sha256: "ab".into(),
+        });
+        let json = serde_json::to_value(&r).unwrap_or_default();
+        assert_eq!(json["started_at"], "2026-11-22T10:00:00.25Z");
+        assert!(json["ended_at"].is_null());
+        assert_eq!(
+            json["capture"],
+            serde_json::json!({"file": "/w/run.pcap", "bytes": 24, "sha256": "ab"})
+        );
+        assert!(
+            text_summary(&r).contains("playpen: packet capture /w/run.pcap: 24 bytes, sha256 ab\n")
+        );
     }
 
     #[test]

@@ -135,6 +135,8 @@ pub struct Plan {
     pub nft: PathBuf,
     /// The `pasta` binary.
     pub pasta: PathBuf,
+    /// With `--capture`: the file pasta writes its packet capture to.
+    pub capture: Option<std::sync::Arc<crate::capture::Capture>>,
     /// With `--pass`: the pass file to re-read while the command runs. A
     /// re-read can stop the run, never change the rules.
     pub watch: Option<PassWatch>,
@@ -203,6 +205,11 @@ pub trait Events {
     }
     /// The sandbox is ready and the command is about to start.
     fn starting(&mut self);
+    /// The command was released ("go" was sent) at `at`.
+    fn released(&mut self, _at: time::OffsetDateTime) {}
+    /// P learned at `at` that the command had ended: from init's report of
+    /// its exit status, or from the end of the sandbox when none came.
+    fn ended(&mut self, _at: time::OffsetDateTime) {}
     /// The approval ended; the command is being stopped.
     fn until_reached(&mut self);
     /// Approved addresses that turned out to be the sandbox's own: pasta
@@ -819,6 +826,8 @@ struct ParentState {
     init: Option<Pid>,
     started: bool,
     status: Option<CommandStatus>,
+    /// When the exit status was read.
+    ended_at: Option<time::OffsetDateTime>,
     drops: Option<Result<DropSummary, String>>,
     grant_packets: Vec<Option<u64>>,
     ready: bool,
@@ -874,6 +883,9 @@ impl ParentState {
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.buf.drain(..=pos).collect();
             self.handle_line(&String::from_utf8_lossy(&line[..pos]));
+            if self.status.is_some() && self.ended_at.is_none() {
+                self.ended_at = Some(time::OffsetDateTime::now_utc());
+            }
         }
     }
 
@@ -1002,7 +1014,7 @@ fn parent(
     // Phase 2: connectivity.
     let mut pasta = None;
     if plan.network {
-        match crate::pasta::start(&plan.pasta, child) {
+        match crate::pasta::start(&plan.pasta, child, plan.capture.as_deref()) {
             Ok(p) => pasta = Some(p),
             Err(e) => {
                 drop(down_w);
@@ -1043,6 +1055,7 @@ fn parent(
     }
     events.starting();
     send_byte(&down_w, GO);
+    events.released(time::OffsetDateTime::now_utc());
 
     // Phase 3: the command runs.
     let mut shutdown = Shutdown::default();
@@ -1224,6 +1237,7 @@ fn parent(
     }
     drop(down_w);
     drop(witness);
+    events.ended(st.ended_at.unwrap_or_else(time::OffsetDateTime::now_utc));
     let _ = waitpid(child, None);
     if let Some(tty) = private_tty.take()
         && let Err(e) = tty.stop()
@@ -2869,6 +2883,7 @@ mod tests {
             init: None,
             started: false,
             status: None,
+            ended_at: None,
             drops: None,
             grant_packets: Vec::new(),
             ready: false,
@@ -2906,5 +2921,18 @@ mod tests {
         assert!(matches!(st.drops, Some(Ok(DropSummary { packets: 2, .. }))));
         st.handle_line("signal 15");
         assert_eq!(st.status, Some(CommandStatus::Signaled(15)));
+    }
+
+    #[test]
+    fn the_command_ended_when_its_status_was_read() {
+        let mut st = ParentState::default();
+        st.receive(b"started\nexi");
+        assert!(st.ended_at.is_none());
+        let before = time::OffsetDateTime::now_utc();
+        st.receive(b"t 0\ndrops {}\n");
+        let ended = st.ended_at;
+        assert!(ended.is_some_and(|t| t >= before));
+        st.receive(b"signal 9\n");
+        assert_eq!(st.ended_at, ended, "the first status counts");
     }
 }

@@ -60,6 +60,10 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
     if args.pass_hosts {
         scope["pass_hosts"] = json!(true);
     }
+    // The same for runs without a packet capture.
+    if let Some(path) = &args.capture {
+        scope["capture"] = unix_string(path.as_os_str());
+    }
     Ok(scope)
 }
 

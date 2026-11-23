@@ -4,6 +4,7 @@
 //! See `README.md` for usage and `docs/DESIGN.md` for the mechanism.
 
 pub mod approval;
+pub mod capture;
 pub mod cli;
 mod compare;
 pub mod doctor;

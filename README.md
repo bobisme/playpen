@@ -203,6 +203,28 @@ playpen run --allow 192.0.2.1:443/tcp --fail-on-drop --report report.json -- ./c
 Unavailable counters also fail the assertion. The report keeps the child
 status separately from playpen's exit status.
 
+### Keep a record of what was sent
+
+`--capture FILE` writes a pcap of every packet that crossed the sandbox's
+outside interface: the approved traffic, its replies, and address
+resolution with pasta. A packet the firewall refuses never reaches that
+interface, so it is not in the file; the report counts it instead.
+
+```sh
+playpen run --pass engagement.pass.toml --capture run.pcap --report run.json -- ./scan
+sha256sum run.pcap   # the same digest as .capture.sha256 in run.json
+```
+
+The report gives the file's size and SHA-256. Every report of a run that
+started also has `started_at` and `ended_at`, so the capture, the report
+and the pass window line up.
+
+**The capture holds payloads**, including passwords, tokens and cookies the
+command sent in clear. Treat it like the pass. playpen creates it as a new
+file with mode 0600. It refuses a name that exists, a symbolic link, and a
+directory that its group or others can write to (a sticky directory such
+as `/tmp` is accepted). The command cannot open the file while it runs.
+
 ### Run an HTTP client offline
 
 Save one response in a fixture file, then run a client against it:
@@ -344,7 +366,8 @@ playpen does not guard against:
 - the approved destination itself forwarding traffic elsewhere (an approved
   proxy is a way out to wherever that proxy goes);
 - what is sent: playpen limits where packets go, not how many or what they
-  contain (so it does not enforce a pass's ceilings);
+  contain (so it does not enforce a pass's ceilings). `--capture` records
+  what was sent; it does not inspect or stop it;
 - traffic to approved destinations during the [revocation and shutdown
   window](#how-a-pass-backed-run-ends), or someone who can restore the pass
   file between checks.

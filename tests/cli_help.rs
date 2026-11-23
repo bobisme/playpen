@@ -135,6 +135,35 @@ fn policy_test_reports_all_decisions_and_refuses_invalid_input_atomically() {
 }
 
 #[test]
+fn run_help_lists_the_packet_capture() {
+    let help = json(&invoke(&["help", "run", "--format", "json"], None).stdout);
+    let capture = help["arguments"]
+        .as_array()
+        .expect("arguments")
+        .iter()
+        .find(|arg| arg["long"] == "capture")
+        .cloned()
+        .expect("--capture");
+    assert_eq!(capture["value_names"], serde_json::json!(["FILE"]));
+    assert_eq!(capture["takes_value"], true);
+    let said = capture["help"].as_str().unwrap_or("");
+    assert!(
+        said.contains("pcap") && said.contains("credentials"),
+        "{said}"
+    );
+    assert!(
+        help["examples"]
+            .as_array()
+            .expect("examples")
+            .iter()
+            .any(|e| e.as_str().is_some_and(|e| e.contains("--capture"))),
+        "{help}"
+    );
+    let text = String::from_utf8(invoke(&["run", "--help"], None).stdout).expect("help");
+    assert!(text.contains("--capture <FILE>"), "{text}");
+}
+
+#[test]
 fn json_run_refusal_is_a_report_even_without_a_file() {
     let out = invoke(
         &["run", "--allow", "invalid", "--json", "--", "false"],

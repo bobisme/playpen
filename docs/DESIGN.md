@@ -608,6 +608,92 @@ Two things that do not work:
   would have to approve that one. `--map-host-loopback` stays `none` (see
   the table below).
 
+## Packet capture (`--capture`)
+
+The capture is a record for the owner of what the command sent, to set
+beside the report and the pass window.
+
+**pasta writes it.** pasta already handles every frame that leaves the
+sandbox, and it has `--pcap`. A capture inside the sandbox would need
+capabilities the command must not have. pasta captures on the side of the
+interface that faces the sandbox, so the file shows the packets as the
+sandbox sent them, before pasta turns them into host sockets. The output
+chain rejects a refused packet before it reaches that interface. So the
+capture holds approved traffic and its replies, and ARP and neighbour
+discovery with pasta. The drop counters, not the capture, record what was
+refused. `the_capture_holds_the_approved_exchange_and_nothing_to_the_denied_address`
+checks both against a fixture with one approved and one denied address.
+
+**A path, not a descriptor.** Giving pasta the file playpen opened would
+be best, but it does not work (checked with strace on pasta
+2026_09_25.df90211):
+
+- pasta closes every inherited descriptor when it starts
+  (`close_range(3, ~0)`), so neither an inherited descriptor nor
+  `/proc/self/fd/N` survives;
+- it joins the sandbox's user namespace before it opens the capture, and
+  after that the kernel refuses it `/proc/PLAYPEN/fd/N` (`EACCES`: it has
+  no `CAP_SYS_PTRACE` over playpen's user namespace).
+
+pasta opens the name it is given with `O_WRONLY|O_CREAT|O_TRUNC`, mode
+0600, following symbolic links, before it sandboxes itself (afterwards it
+has an empty root). When it cannot open the file, it prints a message and
+goes on without a capture, and still exits 0.
+
+**Making the path safe.**
+
+- playpen creates the file first: `openat` in the directory it opened,
+  `O_CREAT|O_EXCL|O_NOFOLLOW`, then mode 0600 with `fchmod` (the umask can
+  only narrow it). A name that exists, a symbolic link included, is
+  refused. A capture is never overwritten.
+- pasta starts in that directory, reached through playpen's descriptor
+  (its working directory is `/proc/self/fd/N`, resolved in pasta's
+  process before `exec`, while the descriptor is still open there), and
+  gets the bare name. A change to a directory above cannot redirect it.
+- That leaves the name itself, between playpen's create and pasta's open.
+  Whoever can write the directory could put a symbolic link in place of
+  the file, and pasta would truncate the link's target and write to it
+  with the caller's rights. So playpen refuses a directory that its group
+  or others can write to, unless it has the sticky bit (as `/tmp` does;
+  there only the file's owner can rename or remove the file). It is the
+  rule hallpass applies to the pass file itself (not writable by group or
+  others), applied to the capture's directory. Directories made with umask
+  002 are group-writable and refused; `chmod g-w DIR` is the fix.
+- Once pasta is up, playpen checks that the file it created starts with a
+  pcap header and that the name still leads to it. pasta writes the header
+  as soon as it has opened the file, before it forks to the background. So
+  this catches a file pasta could not open (for example under an AppArmor
+  profile for pasta that does not allow the path) and a file it opened
+  somewhere else. The run then stops before the command starts.
+
+**The command cannot touch it.** The capture's path is added to the hidden
+paths, so inside the sandbox it is `/dev/null`. The report file is written
+once, at the end, through the file playpen opened; the capture is written
+while the command runs, so without this the command (the same user) could
+change it the whole time.
+
+**A complete file when pasta stops.** pasta writes each packet as it goes,
+with two system calls (a `write` of the 16-byte record header, then the
+frame), and buffers nothing. It exits by itself, between two packets, when
+it notices that C is gone. It looks once a second, on a timer. SIGTERM
+ends it at once, and can come between the two calls of one packet and
+leave the last record cut. So with a capture P waits up to 2 seconds for
+pasta to exit by itself, sends SIGTERM only after that, and then reads
+size and digest through its own descriptor. That costs up to a second at
+the end of a run with a capture. Without a capture P still sends SIGTERM
+at once.
+
+**The times.** `started_at` is taken when P has sent "go", `ended_at` when
+P reads init's report of the exit status. Both come from the wall clock,
+so they line up with the pass window and with the capture's timestamps
+(pasta writes the wall clock to the microsecond). A change of the clock
+during the run changes the difference between them.
+
+**An unused file is removed.** When the run stops before the command is
+released, the file holds at most pasta's header and address resolution,
+and it would make a second run with the same name fail. playpen removes
+it, but only when the name still leads to the file it created.
+
 ## Leaks considered
 
 | Leak | How it is closed | Tested |
@@ -643,6 +729,9 @@ Two things that do not work:
 | A pass edited to add a destination or extend the window during a run | rules and end time fixed at start; never reloaded | yes (added destination stays blocked) |
 | A pass swapped for a symbolic link, or made writable by others | hallpass's loader refuses both, at start and on every re-read | yes, at start (symlink, mode 0666) and during the run (renamed over by a symlink; mode 0620 and 0602) |
 | `--allow` adding a destination beside a pass | refused | yes |
+| The command reading or changing the packet capture while it runs | the capture's path is `/dev/null` inside, as with `--hide` | yes: the command finds a character device at the path |
+| pasta writing the capture through a link put in place of the file | playpen creates the file (`O_EXCL`, `O_NOFOLLOW`) in a directory where no other user can replace it, starts pasta there by descriptor, and checks that its own file got pasta's header | yes: an existing file, a link, an unwritable and a group-writable directory are refused; a pasta that writes no capture stops the run before the command starts |
+| A capture cut by stopping pasta in the middle of a packet | P waits for pasta to exit by itself before SIGTERM | yes: a run stopped by its end time during continuous traffic leaves a file that parses to the last record, with the digest the report gives |
 
 ## What is not closed
 
@@ -680,6 +769,11 @@ Two things that do not work:
   stops the command when it wakes after the end, instead of giving it the
   time slept on top. A clock set forward past the end stops the command at
   once.
+- **What the capture holds.** A `--capture` file holds what the command
+  sent and received through pasta, payloads included: passwords, tokens
+  and cookies sent in clear. It is mode 0600 and hidden from the command,
+  but every other process of the caller can read it. Treat it like the
+  pass.
 - **Report file tampering.** The command runs as the same user and could
   write to the `--report` path while it runs. playpen writes the report
   through the file it opened before starting, after the command and every

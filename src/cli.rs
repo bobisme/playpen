@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::Write as _;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -19,6 +20,7 @@ use discovery::Format;
 use time::OffsetDateTime;
 
 use crate::approval::{Approval, EndsAt, parse_allow, parse_literal_addr};
+use crate::capture::Capture;
 use crate::pass::{
     self, FromPass, MIN_RECHECK_INTERVAL, NamedDestination, PassHosts, RECHECK_INTERVAL,
 };
@@ -264,6 +266,11 @@ struct RunArgs {
     /// Write the JSON summary to FILE (for every outcome, refusals included).
     #[arg(help_heading = "Launch and reporting", long, value_name = "FILE")]
     report: Option<PathBuf>,
+    /// Write a pcap of every packet that crosses the sandbox's outside
+    /// interface to FILE, a new file (mode 0600). It holds what was sent,
+    /// credentials sent in clear included. Not with --no-network.
+    #[arg(help_heading = "Launch and reporting", long, value_name = "FILE")]
+    capture: Option<PathBuf>,
     /// Test aid: add ADDR to the sandbox's lo before the ruleset loads.
     #[arg(long = "lo-addr", hide = true, value_name = "ADDR")]
     lo_addr: Vec<String>,
@@ -654,6 +661,12 @@ fn hostname_hint(
 }
 
 fn check(args: &RunArgs) -> Result<Checked, String> {
+    if args.capture.is_some() && args.no_network {
+        return Err(
+            "--capture and --no-network contradict each other: without a network there is no pasta and no outside interface to capture; give one or the other"
+                .into(),
+        );
+    }
     let now = OffsetDateTime::now_utc();
     let mut from_pass = None;
     let approval = if let Some(path) = &args.pass {
@@ -747,6 +760,10 @@ struct StderrEvents<'a> {
     args: &'a RunArgs,
     start_line: String,
     until: Option<String>,
+    /// When the command was released.
+    started_at: Option<OffsetDateTime>,
+    /// When the supervisor learned that the command had ended.
+    ended_at: Option<OffsetDateTime>,
 }
 
 impl Events for StderrEvents<'_> {
@@ -765,6 +782,12 @@ impl Events for StderrEvents<'_> {
     fn starting(&mut self) {
         self.pipe.send("starting", &serde_json::Value::Null);
         eprintln!("{}", self.start_line);
+    }
+    fn released(&mut self, at: OffsetDateTime) {
+        self.started_at = Some(at);
+    }
+    fn ended(&mut self, at: OffsetDateTime) {
+        self.ended_at = Some(at);
     }
     fn until_reached(&mut self) {
         self.pipe
@@ -833,8 +856,17 @@ fn sockets_clause(c: &Checked, landlock: bool) -> String {
     out
 }
 
-fn start_line(c: &Checked, network: bool, landlock: bool, private_tty: bool) -> String {
+fn start_line(
+    c: &Checked,
+    network: bool,
+    landlock: bool,
+    private_tty: bool,
+    capture: Option<&Path>,
+) -> String {
     let line = start_line_net(c, network);
+    let capture = capture.map_or_else(String::new, |p| {
+        format!("; packet capture: {}", p.display())
+    });
     let session = if private_tty {
         "; private controlling terminal"
     } else if c.new_session {
@@ -843,7 +875,7 @@ fn start_line(c: &Checked, network: bool, landlock: bool, private_tty: bool) -> 
         ""
     };
     format!(
-        "{line}{}{session}{}",
+        "{line}{capture}{}{session}{}",
         sockets_clause(c, landlock),
         start_notes(c)
     )
@@ -915,6 +947,8 @@ fn base_report(args: &RunArgs) -> Report {
         allowed: args.allow.clone(),
         hosts: args.host.clone(),
         until: args.until.clone(),
+        started_at: None,
+        ended_at: None,
         network: if args.no_network { "none" } else { "pasta" },
         exit_code: None,
         signal: None,
@@ -931,6 +965,7 @@ fn base_report(args: &RunArgs) -> Report {
             valid_until: None,
             labels: Vec::new(),
         }),
+        capture: None,
         playpen_exit_status: EXIT_REFUSED,
         dropped: None,
         grant_use: None,
@@ -1061,6 +1096,22 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         report.message = Some(e);
         return finish(report_file.as_mut(), &mut report);
     }
+    // Created before anything is built, so that a name that is taken, a
+    // link or a directory that cannot be used is a refusal.
+    let capture = match args.capture.as_deref().map(Capture::create).transpose() {
+        Ok(c) => c.map(Arc::new),
+        Err(e) => {
+            eprintln!("playpen: refused: {e}; nothing was run");
+            report.message = Some(e);
+            return finish(report_file.as_mut(), &mut report);
+        }
+    };
+    // When nothing was run, the capture file playpen created goes again.
+    let discard = || {
+        if let Some(c) = &capture {
+            c.discard();
+        }
+    };
     pipe.send("validated", &serde_json::Value::Null);
     report.allowed = checked
         .approval
@@ -1094,6 +1145,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         finish(file, report)
     };
     let Some(nft) = crate::tools::nft() else {
+        discard();
         return fail(
             &mut report,
             report_file.as_mut(),
@@ -1106,6 +1158,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     } else if let Some(p) = crate::tools::pasta() {
         p
     } else {
+        discard();
         return fail(
             &mut report,
             report_file.as_mut(),
@@ -1127,8 +1180,11 @@ fn run(args: &RunArgs, format: Format) -> i32 {
             !args.no_network,
             !args.without_landlock,
             args.private_tty,
+            capture.as_deref().map(Capture::path),
         ),
         until: report.until.clone(),
+        started_at: None,
+        ended_at: None,
     };
     let grant_labels = if args.report_grant_use {
         checked
@@ -1140,6 +1196,9 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     };
     let grant_counters = crate::grant_use::counter_count(&checked.approval, args.report_grant_use);
     let hosts = checked.all_hosts();
+    let mut hide = args.hide.clone();
+    // The command cannot open the capture: inside it is /dev/null.
+    hide.extend(capture.as_deref().map(|c| c.path().to_path_buf()));
     let plan = Plan {
         fixture: checked.fixture,
         approval: checked.approval,
@@ -1147,17 +1206,34 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         network: !args.no_network,
         grant_counters,
         lo_addrs: checked.lo_addrs,
-        hide: args.hide.clone(),
+        hide,
         exposed: checked.exposed,
         landlock: !args.without_landlock,
         new_session: checked.new_session,
         command: args.command.clone(),
         nft,
         pasta,
+        capture: capture.clone(),
         watch: checked.from_pass.map(|p| p.watch),
     };
-    let result = match sandbox::run_with_output(&plan, &mut events, stdout_report, args.private_tty)
-    {
+    let outcome = sandbox::run_with_output(&plan, &mut events, stdout_report, args.private_tty);
+    report.started_at = events.started_at.map(crate::report::stamp);
+    report.ended_at = events.ended_at.map(crate::report::stamp);
+    if let Some(c) = &capture {
+        // pasta has exited: the file is complete.
+        if report.started_at.is_none() {
+            c.discard();
+        } else {
+            match c.summary() {
+                Ok(s) => report.capture = Some(s),
+                Err(e) => {
+                    eprintln!("playpen: {e}");
+                    report.message.get_or_insert(e);
+                }
+            }
+        }
+    }
+    let result = match outcome {
         Ok(r) => r,
         Err(e @ RunError::NotStarted(_)) => {
             return fail(

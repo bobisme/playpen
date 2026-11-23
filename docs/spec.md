@@ -97,8 +97,8 @@ namespace (section 6). `playpen rules` prints it.
 which owns nothing, with all capability sets cleared and `no_new_privs` set,
 and checking the result before `exec` (section 5, step 9).
 
-**Report.** The summary of a run: what was approved, how the command ended,
-and the drop counters. Printed to stderr as text at the end of every run;
+**Report.** The summary of a run: what was approved, when the command
+started and ended, how it ended, and the drop counters. Printed to stderr as text at the end of every run;
 written as JSON to `--report FILE` (section 4.5).
 
 ## 3. Requirements
@@ -137,10 +137,11 @@ and exits 2.
 ```text
 playpen run --pass FILE [--only LABEL]... [--pass-hosts]
             [--host NAME=ADDR]... [--until RFC3339] [SOCKETS]
-            [--format text|pretty|json] [--report FILE] -- COMMAND [ARGS...]
+            [--format text|pretty|json] [--report FILE] [--capture FILE]
+            -- COMMAND [ARGS...]
 playpen run [--allow SPEC]... [--host NAME=ADDR]... [--until RFC3339]
             [--no-network] [SOCKETS] [--format text|pretty|json]
-            [--report FILE] -- COMMAND [ARGS...]
+            [--report FILE] [--capture FILE] -- COMMAND [ARGS...]
 
 SOCKETS = [--expose PATH]... [--display] [--hide PATH]...
           [--without-landlock] [--new-session | --private-tty]
@@ -423,6 +424,41 @@ Linux scheduling the sandbox init and delivering its stop signals.
 refusals by policy included. The file is created (truncated) before
 anything else; if that fails, playpen refuses.
 
+**`--capture FILE`**. pasta writes a pcap file (Ethernet link type) of every
+frame on the sandbox's outside interface, in both directions, to `FILE`
+(pasta's `--pcap`). That is the approved traffic and its replies, and
+address resolution with pasta (ARP, IPv6 neighbour solicitation and
+advertisement). A packet the output chain rejects (section 6.1) never
+reaches that interface, so it is not in the file; the drop counters count
+it. Traffic on the sandbox's loopback, and to the sandbox's own addresses,
+does not cross the interface either.
+
+- **The capture holds payloads**, including passwords, tokens and cookies
+  the command sends in clear. Treat it like the pass: keep it, share it and
+  delete it under the same rules.
+- playpen creates `FILE` itself after the request checks pass, before
+  anything is built: a new file (`O_CREAT|O_EXCL`), mode 0600, never
+  through a symbolic link. Refused (exit 2, nothing runs, the report's
+  `outcome` is `refused`): a name that exists (`already exists; playpen
+  never overwrites a capture`), a symbolic link (`is a symbolic link`), a
+  directory that cannot be written (`cannot create the capture file ...`),
+  a directory that its group or others can write to unless it has the
+  sticky bit (see DESIGN.md, "Packet capture"), and `--capture` with
+  `--no-network` (there is no outside interface).
+- pasta opens the file by name. When it cannot, it goes on without a
+  capture; playpen checks that pasta wrote the pcap header into the file
+  playpen created, and otherwise stops with `pasta did not write the
+  packet capture to FILE ...; nothing was run` (exit 1).
+- Inside the sandbox `FILE` is `/dev/null`, as with `--hide`: the command
+  cannot read or change the capture.
+- When nothing was run (`refused`, `not_started`), playpen removes the
+  file again, if the name still leads to the file it created. When the
+  command was released, the file stays, and the report's `capture` gives
+  its path, size and SHA-256, read after pasta has exited. A run stopped by
+  its end time or by the pass leaves a complete file: playpen waits up to
+  2 seconds for pasta to exit by itself (it looks once a second whether
+  the sandbox is gone) and sends it SIGTERM only after that.
+
 **`--format text|pretty|json`**. With JSON and no report path, stdout carries
 one final JSON report. The workload’s stdout and stderr both stream to
 Playpen’s stderr alongside supervisor diagnostics. With `--report FILE`,
@@ -439,7 +475,8 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   destinations LABEL, ...): allowing only ...` and may continue with the
   `hostname` hint above. With `--pass-hosts` the names include the entries
   from the pass (`NAME=ADDR (pass: LABEL)`) and any `; --host NAME replaces
-  ...`. It says nothing about ceilings. Then, always,
+  ...`. It says nothing about ceilings. Then, with `--capture`,
+  `; packet capture: PATH` (the absolute path). Then, always,
   `; host Unix sockets: none reachable` (with `--without-landlock`: `;
   host Unix sockets: hidden under /run, /tmp, /var/tmp and the runtime
   directory only (--without-landlock); sockets elsewhere stay reachable`),
@@ -460,7 +497,8 @@ The supervisor’s human-readable diagnostics on stderr include the following me
 - at the end: how the command ended; then either `no packets to
   unapproved destinations were dropped`, or a block between lines of
   asterisks starting `WARNING: N packet(s) to UNAPPROVED destinations were
-  dropped.` listing each destination with protocol, port and packet count.
+  dropped.` listing each destination with protocol, port and packet count;
+  then, with `--capture`, `packet capture PATH: N bytes, sha256 HEX`.
 
 ### 4.2 Exit status of `run`
 
@@ -523,7 +561,10 @@ can disappear without delaying supervision.
 effective settings. Use `--format json` for the versioned `plan` object.
 For example, its `network` field is `"none"` for this invocation. Preview
 uses the same validation as run, reads the current pass and resolves socket
-exposures. It leaves the report path untouched. Availability of helpers,
+exposures. It leaves the report path untouched. With `--capture FILE` the
+plan has a `capture` field, the path as given; plan neither creates nor
+checks the file. Without `--capture` the plan has no such field, so
+digests of earlier plans stay valid. Availability of helpers,
 namespace setup and installation of the filter are determined at launch.
 Command arguments and paths use JSON strings for UTF-8 and an object with a
 `unix_bytes` array for other byte sequences. Grant order is canonical; host
@@ -693,6 +734,8 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `allowed` | array of strings | approved specs (canonical form once parsed; as typed when refused; with `--pass`, the rules from the pass once loaded) |
 | `hosts` | array of strings | `--host` entries as given; then, with `--pass-hosts` and once the pass is loaded, each entry taken from the pass as `NAME=ADDR (pass: LABEL[, LABEL]...)` |
 | `until` | string or null | end time (RFC 3339 UTC once parsed; as typed when refused); with `--pass`, `valid_until` or the earlier `--until` |
+| `started_at` | string or null | when the supervisor released the command (sent "go"), RFC 3339 UTC like `until`, with the fraction of a second; null when nothing was run |
+| `ended_at` | string or null | when the supervisor learned that the command had ended: when it read init's report of the exit status, or, when none came, when the sandbox ended; RFC 3339 UTC; null when nothing was run, and when supervision failed before the supervisor saw the end (`outcome: "error"`) |
 | `network` | `"pasta"` or `"none"` | |
 | `exit_code` | integer or null | the command's exit status |
 | `signal` | integer or null | the signal that killed the command |
@@ -701,6 +744,7 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `stop_reason` | string or null | why playpen stopped the command, when `stopped_by_until` or `stopped_by_pass` |
 | `enforcement_coverage` | object, if available | selected pass enforcement coverage; omitted when unavailable |
 | `pass` | object or null | null without `--pass`; else `{"file", "id", "name", "owner", "digest", "valid_until", "labels"}`: the file as given, the pass id, name, `approval.owner`, `sha256:` digest of the file at start, `valid_until` (RFC 3339 UTC), and the labels in use. When the pass could not be loaded, everything but `file` is null and `labels` is empty |
+| `capture` | object or null | null without `--capture` and when nothing was run; else `{"file", "bytes", "sha256"}`: the capture file (absolute), its size, and the SHA-256 of its bytes in lower-case hex as `sha256sum` prints it, read through the descriptor playpen created it with, after pasta has exited. Also null when the file could not be read back; `message` then says why |
 | `playpen_exit_status` | integer | the status playpen exits with |
 | `dropped` | object or null | `{"packets": N, "destinations": [{"address", "protocol", "port", "packets"}], "destinations_truncated": bool}`; `port` is null for protocols other than TCP and UDP; destinations are sorted by packet count, largest first |
 | `drop_assertion` | `"pass"`, `"violated"`, or `"unknown"` | present only with `--fail-on-drop` |
@@ -772,6 +816,14 @@ allowlist addition and a schema compatibility decision.
 {"advice":[],"schema":"playpen-shareable-v1","outcome":"ran","exit_code":0,"signal":null,"playpen_exit_status":0,"network":"pasta","socket_guard":"landlock","stopped_by_until":false,"stopped_by_pass":false,"dropped_packets":0,"destinations_truncated":false,"drop_assertion":null}
 ```
 
+Decision (`started_at`, `ended_at`): not added. The shareable report leaves
+out the destinations on purpose. Exact start and end times are a key into
+the logs of every destination the command reached, so a reader who has
+such logs could find the destinations again. The full report has both
+times for the owner. The schema stays `playpen-shareable-v1`, unchanged.
+`capture` is never added: the capture holds payloads, and its path and
+digest name a file that must not travel with a shared report.
+
 Child output and files created by the caller or child are separate from this
 report and may contain sensitive data. Aggregate counts and the occurrence of
 stops can themselves disclose information, including timing-related behavior.
@@ -783,7 +835,9 @@ inert data (at most 1 MiB each). It compares effective grants, network, host
 mappings (an entry from `--pass-hosts` counts as its `NAME=ADDR`), exposed
 sockets, display and socket guard independently of observed
 blocked endpoint tuples. Packet counts do not themselves trigger changes.
-Policy differences are shown before the observations. A newly observed tuple
+`started_at`, `ended_at` and `capture` are ignored: two runs of the same
+policy differ in them by nature. Policy differences are shown before the
+observations. A newly observed tuple
 requires a complete baseline; a no-longer-observed tuple requires a complete
 later report and does not mean it is allowed or fixed. Missing or partial
 counters, malformed detail, unstarted runs and unsupported/reduced schemas
@@ -858,7 +912,8 @@ Each step either succeeds or stops the run with a message that ends
 1. **Check the request** (CLI): load and check the pass (with `--pass`),
    parse every spec, `--host` and `--until`, check every `--expose` path
    and find the display sockets for `--display`, check standard input,
-   output and error; apply the refusals in 4.1. Policy failures exit 2.
+   output and error; apply the refusals in 4.1. Then create the
+   `--capture` file. Policy failures exit 2.
 2. **Find the tools**: `nft`, and `pasta` unless `--no-network`.
 3. **Check the process**: exactly one thread (required for creating a user
    namespace) and not root; Landlock ABI 9 unless `--without-landlock`.
@@ -884,10 +939,12 @@ Each step either succeeds or stops the run with a message that ends
    table faithfully.
 7. **P: attach pasta** (unless `--no-network`) to C's namespaces with the
    options in section 6.3, and wait for it to exit 0 (it daemonizes after
-   configuring the namespace). Failure stops the run. P checks the end time
-   has not passed while setting up and, with `--pass`, re-reads the pass
-   once, prints the start line, and tells C to go. (Steps 4 to 6 must
-   finish within 30 seconds.)
+   configuring the namespace). Failure stops the run. With `--capture`, P
+   checks that pasta wrote the pcap header into the capture file. P
+   checks the end time has not passed while setting up and, with
+   `--pass`, re-reads the pass
+   once, prints the start line, and tells C to go. That moment is the
+   report's `started_at`. (Steps 4 to 6 must finish within 30 seconds.)
 8. **C makes itself non-dumpable**, then forks S, which unshares a PID
    namespace and forks I, its PID 1. I unshares a mount and an IPC
    namespace, makes all mounts private, and mounts a fresh `/proc`. Then,
@@ -953,15 +1010,21 @@ AppArmor's restriction is the likely cause and what an administrator can do
 sysctl set to 0).
 
 **Teardown.** When the command exits, I reports its status and exits; the
-kernel kills every process left in the PID namespace. C then lists the
+kernel kills every process left in the PID namespace. The moment P reads
+that status is the report's `ended_at`. C then lists the
 table again to read the counters, reports them, and exits. P stops pasta
 if it is still running (pasta also exits when the namespace's process is
-gone), removes pasta's PID file and its private directory, prints the
-summary, writes the report, and exits.
+gone; it looks once a second), removes pasta's PID file and its private
+directory, prints the summary, writes the report, and exits. With
+`--capture`, P first waits up to 2 seconds for pasta to exit by itself,
+sends SIGTERM only after that, and reads the capture's size and digest
+once pasta is gone.
 
 If playpen itself is killed, each stage dies with its parent
 (`PR_SET_PDEATHSIG`), and I exits when its pipe from P closes, so the
-sandbox goes with it. Only the directory of pasta's PID file is left.
+sandbox goes with it. Only the directory of pasta's PID file is left, and
+the capture file without a report; pasta exits by itself within a second
+of C, between two packets.
 
 ## 6. What is allowed and dropped
 
@@ -1030,7 +1093,9 @@ nothing.
 --udp-ns none --map-host-loopback none --dns none --search none --no-dhcp
 --no-dhcpv6 --no-ra --pid FILE PID`, where `FILE` is in a new private
 directory (mode 0700) under `$XDG_RUNTIME_DIR` (or the temporary directory)
-and `PID` is C.
+and `PID` is C. With `--capture`, also `--pcap NAME` before `PID`, where
+`NAME` is the capture file's bare name and pasta starts in the capture's
+directory, reached through the descriptor playpen holds for it.
 
 ## 7. Files the command sees differently
 
@@ -1091,6 +1156,11 @@ Not guarded against, or known limits:
 - volume, content and covert channels within approved flows;
 - the report file can be overwritten by the command while it runs (same
   user); playpen writes it last, through the file it opened at start;
+- the capture file (`--capture`) holds what the command sent, credentials
+  sent in clear included. It is mode 0600 and is `/dev/null` inside the
+  sandbox, but every other process of the caller can read it. The capture
+  is what pasta saw on its side of the interface; playpen checks its
+  header, size and digest, not its packets;
 - supplementary groups of the caller still apply to file access inside;
 - per-destination drop lists hold 1024 destinations per address family;
   `destinations_truncated` is true when the list is incomplete or its
