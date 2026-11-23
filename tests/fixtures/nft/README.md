@@ -11,27 +11,39 @@ playpen rules --allow 192.0.2.0/30:8000-8002/tcp \
     --allow 192.0.2.4/32:53/udp --allow '[2001:db8::/124]:80/udp' > nonempty.nft
 playpen rules --allow 192.0.2.0/28:444/tcp --allow 192.0.2.6/31:445/udp \
     --allow 192.0.2.4/30:443/tcp --allow '[2001:db8::1]:1024/tcp' > edges.nft
-unshare -Urn sh -c 'nft -f "$1" && nft --json list table inet playpen' _ edges.nft
-unshare -Urn sh -c 'nft -f "$1" && nft --json list table inet playpen' _ empty.nft
-unshare -Urn sh -c 'nft -f "$1" && nft --json list table inet playpen' _ nonempty.nft
-unshare -Urn sh -c 'nft -f "$1" && nft --numeric --json list table inet playpen' _ nonempty.nft
+playpen rules --allow 192.0.2.0/30:8000-8002/tcp --until 2026-12-01T12:34:56Z > until.nft
+list='nft -f "$1" && TZ=UTC0 nft --json list table inet playpen'
+unshare -Urn sh -c "$list" _ edges.nft
+unshare -Urn sh -c "$list" _ empty.nft
+unshare -Urn sh -c "$list" _ nonempty.nft
+unshare -Urn sh -c "$list" _ until.nft
+unshare -Urn sh -c 'nft -f "$1" && TZ=UTC0 nft --numeric --json list table inet playpen' _ nonempty.nft
+unshare -Urn sh -c 'nft -f "$1" && TZ=Asia/Kolkata nft --json list table inet playpen' _ until.nft
 ```
+
+The last one is `until-kolkata.json`. `nft --json` prints `meta time` as a
+date without an offset (`"2026-12-01 12:34:56"`), in the local time zone of
+the `nft` process, with or without `--numeric`. Playpen lists the table with
+`TZ=UTC0` and reads that date as UTC. The Kolkata dump names another moment
+(`"2026-12-01 18:04:56"`) and is refused.
 
 The comparator accepts the following expression vocabulary from these dumps.
 It checks connection state, interface, IP destination and prefix, IPv6 hop
-limit and ICMP type, transport protocol and inclusive ports, the four dynamic
-set additions, the named drop counter, and accept, drop and ICMPx reject
-verdicts. Named and numeric spellings from the recorded dumps are equivalent,
-as are anonymous set member permutations and textual IP address spellings.
-Rule order and expression order are checked. Handles, counter values and
-dynamic set elements vary at runtime. Unknown material objects and expressions
-are refused.
+limit and ICMP type, transport protocol and inclusive ports, the packet
+mark against the `cut` set, the time, the four dynamic set additions, the
+named counters, and accept, drop and ICMPx reject verdicts. Named and
+numeric spellings from the recorded dumps are equivalent, as are anonymous
+set member permutations and textual IP address spellings. Rule order and
+expression order are checked. Handles, counter values and the elements of
+the dynamic drop sets vary at runtime. The `cut` set must be empty. Unknown
+material objects and expressions are refused.
 
 Startup qualification used Playpen's normal `run` path on the same host
 with pasta 2026_09_25.df90211. A temporary forwarding adapter captured the
 real `nft` JSON at startup and teardown. Both `run --no-network -- true`
-and `run --allow 192.0.2.1:8000-8002/tcp -- true` succeeded. The readbacks
-had 11 and 12 output rules respectively, with three input rules and an
-empty forward chain. The integration suite separately checks rejection of
+and `run --allow 192.0.2.1:8000-8002/tcp -- true` succeeded. With the
+`cut` rule added since, the readbacks have 12 and 13 output rules
+respectively, with four input rules and an empty forward chain; an end
+time adds one rule to each of the two chains. The integration suite separately checks rejection of
 a failing load, an empty readback and a narrower reported range. The
 narrower-readback adapter delegates the real load unchanged.

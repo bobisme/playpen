@@ -12,10 +12,12 @@ loopback. An approved server can forward traffic, so choose destinations you tru
 
 A [Hallpass](https://github.com/bobisme/hallpass) file records the
 owner, approved destinations and time window. playpen loads those
-destinations into the firewall at startup. It checks the pass every
-2 seconds and starts shutting down the command when it detects revocation
-or the deadline passes. The command can still reach approved destinations
-during detection and shutdown. See [how a pass-backed run ends](#how-a-pass-backed-run-ends)
+destinations into the firewall at startup. From the end of the window the
+firewall itself refuses all traffic but loopback, whatever playpen does.
+playpen checks the pass every 2 seconds. When it detects revocation it
+closes egress in the firewall the same way, then shuts the command down.
+Until revocation is detected, the command can still reach approved
+destinations. See [how a pass-backed run ends](#how-a-pass-backed-run-ends)
 for the timing, including what happens if playpen itself is paused.
 For a quick run, supply destinations directly with `--allow`.
 
@@ -69,21 +71,34 @@ such applicable terms when playpen must enforce every restriction itself.
 ### How a pass-backed run ends
 
 If the owner sets `revoked = true`, playpen normally detects it at the
-next pass check. The supervisor schedules checks 2 seconds apart. It sends the command `SIGTERM` and
-gives it 3 seconds to exit before killing the remaining sandbox. The same
-shutdown applies when the deadline passes, the file disappears or becomes
-invalid, or a destination in use changes. The original firewall stays in
-force throughout. Granting more destinations or extending the deadline
-only affects future runs.
+next pass check. The supervisor schedules checks 2 seconds apart. It first
+closes egress in the firewall: from then on the firewall refuses every
+packet that is not loopback, in both directions. Only then does it print
+the notice, send the command `SIGTERM` and give it 3 seconds to exit before
+killing the remaining sandbox. The same shutdown applies when the deadline
+passes, the file disappears or becomes invalid, or a destination in use
+changes. If egress cannot be closed within 2 seconds, playpen says so and
+kills the command at once, without the 3 seconds. Nothing in the firewall
+is widened during the run. Granting more destinations or extending the
+deadline only affects future runs.
+
+The ruleset also holds the end time itself (the run's `--until`, or the
+pass's `valid_until`), rounded down to the second. From that second the
+kernel refuses all traffic but loopback, even if the supervisor is stopped
+or stuck. The rule reads the system's wall clock, as the supervisor's own
+check does: setting the clock forward closes egress early, and setting it
+back delays the rule (the supervisor's monotonic deadline still applies).
+Packets refused after the end are counted on their own line in the
+summary and in the report's `refused_after_end`. They are not unapproved
+destinations and do not fail `--fail-on-drop`.
 
 If the supervisor is stopped directly or gets stuck, it cannot check the
-pass or enforce the deadline. After 5 seconds without a heartbeat, a
-watchdog inside the sandbox starts freezing its processes. When the
-supervisor resumes, it checks the deadline and re-reads the pass if due.
-Time spent in system suspend counts toward the deadline. Poll intervals,
-grace periods and watchdog actions depend on Linux scheduling the supervisor
-and the sandbox init. A signal request and the final process exit can occur
-at different times.
+pass. After 5 seconds without a heartbeat, a watchdog inside the sandbox
+starts freezing its processes. When the supervisor resumes, it checks the
+deadline and re-reads the pass if due. Time spent in system suspend counts
+toward the deadline. Poll intervals, grace periods and watchdog actions
+depend on Linux scheduling the supervisor and the sandbox init. A signal
+request and the final process exit can occur at different times.
 
 For a headless job (no controlling terminal), send signals to the playpen PID
 or its process group. Playpen forwards them to the workload group. Redirecting
@@ -396,8 +411,9 @@ playpen does not guard against:
 - what is sent: playpen limits where packets go, not how many or what they
   contain (so it does not enforce a pass's ceilings). `--capture` records
   what was sent; it does not inspect or stop it;
-- traffic to approved destinations during the [revocation and shutdown
-  window](#how-a-pass-backed-run-ends), or someone who can restore the pass
+- traffic to approved destinations before playpen [detects a
+  revocation](#how-a-pass-backed-run-ends) (up to one check interval, or
+  longer while playpen is stopped), or someone who can restore the pass
   file between checks.
 
 ## License

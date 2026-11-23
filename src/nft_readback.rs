@@ -6,7 +6,13 @@ use std::net::IpAddr;
 use serde_json::{Value, json};
 
 use crate::approval::{AllowRule, Approval, Proto};
-use crate::ruleset::{DROP_SET_SIZE, TABLE};
+use crate::ruleset::{CUT_COUNTER, CUT_SET, DROP_SET_SIZE, LATE_COUNTER, TABLE, end_second};
+
+/// The time zone `nft` is run in when it lists the table. `nft --json`
+/// prints `meta time` as a wall-clock date without an offset, in the local
+/// time zone of the `nft` process, with or without `--numeric`. In UTC that
+/// date names one moment; `UTC0` is a POSIX zone that needs no zone files.
+pub const LISTING_TZ: &str = "UTC0";
 
 #[derive(Default, Debug, PartialEq, Eq)]
 struct Table {
@@ -54,23 +60,51 @@ fn prefix(addr: IpAddr, len: u8) -> Value {
     }
 }
 
-fn expected(approval: &Approval, grant_counters: usize) -> Table {
+/// The time rule, when the approval has an end time, and the cut rule.
+/// Only the output chain counts what they refuse.
+fn end_rules(end: Option<i64>, output: bool) -> Vec<Value> {
+    let counted = |name: &str, mut expr: Vec<Value>| {
+        if output {
+            expr.push(json!({"counter":name}));
+        }
+        expr.push(json!({"drop":null}));
+        Value::Array(expr)
+    };
+    let mut rules = Vec::new();
+    if let Some(second) = end {
+        rules.push(counted(
+            LATE_COUNTER,
+            vec![matcher(">=", meta("time"), json!(second))],
+        ));
+    }
+    rules.push(counted(
+        CUT_COUNTER,
+        vec![matcher("==", meta("mark"), json!(format!("@{CUT_SET}")))],
+    ));
+    rules
+}
+
+/// The table, its chains (without rules), counters and sets.
+fn declarations(timed: bool, grant_counters: usize) -> Table {
     let mut table = Table::default();
+    let mut counters = vec![String::from("dropped"), CUT_COUNTER.to_owned()];
+    if timed {
+        counters.push(LATE_COUNTER.to_owned());
+    }
+    counters.extend((0..grant_counters).map(crate::grant_use::counter_name));
+    table.objects.extend(counters.into_iter().map(|name| {
+        let fields = json!({"family":"inet","table":TABLE,"name":name});
+        ((String::from("counter"), name), fields)
+    }));
     table.objects.extend([
         object("table", TABLE, json!({"family":"inet","name":TABLE})),
+        // An empty set: nft prints no `elem` for it (see `parse`).
         object(
-            "counter",
-            "dropped",
-            json!({"family":"inet","table":TABLE,"name":"dropped"}),
+            "set",
+            CUT_SET,
+            json!({"family":"inet","table":TABLE,"name":CUT_SET,"type":"mark","flags":["dynamic"]}),
         ),
     ]);
-    for index in 0..grant_counters {
-        let name = crate::grant_use::counter_name(index);
-        table.objects.insert(
-            (String::from("counter"), name.clone()),
-            json!({"family":"inet","table":TABLE,"name":name}),
-        );
-    }
     for hook in ["output", "input", "forward"] {
         table.objects.insert(
             (String::from("chain"), hook.to_owned()),
@@ -85,6 +119,12 @@ fn expected(approval: &Approval, grant_counters: usize) -> Table {
                 "size":DROP_SET_SIZE,"flags":["dynamic"],"stmt":[{"counter":null}]}),
         );
     }
+    table
+}
+
+fn expected(approval: &Approval, grant_counters: usize) -> Table {
+    let end = end_second(approval);
+    let mut table = declarations(end.is_some(), grant_counters);
     let established = json!([
         matcher("in", json!({"ct":{"key":"state"}}), [2, 4].map(Value::from).to_vec().into()),
         {"accept":null}
@@ -105,7 +145,6 @@ fn expected(approval: &Approval, grant_counters: usize) -> Table {
         .chains
         .get_mut("output")
         .expect("declared output chain");
-    output.push(established.clone());
     for (family, addr, len) in [("ip", "127.0.0.0", 8), ("ip6", "::1", 128)] {
         output.push(json!([
             matcher("==", meta("oif"), json!("lo")),
@@ -113,12 +152,14 @@ fn expected(approval: &Approval, grant_counters: usize) -> Table {
             {"accept":null}
         ]));
     }
-    output.push(neighbour_discovery.clone());
     output.push(json!([
         matcher("==", payload("ip6", "daddr"), prefix("ff02::".parse().expect("multicast address"), 16)),
         icmp_type(&[131, 133, 143]),
         {"drop":null}
     ]));
+    output.extend(end_rules(end, true));
+    output.push(established.clone());
+    output.push(neighbour_discovery.clone());
     output.extend(approval.rules().iter().enumerate().map(|(index, rule)| {
         let counter = (index < grant_counters).then(|| crate::grant_use::counter_name(index));
         grant(approval, rule, counter.as_deref())
@@ -133,15 +174,10 @@ fn expected(approval: &Approval, grant_counters: usize) -> Table {
     }
     output.push(json!([{"counter":"dropped"}]));
     output.push(json!([{"reject":{"type":"icmpx","expr":3}}]));
-    table
-        .chains
-        .get_mut("input")
-        .expect("declared input chain")
-        .extend([
-            established,
-            json!([matcher("==", meta("iif"), json!("lo")), {"accept":null}]),
-            neighbour_discovery,
-        ]);
+    let input = table.chains.get_mut("input").expect("declared input chain");
+    input.push(json!([matcher("==", meta("iif"), json!("lo")), {"accept":null}]));
+    input.extend(end_rules(end, false));
+    input.extend([established, neighbour_discovery]);
     table
 }
 
@@ -225,6 +261,16 @@ fn address(value: &mut Value) {
     }
 }
 
+/// The second a `meta time` date names. nft prints the date in its own
+/// local time zone, which is [`LISTING_TZ`] for the listings playpen reads,
+/// so the date is read as UTC. `None` for any other spelling.
+fn utc_second(date: &str) -> Option<i64> {
+    let format = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    time::PrimitiveDateTime::parse(date, format)
+        .ok()
+        .map(|t| t.assume_utc().unix_timestamp())
+}
+
 fn normalize_expression(expr: &mut Value) {
     // Normalize only recognized fields, preserving all other data so a
     // material addition or unfamiliar shape fails the comparison.
@@ -233,7 +279,11 @@ fn normalize_expression(expr: &mut Value) {
         let Some(right) = m.get_mut("right") else {
             return;
         };
-        if left == json!({"ct":{"key":"state"}}) {
+        if left == meta("time") {
+            if let Some(second) = right.as_str().and_then(utc_second) {
+                *right = json!(second);
+            }
+        } else if left == json!({"ct":{"key":"state"}}) {
             if let Some(values) = right.as_array_mut() {
                 for member in &mut *values {
                     symbol(member, &[("established", 2), ("related", 4)]);
@@ -352,6 +402,12 @@ fn parse(mut value: Value) -> Result<Table, String> {
                         }
                     }
                 }
+                // An element in the cut set would close all egress from the
+                // start: the run would start with a firewall that is not
+                // the one rendered.
+                if kind == "set" && name == CUT_SET && data.contains_key("elem") {
+                    return Err(format!("the {CUT_SET} set is not empty"));
+                }
                 if kind == "set"
                     && let Some(elements) = data.remove("elem")
                     && !elements.is_array()
@@ -424,7 +480,7 @@ pub fn verify_instrumented(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approval::parse_allow;
+    use crate::approval::{EndsAt, parse_allow};
 
     const EMPTY: &str = include_str!("../tests/fixtures/nft/empty.json");
     const RULES: &str = include_str!("../tests/fixtures/nft/nonempty.json");
@@ -467,8 +523,96 @@ mod tests {
         assert_ne!(RULES, narrower);
         assert_eq!(
             verify_policy(&narrower, &approval()),
-            Err("output rule 6 differs".into())
+            Err("output rule 7 differs".into())
         );
+    }
+
+    const UNTIL: &str = include_str!("../tests/fixtures/nft/until.json");
+    const UNTIL_KOLKATA: &str = include_str!("../tests/fixtures/nft/until-kolkata.json");
+
+    fn until(end: &str) -> Approval {
+        let rule = parse_allow("192.0.2.0/30:8000-8002/tcp").expect("valid fixture grant");
+        Approval::new(
+            vec![rule],
+            Some(EndsAt::parse(end).expect("valid fixture end")),
+        )
+    }
+
+    #[test]
+    fn time_rule_is_read_back_in_utc_to_the_second() {
+        verify_policy(UNTIL, &until("2026-12-01T12:34:56Z")).expect("recorded time rule");
+        // The rule starts at the end time rounded down to the second.
+        verify_policy(UNTIL, &until("2026-12-01T12:34:56.900Z")).expect("same second");
+        verify_policy(UNTIL, &until("2026-12-01T18:04:56+05:30")).expect("same moment");
+        for other in ["2026-12-01T12:34:55Z", "2026-12-01T12:34:57Z"] {
+            assert_eq!(
+                verify_policy(UNTIL, &until(other)),
+                Err("input rule 2 differs".into()),
+                "{other}"
+            );
+        }
+        // A dump in another time zone names another moment.
+        assert_eq!(
+            verify_policy(UNTIL_KOLKATA, &until("2026-12-01T12:34:56Z")),
+            Err("input rule 2 differs".into())
+        );
+        // Without an end time the time rule and its counter are extra.
+        let rule = parse_allow("192.0.2.0/30:8000-8002/tcp").expect("valid fixture grant");
+        assert!(verify_policy(UNTIL, &Approval::new(vec![rule], None)).is_err());
+        // With one, a ruleset without them is refused.
+        assert!(verify_policy(RULES, &until("2026-12-01T12:34:56Z")).is_err());
+    }
+
+    #[test]
+    fn time_rule_must_drop_and_count_in_output_only() {
+        let approval = until("2026-12-01T12:34:56Z");
+        let uncounted = UNTIL.replacen(
+            "\"right\": \"2026-12-01 12:34:56\"}}, {\"counter\": \"late\"}, {\"drop\": null}",
+            "\"right\": \"2026-12-01 12:34:56\"}}, {\"drop\": null}",
+            1,
+        );
+        assert_ne!(UNTIL, uncounted);
+        assert_eq!(
+            verify_policy(&uncounted, &approval),
+            Err("output rule 4 differs".into())
+        );
+        let accepted = UNTIL.replacen(
+            "\"right\": \"2026-12-01 12:34:56\"}}, {\"drop\": null}",
+            "\"right\": \"2026-12-01 12:34:56\"}}, {\"accept\": null}",
+            1,
+        );
+        assert_ne!(UNTIL, accepted);
+        assert_eq!(
+            verify_policy(&accepted, &approval),
+            Err("input rule 2 differs".into())
+        );
+        let later = UNTIL.replace("\"op\": \">=\"", "\"op\": \">\"");
+        assert_ne!(UNTIL, later);
+        assert!(verify_policy(&later, &approval).is_err());
+    }
+
+    #[test]
+    fn cut_rule_and_empty_cut_set_are_required() {
+        let approval = approval();
+        let other_set = RULES.replace("\"right\": \"@cut\"", "\"right\": \"@drop4\"");
+        assert_ne!(RULES, other_set);
+        assert_eq!(
+            verify_policy(&other_set, &approval),
+            Err("input rule 2 differs".into())
+        );
+        let filled = RULES.replacen(
+            "\"flags\": [\"dynamic\"]}}",
+            "\"flags\": [\"dynamic\"], \"elem\": [0]}}",
+            1,
+        );
+        assert_ne!(RULES, filled);
+        assert_eq!(
+            verify_policy(&filled, &approval),
+            Err("the cut set is not empty".into())
+        );
+        let wider = RULES.replacen("\"type\": \"mark\"", "\"type\": \"ipv4_addr\"", 1);
+        assert_ne!(RULES, wider);
+        assert!(verify_policy(&wider, &approval).is_err());
     }
 
     #[test]

@@ -39,6 +39,14 @@
 //! P also sends `b` every second. When I hears nothing from P for
 //! [`SILENCE_LIMIT`] (P was stopped with SIGSTOP, which it cannot catch,
 //! or is stuck), I freezes the sandbox by itself until P is heard again.
+//!
+//! P has a third pipe, to C alone (I never sees it). When P decides to stop
+//! the command because the approval ended or the pass withdrew it, it sends
+//! [`CUT`] there. C adds the one element of the ruleset's `cut` set, which
+//! refuses every packet that is not loopback, and answers `cut` on the
+//! report pipe. Only then does P print the notice and send SIGTERM (see
+//! [`Cut`]). From the approval's end time the ruleset refuses the same
+//! traffic by itself, whatever P does.
 
 use std::ffi::OsString;
 use std::fs;
@@ -177,6 +185,23 @@ pub struct RunResult {
     pub grant_packets: Vec<Option<u64>>,
     /// The names the command looked up, or why they could not be read.
     pub lookups: Result<crate::dns_stub::Lookups, String>,
+    /// Packets the time rule or the cut refused on their way out; `None`
+    /// when the counters could not be read.
+    pub refused_after_end: Option<u64>,
+}
+
+/// Whether egress was closed in the firewall when playpen began to stop
+/// the command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cut {
+    /// The ruleset refuses every packet that is not loopback, in both
+    /// directions, from before the notice and SIGTERM on. Also when the
+    /// sandbox was gone already, so nothing in it could send.
+    Closed,
+    /// The setup process could not add the cut, or did not confirm it
+    /// within [`CUT_LIMIT`]; the text says which. The sandbox is killed at
+    /// once instead, without the grace.
+    Failed(String),
 }
 
 /// Why the command did not run, or what went wrong after it started.
@@ -215,16 +240,17 @@ pub trait Events {
     /// P learned at `at` that the command had ended: from init's report of
     /// its exit status, or from the end of the sandbox when none came.
     fn ended(&mut self, _at: time::OffsetDateTime) {}
-    /// The approval ended; the command is being stopped.
-    fn until_reached(&mut self);
+    /// The approval ended; egress is closed as `cut` says, and the command
+    /// is being stopped.
+    fn until_reached(&mut self, cut: &Cut);
     /// Approved addresses that turned out to be the sandbox's own: pasta
     /// gave them to its interface, so connections to them stay inside.
     fn own_addresses(&mut self, _addresses: &[IpAddr]) {}
     /// A re-read of the pass found an edit that changes nothing in use.
     fn pass_edited(&mut self, message: &str);
-    /// A re-read of the pass withdrew the approval; the command is being
-    /// stopped for this reason.
-    fn pass_withdrawn(&mut self, reason: &str);
+    /// A re-read of the pass withdrew the approval; egress is closed as
+    /// `cut` says, and the command is being stopped for this reason.
+    fn pass_withdrawn(&mut self, reason: &str, cut: &Cut);
 }
 
 /// Number of threads in this process, from `/proc/self/status`.
@@ -428,6 +454,15 @@ const SYNCED: u8 = b'k';
 /// Added to a [`signal_byte`] when P's whole process group was sent the
 /// signal: I passes it on only if the command has left that group.
 const GROUP_SENT: u8 = 0x10;
+
+/// Byte P sends C on their own pipe: close all egress in the firewall now,
+/// and answer `cut` (or `cuterr WHY`) on the report pipe.
+const CUT: u8 = b'x';
+
+/// How long P waits for C to confirm [`CUT`]. Adding the element takes
+/// milliseconds; without an answer in this time P kills the sandbox
+/// instead of giving the command the grace (see [`Cut::Failed`]).
+pub const CUT_LIMIT: Duration = Duration::from_secs(2);
 
 /// How often P tells I that it is running.
 const BEAT_INTERVAL: Duration = Duration::from_secs(1);
@@ -711,6 +746,10 @@ fn run_sandbox(
     let (up_r, up_w) = pipe2(OFlag::O_CLOEXEC).map_err(|e| not_started(format!("pipe: {e}")))?;
     let (down_r, down_w) =
         pipe2(OFlag::O_CLOEXEC).map_err(|e| not_started(format!("pipe: {e}")))?;
+    // P to C alone: I reads the down pipe after "go", so a byte for C there
+    // could be read by I instead.
+    let (control_r, control_w) =
+        pipe2(OFlag::O_CLOEXEC).map_err(|e| not_started(format!("pipe: {e}")))?;
     let ids = Ids {
         uid: getuid(),
         gid: getgid(),
@@ -727,6 +766,7 @@ fn run_sandbox(
             events.in_setup_child();
             drop(up_r);
             drop(down_w);
+            drop(control_w);
             drop(sigfd);
             if stdout_report && let Err(e) = nix::unistd::dup2_stdout(std::io::stderr()) {
                 write_line(
@@ -742,6 +782,7 @@ fn run_sandbox(
                 &files,
                 &up_w,
                 &down_r,
+                control_r,
                 job,
                 private_fds,
                 tty_streams,
@@ -757,9 +798,25 @@ fn run_sandbox(
         ForkResult::Parent { child } => {
             drop(up_w);
             drop(down_r);
-            parent(plan, child, &sigfd, &up_r, down_w, events, job, private_tty)
+            drop(control_r);
+            let channels = Channels {
+                up_r,
+                down_w,
+                control_w,
+            };
+            parent(plan, child, &sigfd, channels, events, job, private_tty)
         }
     }
+}
+
+/// P's ends of its pipes to the sandbox.
+struct Channels {
+    /// Lines from C, S and I.
+    up_r: OwnedFd,
+    /// Bytes to C ("go") and after that to I.
+    down_w: OwnedFd,
+    /// Bytes to C alone ([`CUT`]).
+    control_w: OwnedFd,
 }
 
 /// Why the run cannot start when Landlock cannot refuse Unix socket
@@ -846,6 +903,10 @@ struct ParentState {
     /// When P read I's report of a signal from outside its PID namespace,
     /// by place in [`FORWARDED`].
     outside: [Option<Instant>; FORWARDED.len()],
+    /// C's answer to [`CUT`]: done, or why not.
+    cut: Option<Result<(), String>>,
+    /// Packets refused after the approval ended, from C's last reading.
+    refused_after_end: Option<u64>,
 }
 
 impl ParentState {
@@ -853,6 +914,9 @@ impl ParentState {
         let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
         match word {
             "ready" => self.ready = true,
+            "cut" => self.cut = Some(Ok(())),
+            "cuterr" => self.cut = Some(Err(rest.to_owned())),
+            "afterend" => self.refused_after_end = rest.parse().ok(),
             "fail" => {
                 if self.failure.is_none() {
                     self.failure = Some(rest.to_owned());
@@ -981,24 +1045,72 @@ fn wait_readable(fd: &OwnedFd, deadline: Instant) -> bool {
     }
 }
 
+/// Asks C to close all egress in the firewall ([`CUT`]) and waits up to
+/// [`CUT_LIMIT`] for its answer. Lines that arrive meanwhile are handled
+/// as usual.
+fn cut_egress(st: &mut ParentState, up_r: &OwnedFd, control_w: &OwnedFd) -> Cut {
+    st.cut = None;
+    send_byte(control_w, CUT);
+    let deadline = Instant::now() + CUT_LIMIT;
+    loop {
+        match &st.cut {
+            Some(Ok(())) => return Cut::Closed,
+            Some(Err(why)) => return Cut::Failed(why.clone()),
+            None => {}
+        }
+        // C has ended, and with it everything in the sandbox: nothing is
+        // left that could send.
+        if st.eof {
+            return Cut::Closed;
+        }
+        if !wait_readable(up_r, deadline) {
+            return Cut::Failed(format!(
+                "the sandbox did not confirm the cut within {} s",
+                CUT_LIMIT.as_secs()
+            ));
+        }
+        st.pump(up_r);
+    }
+}
+
+/// After the cut: SIGTERM and the grace when egress is closed, SIGKILL at
+/// once when it may not be.
+fn stop_after_cut(
+    cut: &Cut,
+    init: Option<Pid>,
+    child: Pid,
+    down_w: &OwnedFd,
+    shutdown: &mut Shutdown,
+) {
+    shutdown.request(Instant::now());
+    match cut {
+        Cut::Closed => stop_command(init, child, down_w),
+        Cut::Failed(_) => {
+            let _ = kill(init.unwrap_or(child), Signal::SIGKILL);
+            shutdown.killed = true;
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one event loop; splitting it would scatter its state"
-)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the parent loop receives the existing supervisor channels and terminal state"
 )]
 fn parent(
     plan: &Plan,
     child: Pid,
     sigfd: &SignalFd,
-    up_r: &OwnedFd,
-    down_w: OwnedFd,
+    channels: Channels,
     events: &mut dyn Events,
     job: JobControl,
     mut private_tty: Option<PrivateTerminal>,
 ) -> Result<RunResult, RunError> {
+    let Channels {
+        up_r,
+        down_w,
+        control_w,
+    } = channels;
+    let up_r = &up_r;
     let deadline = plan.approval.ends_at.map(|end| {
         let left = end.at() - time::OffsetDateTime::now_utc();
         Deadline {
@@ -1108,10 +1220,11 @@ fn parent(
                     Recheck::Unchanged => {}
                     Recheck::Edited(m) => events.pass_edited(&m),
                     Recheck::Stop(why) => {
-                        events.pass_withdrawn(&why);
+                        // Egress is closed before anything is said or sent.
+                        let cut = cut_egress(&mut st, up_r, &control_w);
+                        events.pass_withdrawn(&why, &cut);
                         stopped_by_pass = Some(why);
-                        shutdown.request(now);
-                        stop_command(st.init, child, &down_w);
+                        stop_after_cut(&cut, st.init, child, &down_w, &mut shutdown);
                     }
                 }
                 next_recheck = Some(Instant::now() + w.interval);
@@ -1124,9 +1237,11 @@ fn parent(
             && shutdown.started.is_none()
         {
             if d.passed(now, time::OffsetDateTime::now_utc()) {
-                events.until_reached();
-                shutdown.request(now);
-                stop_command(st.init, child, &down_w);
+                // The time rule refuses this traffic from the end second on;
+                // the cut also covers a monotonic deadline that comes first.
+                let cut = cut_egress(&mut st, up_r, &control_w);
+                events.until_reached(&cut);
+                stop_after_cut(&cut, st.init, child, &down_w, &mut shutdown);
             } else {
                 wake = wake.min(d.monotonic);
             }
@@ -1287,6 +1402,7 @@ fn parent(
         lookups: st
             .lookups
             .unwrap_or_else(|| Err("the names the command looked up were not reported".into())),
+        refused_after_end: st.refused_after_end,
     })
 }
 
@@ -1648,6 +1764,7 @@ fn stage_c(
     files: &SandboxFiles,
     up_w: &OwnedFd,
     down_r: &OwnedFd,
+    control_r: OwnedFd,
     job: JobControl,
     private_fds: Option<PrivateTtyFds>,
     tty_streams: [bool; 3],
@@ -1675,6 +1792,12 @@ fn stage_c(
     load_ruleset(&plan.nft, ruleset_text)?;
     let grant_counters = plan.grant_counter_count();
     verify_ruleset(&plan.nft, &plan.approval, grant_counters)?;
+    // Made now, so that C can watch S and P's control pipe at once later,
+    // and a failure stops the run before anything runs.
+    let mut chld = SigSet::empty();
+    chld.add(Signal::SIGCHLD);
+    let chld = SignalFd::with_flags(&chld, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)
+        .map_err(|e| format!("cannot create signalfd: {e}"))?;
     write_line(up_w, "ready");
 
     let mut go = [0u8; 1];
@@ -1701,8 +1824,11 @@ fn stage_c(
 
     match fork_checked()? {
         ForkResult::Child => {
-            // Only C stops the stub; S keeps no handle on it.
+            // Only C stops the stub; S keeps no handle on it. P's control
+            // pipe and C's signals are C's alone.
             drop(stub);
+            drop(control_r);
+            drop(chld);
             let code = match stage_s(plan, files, up_w, down_r, job, private_fds, tty_streams) {
                 Ok(()) => 0,
                 Err(msg) => {
@@ -1713,11 +1839,99 @@ fn stage_c(
             exit_now(code);
         }
         ForkResult::Parent { child } => {
-            let _ = waitpid(child, None);
+            watch_sandbox(&plan.nft, child, &control_r, &chld, up_w);
         }
     }
+    // S has ended, and with it the command: nothing can look up a name now.
     stub.report(up_w);
-    report_counters(&plan.nft, grant_counters, up_w);
+    report_counters(
+        &plan.nft,
+        grant_counters,
+        plan.approval.ends_at.is_some(),
+        up_w,
+    );
+    Ok(())
+}
+
+/// C's work while the command runs: wait for S to end, and close all
+/// egress in the firewall when P asks ([`CUT`]).
+///
+/// One `poll` over P's control pipe and C's SIGCHLD; another duty for C
+/// while the command runs is one more descriptor here. C answers every
+/// [`CUT`], so P never waits for an answer that will not come; the element
+/// is added once.
+fn watch_sandbox(nft: &Path, s: Pid, control_r: &OwnedFd, chld: &SignalFd, up_w: &OwnedFd) {
+    // False once P has closed its end: P is gone, and PR_SET_PDEATHSIG
+    // ends C as well.
+    let mut listening = true;
+    let mut cut: Option<Result<(), String>> = None;
+    loop {
+        let mut fds = vec![PollFd::new(chld.as_fd(), PollFlags::POLLIN)];
+        if listening {
+            fds.push(PollFd::new(control_r.as_fd(), PollFlags::POLLIN));
+        }
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(_) | Err(Errno::EINTR) => {}
+            // Nothing to wait on any more but S itself.
+            Err(_) => {
+                while waitpid(s, None) == Err(Errno::EINTR) {}
+                return;
+            }
+        }
+        let asked = fds
+            .get(1)
+            .and_then(PollFd::revents)
+            .is_some_and(|r| !r.is_empty());
+        if asked {
+            let mut bytes = [0u8; 16];
+            match read(control_r, &mut bytes) {
+                Ok(0) => listening = false,
+                Ok(n) => {
+                    for _ in bytes[..n].iter().filter(|&&b| b == CUT) {
+                        match cut.get_or_insert_with(|| close_egress(nft)) {
+                            Ok(()) => write_line(up_w, "cut"),
+                            Err(why) => write_line(up_w, &format!("cuterr {why}")),
+                        }
+                    }
+                }
+                Err(Errno::EINTR | Errno::EAGAIN) => {}
+                Err(_) => listening = false,
+            }
+        }
+        // SIGCHLD also comes from the nft run by `close_egress` and from the
+        // DNS stub, which `Stub::report` reaps.
+        while let Ok(Some(_)) = chld.read_signal() {}
+        match waitpid(s, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) | Err(Errno::EINTR) => {}
+            _ => return,
+        }
+    }
+}
+
+/// Adds the element [`ruleset::CUT_MARK`] to the [`ruleset::CUT_SET`]:
+/// from now on the ruleset refuses every packet that is not loopback, in
+/// both directions. Nothing else in the table changes.
+fn close_egress(nft: &Path) -> Result<(), String> {
+    let element = format!("{{ {} }}", ruleset::CUT_MARK);
+    let out = nft_command(nft)
+        .stdin(Stdio::null())
+        .args([
+            "add",
+            "element",
+            "inet",
+            ruleset::TABLE,
+            ruleset::CUT_SET,
+            &element,
+        ])
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", nft.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "nft add element failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
     Ok(())
 }
 
@@ -1786,6 +2000,8 @@ fn load_ruleset(nft: &Path, text: &str) -> Result<(), String> {
 fn list_table(nft: &Path) -> Result<String, String> {
     let out = nft_command(nft)
         .stdin(Stdio::null())
+        // nft prints `meta time` as a date in its own time zone.
+        .env("TZ", crate::nft_readback::LISTING_TZ)
         .args(["--json", "list", "table", "inet", ruleset::TABLE])
         .output()
         .map_err(|e| format!("cannot run {}: {e}", nft.display()))?;
@@ -1805,7 +2021,7 @@ fn verify_ruleset(nft: &Path, approval: &Approval, grant_counters: usize) -> Res
         .map_err(|e| format!("the loaded ruleset is not the one playpen built: {e}"))
 }
 
-fn report_counters(nft: &Path, grant_counters: usize, up: &OwnedFd) {
+fn report_counters(nft: &Path, grant_counters: usize, timed: bool, up: &OwnedFd) {
     let snapshot = list_table(nft);
     match snapshot
         .as_ref()
@@ -1817,6 +2033,13 @@ fn report_counters(nft: &Path, grant_counters: usize, up: &OwnedFd) {
             write_line(up, &format!("drops {json}"));
         }
         Err(e) => write_line(up, &format!("dropserr {e}")),
+    }
+    if let Ok(refused) = snapshot
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|json| ruleset::parse_refused_after_end(json, timed))
+    {
+        write_line(up, &format!("afterend {refused}"));
     }
     if grant_counters != 0
         && let Ok(snapshot) = snapshot
@@ -2915,7 +3138,15 @@ mod tests {
             asked: 0,
             synced: 0,
             outside: [None; FORWARDED.len()],
+            cut: None,
+            refused_after_end: None,
         };
+        st.handle_line("cuterr nft could not close egress");
+        assert_eq!(st.cut, Some(Err("nft could not close egress".into())));
+        st.handle_line("cut");
+        assert_eq!(st.cut, Some(Ok(())));
+        st.handle_line("afterend 12");
+        assert_eq!(st.refused_after_end, Some(12));
         st.handle_line("own 192.0.2.10 2001:db8::10 nonsense");
         let own: Vec<IpAddr> = ["192.0.2.10", "2001:db8::10"]
             .iter()

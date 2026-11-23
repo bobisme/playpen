@@ -17,35 +17,69 @@ pub use crate::nft_readback::verify_policy;
 pub const TABLE: &str = "playpen";
 /// Most distinct dropped destinations remembered per address family.
 pub const DROP_SET_SIZE: u32 = 1024;
+/// The set that closes all egress once it holds [`CUT_MARK`]. Empty when
+/// the ruleset is loaded.
+pub const CUT_SET: &str = "cut";
+/// The packet mark of every packet in the sandbox. Setting another mark
+/// needs a capability over the network namespace, which only the
+/// setup process has.
+pub const CUT_MARK: u32 = 0;
+/// Counter of the packets the cut refused on their way out.
+pub const CUT_COUNTER: &str = "cut";
+/// Counter of the packets refused on their way out because the approval's
+/// end time had passed.
+pub const LATE_COUNTER: &str = "late";
+/// The latest second `meta time` can hold: it counts nanoseconds since
+/// 1970 in 64 bits (2554-07-21T23:34:33Z). nft wraps larger values silently.
+pub const LATEST_END: i64 = 18_446_744_073;
+
+/// The second from which the time rule refuses traffic: the approval's end
+/// rounded down to a whole second (so never later than the end), and at
+/// most [`LATEST_END`]. `None` without an end time.
+#[must_use]
+pub fn end_second(approval: &Approval) -> Option<i64> {
+    approval
+        .ends_at
+        .map(|end| end.at().unix_timestamp().clamp(0, LATEST_END))
+}
 
 /// Renders the complete ruleset for `rules`.
 ///
 /// Output, input and forward chains all have policy drop. Output accepts
-/// established and related traffic, loopback destinations on `lo`, the
+/// loopback destinations on `lo`, established and related traffic, the
 /// kernel's own IPv6 neighbour discovery, and the approved destinations.
 /// Everything else is counted (in total and per destination) and rejected,
 /// so a blocked connection fails at once instead of hanging. A rule for an
 /// IPv4 network does not accept the network and broadcast addresses of any
 /// listed network (see [`Approval::covers_addr`]); they are counted and rejected
 /// like any other unapproved destination.
+///
+/// Between the loopback accepts and the established accept, in output and
+/// input, are the rules that end egress: the cut (every packet once
+/// [`CUT_SET`] holds [`CUT_MARK`]) and, when the approval has an end time,
+/// the time rule (every packet from [`end_second`] on). This renders no end
+/// time; see [`render_approval`].
 #[must_use]
 pub fn render(rules: &[AllowRule]) -> String {
     render_approval(&Approval::new(rules.to_vec(), None))
 }
 
-/// Renders an approval with the edge exclusions inherited from its source.
+/// Renders an approval with the edge exclusions inherited from its source,
+/// and its end time.
 #[must_use]
 pub fn render_approval(approval: &Approval) -> String {
     render_instrumented(approval, 0)
 }
 
-pub(crate) fn render_instrumented(approval: &Approval, grant_counters: usize) -> String {
-    let mut out = String::new();
-    // A table of our own; flush it first so a reload replaces it whole.
-    let _ = writeln!(out, "table inet {TABLE} {{}}");
-    let _ = writeln!(out, "delete table inet {TABLE}");
-    let _ = writeln!(out, "table inet {TABLE} {{");
+/// The table's counters and sets.
+fn declarations(out: &mut String, timed: bool, grant_counters: usize) {
     let _ = writeln!(out, "\tcounter dropped {{");
+    let _ = writeln!(out, "\t}}");
+    if timed {
+        let _ = writeln!(out, "\tcounter {LATE_COUNTER} {{");
+        let _ = writeln!(out, "\t}}");
+    }
+    let _ = writeln!(out, "\tcounter {CUT_COUNTER} {{");
     let _ = writeln!(out, "\t}}");
     for index in 0..grant_counters {
         let _ = writeln!(
@@ -62,26 +96,42 @@ pub(crate) fn render_instrumented(approval: &Approval, grant_counters: usize) ->
         let _ = writeln!(out, "\t\tcounter");
         let _ = writeln!(out, "\t}}");
     }
+    let _ = writeln!(out, "\tset {CUT_SET} {{");
+    let _ = writeln!(out, "\t\ttype mark");
+    let _ = writeln!(out, "\t\tflags dynamic");
+    let _ = writeln!(out, "\t}}");
+}
+
+pub(crate) fn render_instrumented(approval: &Approval, grant_counters: usize) -> String {
+    let end = end_second(approval);
+    let mut out = String::new();
+    // A table of our own; flush it first so a reload replaces it whole.
+    let _ = writeln!(out, "table inet {TABLE} {{}}");
+    let _ = writeln!(out, "delete table inet {TABLE}");
+    let _ = writeln!(out, "table inet {TABLE} {{");
+    declarations(&mut out, end.is_some(), grant_counters);
     let _ = writeln!(out, "\tchain output {{");
     let _ = writeln!(
         out,
         "\t\ttype filter hook output priority filter; policy drop;"
     );
-    let _ = writeln!(out, "\t\tct state established,related accept");
     let _ = writeln!(out, "\t\toif \"lo\" ip daddr 127.0.0.0/8 accept");
     let _ = writeln!(out, "\t\toif \"lo\" ip6 daddr ::1 accept");
+    // The kernel's own multicast listener reports and router solicitations
+    // when an interface comes up: dropped, but not counted, because the
+    // command did not send them. Before the rules that end egress, so they
+    // are not counted there either.
+    let _ = writeln!(
+        out,
+        "\t\tip6 daddr ff02::/16 icmpv6 type {{ mld-listener-report, mld2-listener-report, nd-router-solicit }} drop"
+    );
+    end_rules(&mut out, end, true);
+    let _ = writeln!(out, "\t\tct state established,related accept");
     // Neighbour discovery: only the two messages address resolution needs,
     // and only with hop limit 255 (RFC 4861), so it never leaves the link.
     let _ = writeln!(
         out,
         "\t\ticmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert }} ip6 hoplimit 255 accept"
-    );
-    // The kernel's own multicast listener reports and router solicitations
-    // when an interface comes up: dropped, but not counted, because the
-    // command did not send them.
-    let _ = writeln!(
-        out,
-        "\t\tip6 daddr ff02::/16 icmpv6 type {{ mld-listener-report, mld2-listener-report, nd-router-solicit }} drop"
     );
     for (index, rule) in approval.rules().iter().enumerate() {
         let matches = match_expr(rule, &approval.exclusions(rule));
@@ -119,8 +169,9 @@ pub(crate) fn render_instrumented(approval: &Approval, grant_counters: usize) ->
         out,
         "\t\ttype filter hook input priority filter; policy drop;"
     );
-    let _ = writeln!(out, "\t\tct state established,related accept");
     let _ = writeln!(out, "\t\tiif \"lo\" accept");
+    end_rules(&mut out, end, false);
+    let _ = writeln!(out, "\t\tct state established,related accept");
     let _ = writeln!(
         out,
         "\t\ticmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert }} ip6 hoplimit 255 accept"
@@ -134,6 +185,80 @@ pub(crate) fn render_instrumented(approval: &Approval, grant_counters: usize) ->
     let _ = writeln!(out, "\t}}");
     let _ = writeln!(out, "}}");
     out
+}
+
+/// The time rule (with an end time) and the cut rule. Only the output
+/// chain counts what they refuse: what arrives was not sent by the command.
+fn end_rules(out: &mut String, end: Option<i64>, output: bool) {
+    let count = |name: &str| {
+        if output {
+            format!(" counter name \"{name}\"")
+        } else {
+            String::new()
+        }
+    };
+    if let Some(second) = end {
+        if output {
+            let stamp = time::OffsetDateTime::from_unix_timestamp(second)
+                .ok()
+                .and_then(|t| {
+                    t.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                })
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "\t\t# From {stamp}, when the approval ends, everything but loopback is refused."
+            );
+        }
+        let _ = writeln!(out, "\t\tmeta time >= {second}{} drop", count(LATE_COUNTER));
+    }
+    let _ = writeln!(out, "\t\tmeta mark @{CUT_SET}{} drop", count(CUT_COUNTER));
+}
+
+/// Packets refused on their way out after the approval ended.
+///
+/// The sum of the [`LATE_COUNTER`] (present when `timed`) and
+/// [`CUT_COUNTER`] counters in `nft --json list table inet playpen`. A
+/// packet meets at most one of the two rules, so none is counted twice.
+///
+/// # Errors
+/// When the JSON does not parse, or a counter is missing, repeated or
+/// invalid.
+pub fn parse_refused_after_end(json: &str, timed: bool) -> Result<u64, String> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| format!("nft printed JSON that does not parse: {e}"))?;
+    let items = value
+        .get("nftables")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("nft JSON has no \"nftables\" array")?;
+    let mut late = None;
+    let mut cut = None;
+    for counter in items.iter().filter_map(|item| item.get("counter")) {
+        let slot = match counter.get("name").and_then(serde_json::Value::as_str) {
+            Some(LATE_COUNTER) => &mut late,
+            Some(CUT_COUNTER) => &mut cut,
+            _ => continue,
+        };
+        if slot.is_some() {
+            return Err("nft JSON repeats a counter of refused packets".into());
+        }
+        *slot = Some(
+            counter
+                .get("packets")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("invalid counter of refused packets")?,
+        );
+    }
+    let cut = cut.ok_or("nft JSON has no \"cut\" counter")?;
+    let late = match (timed, late) {
+        (true, Some(n)) => n,
+        (false, None) => 0,
+        (true, None) => return Err("nft JSON has no \"late\" counter".into()),
+        (false, Some(_)) => return Err("nft JSON has an unexpected \"late\" counter".into()),
+    };
+    late.checked_add(cut)
+        .ok_or_else(|| "the counters of refused packets overflow".into())
 }
 
 fn match_expr(rule: &AllowRule, excluded: &[std::net::Ipv4Addr]) -> String {
@@ -302,7 +427,7 @@ fn parse_elem(elem: &serde_json::Value, family: &str) -> Option<DroppedDest> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approval::{Net, Ports, parse_allow};
+    use crate::approval::{EndsAt, Net, Ports, parse_allow};
     use proptest::prelude::*;
     use std::net::Ipv4Addr;
 
@@ -340,6 +465,117 @@ mod tests {
         let text = render(&[]);
         assert_eq!(text.matches(" accept").count(), 7);
         assert!(!text.contains("dport 1"));
+    }
+
+    fn ending(end: &str) -> Approval {
+        Approval::new(
+            rules(&["192.0.2.1:443/tcp"]),
+            Some(EndsAt::parse(end).unwrap_or_else(|e| panic!("{e}"))),
+        )
+    }
+
+    /// The chain named `name` in `text`, from its header to its end.
+    fn chain<'a>(text: &'a str, name: &str) -> &'a str {
+        let start = text.find(&format!("chain {name} {{")).unwrap_or(0);
+        let rest = &text[start..];
+        &rest[..rest.find("\n\t}").unwrap_or(rest.len())]
+    }
+
+    #[test]
+    fn without_an_end_time_there_is_no_time_rule() {
+        let text = render_approval(&Approval::new(rules(&["192.0.2.1:443/tcp"]), None));
+        assert!(!text.contains("meta time"));
+        assert!(!text.contains("counter late"));
+        assert!(!text.contains("name \"late\""));
+        // The cut rule is always there; its set starts empty.
+        assert!(text.contains("\tset cut {\n\t\ttype mark\n\t\tflags dynamic\n\t}\n"));
+        assert!(text.contains("\t\tmeta mark @cut counter name \"cut\" drop\n"));
+        assert!(text.contains("\t\tmeta mark @cut drop\n"));
+        assert!(!text.contains("elements"));
+    }
+
+    #[test]
+    fn end_rules_follow_loopback_and_precede_everything_else() {
+        let text = render_approval(&ending("2026-12-01T12:34:56.7+01:00"));
+        assert_eq!(text.matches("meta time").count(), 2);
+        assert_eq!(text.matches("meta mark @cut").count(), 2);
+        assert_eq!(text.matches("\tcounter late {").count(), 1);
+        let output = chain(&text, "output");
+        let at = |needle: &str| output.find(needle).unwrap_or(usize::MAX);
+        let order = [
+            "oif \"lo\" ip daddr 127.0.0.0/8 accept",
+            "oif \"lo\" ip6 daddr ::1 accept",
+            "mld-listener-report",
+            "# From 2026-12-01T11:34:56Z, when the approval ends,",
+            "meta time >= 1796124896 counter name \"late\" drop",
+            "meta mark @cut counter name \"cut\" drop",
+            "ct state established,related accept",
+            "nd-neighbor-solicit",
+            "ip daddr 192.0.2.1 tcp dport 443 accept",
+            "counter name \"dropped\"",
+        ];
+        for pair in order.windows(2) {
+            assert!(at(pair[0]) < at(pair[1]), "{pair:?} in\n{output}");
+        }
+        let input = chain(&text, "input");
+        let at = |needle: &str| input.find(needle).unwrap_or(usize::MAX);
+        let order = [
+            "iif \"lo\" accept",
+            "meta time >= 1796124896 drop",
+            "meta mark @cut drop",
+            "ct state established,related accept",
+        ];
+        for pair in order.windows(2) {
+            assert!(at(pair[0]) < at(pair[1]), "{pair:?} in\n{input}");
+        }
+        // Arriving packets are refused but not counted.
+        assert!(!input.contains("counter"));
+    }
+
+    #[test]
+    fn end_second_rounds_down_and_stays_within_what_nft_holds() {
+        let second = |end: &str| end_second(&ending(end));
+        assert_eq!(second("2026-12-01T12:34:56Z"), Some(1_796_128_496));
+        assert_eq!(
+            second("2026-12-01T12:34:56.999999999Z"),
+            Some(1_796_128_496)
+        );
+        assert_eq!(second("1969-12-31T23:59:59Z"), Some(0));
+        assert_eq!(second("9999-12-31T23:59:59Z"), Some(LATEST_END));
+        assert_eq!(end_second(&Approval::new(vec![], None)), None);
+    }
+
+    #[test]
+    fn refused_after_end_sums_late_and_cut() {
+        let counters = |late: Option<u64>, cut: Option<u64>| {
+            let mut items = vec![serde_json::json!({"metainfo": {}})];
+            if let Some(n) = late {
+                items.push(serde_json::json!({"counter": {"name": "late", "packets": n}}));
+            }
+            if let Some(n) = cut {
+                items.push(serde_json::json!({"counter": {"name": "cut", "packets": n}}));
+            }
+            items.push(serde_json::json!({"counter": {"name": "dropped", "packets": 99}}));
+            serde_json::json!({ "nftables": items }).to_string()
+        };
+        assert_eq!(
+            parse_refused_after_end(&counters(Some(3), Some(4)), true),
+            Ok(7)
+        );
+        assert_eq!(
+            parse_refused_after_end(&counters(None, Some(4)), false),
+            Ok(4)
+        );
+        assert!(parse_refused_after_end(&counters(None, Some(4)), true).is_err());
+        assert!(parse_refused_after_end(&counters(Some(3), Some(4)), false).is_err());
+        assert!(parse_refused_after_end(&counters(Some(3), None), true).is_err());
+        assert!(parse_refused_after_end(&counters(Some(u64::MAX), Some(1)), true).is_err());
+        let twice = counters(None, Some(4)).replace(
+            "{\"metainfo\":{}}",
+            "{\"counter\":{\"name\":\"cut\",\"packets\":1}}",
+        );
+        assert!(parse_refused_after_end(&twice, false).is_err());
+        assert!(parse_refused_after_end("{}", false).is_err());
     }
 
     #[test]

@@ -34,6 +34,14 @@ If you used v0.1, these will be different:
 - **The start line** has new clauses about host sockets, exposed paths and
   the session; **the report** has the new fields `socket_guard`,
   `exposed`, `display`, `new_session` and `private_tty`.
+- **Egress ends in the firewall.** With an end time, the ruleset refuses
+  all traffic but loopback from the end second on (section 6.1). When
+  playpen stops the command because the approval ended or a re-read
+  withdrew the pass, it closes egress in the firewall before the notice
+  and SIGTERM (section 4.1). Packets refused this way are reported in the
+  new field `refused_after_end` and on their own summary line. The
+  ruleset has two more rules in each chain with an end time, and one
+  without (section 6). `playpen rules` takes `--until`.
 
 ## 1. Purpose and non-goals
 
@@ -112,7 +120,9 @@ written as JSON to `--report FILE` (section 4.5).
   Playpen binary needs an AppArmor profile granting `userns,` (see the
   AppArmor section of DESIGN.md).
 - Kernel support for network, PID, mount and IPC namespaces, nftables
-  with the `inet` family, dynamic sets with counters, and `reject`.
+  with the `inet` family, dynamic sets with counters, `reject`, and, for a
+  run with an end time, the `meta time` match (Linux 5.4 and nftables
+  0.9.3 or later).
 - Landlock ABI 9 or later (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`), with
   `landlock` in the kernel's active security modules. Without it `run`
   does not start unless `--without-landlock` is given.
@@ -211,8 +221,9 @@ single-address rule grants its own ports and protocol only when selected.
 **While the command runs, with `--pass`**, the supervisor re-reads the
 pass every 2 seconds (`pass::RECHECK_INTERVAL`) with the same loader, and
 once more just before the command starts. It stops the command, the same
-way as at the end time (SIGTERM, a grace of 3 seconds, then SIGKILL to the
-whole PID namespace), and prints why, when the pass:
+way as at the end time (egress closed in the firewall, then SIGTERM, a
+grace of 3 seconds, then SIGKILL to the whole PID namespace; see
+`--until`), and prints why, when the pass:
 
 - cannot be read or no longer validates (deleted, moved, made a symbolic
   link, made writable by others, a syntax error, a half-written file);
@@ -230,8 +241,9 @@ Any other edit (a raised or lowered ceiling, a later `valid_until`, a new
 destination, a changed `hostname`, `name`, `reference`, comment, or a
 destination not in use) prints once per new digest that the run continues
 under the rules loaded at start. Nothing an edit adds applies to the
-running command: the ruleset in the kernel is never changed after start,
-and the end time is never moved later. With `--pass-hosts`, a changed,
+running command: the only change made to the ruleset in the kernel after
+start is the cut that closes egress, and the end time is never moved
+later. With `--pass-hosts`, a changed,
 added or removed `hostname` of a single-address destination in use is such
 an edit too: it changes no rule, so the run continues, and `/etc/hosts`
 keeps the names written at start. The notice then says ``the hostname of
@@ -339,13 +351,27 @@ rule, so the running command is not stopped.
 ("unknown offset") is refused. A time at or before now is refused. With
 `--pass`, it may only make the end earlier: a time later than the pass's
 `valid_until` is refused (`--until can only end the run earlier`); equal
-or earlier replaces `valid_until` as the end time. While
-the command runs, when the time comes playpen prints why, sends SIGTERM to
-the command, and after a grace of 3 seconds kills the whole PID namespace
-with SIGKILL. The time has come when a monotonic deadline fixed at the
+or earlier replaces `valid_until` as the end time.
+
+The end time is enforced twice. The ruleset refuses every packet that is
+not loopback from the end second on (the end time rounded down to a whole
+second; section 6.1). This rule is in the kernel and does not depend on
+playpen running: it holds while playpen is stopped or stuck. It reads the
+system's wall clock (nftables `meta time`), so setting the clock forward
+closes egress early and setting it back delays the rule.
+
+The supervisor stops the command when a monotonic deadline fixed at the
 start of the sandbox has passed, or the system clock shows the end time,
 whichever is first: setting the clock back does not extend the run, and
-time the machine spent suspended counts.
+time the machine spent suspended counts. It then asks the sandbox to close
+egress in the firewall (the cut: section 6.1) and waits up to 2 seconds
+(`sandbox::CUT_LIMIT`) for the answer. When the cut is confirmed, it
+prints why, sends SIGTERM to the command, and after a grace of 3 seconds
+kills the whole PID namespace with SIGKILL. During the grace the command
+can still use loopback but nothing else, so it cannot finish politely over
+the network. When the cut fails or is not confirmed in time, playpen says
+so and kills the whole PID namespace with SIGKILL at once, without the
+grace.
 
 **Host Unix sockets.** By default the command cannot connect to, or send
 by address to, any pathname Unix socket created outside the sandbox
@@ -422,7 +448,11 @@ or stuck for 5 s ...; the command is paused until playpen continues`. When
 playpen is heard again, init continues the processes it stopped, and
 playpen checks the end time and re-reads the pass if due. Five seconds
 is the silence threshold. The time until processes stop also depends on
-Linux scheduling the sandbox init and delivering its stop signals.
+Linux scheduling the sandbox init and delivering its stop signals. The
+ruleset's time rule does not wait for either: from the end second on, a
+command that still runs while playpen is stopped reaches nothing but
+loopback. A pass revoked while playpen is stopped is not seen until
+playpen runs again.
 
 **`--report FILE`**. Write the JSON report to `FILE`, for every outcome,
 refusals by policy included. The file is created (truncated) before
@@ -477,7 +507,12 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   `with no time limit` when there is no `--until`; with `--no-network`:
   `no network, loopback only, ...`. With `--pass` the line starts `under
   pass ID ("NAME", owner "OWNER", sha256:DIGEST, window ends TIME,
-  destinations LABEL, ...): allowing only ...` and may continue with the
+  destinations LABEL, ...): allowing only ...`. With network and an end
+  time, `; from END-SECOND the firewall itself refuses all traffic but
+  loopback` follows `everything else is dropped`, where END-SECOND is the
+  end time rounded down to the second (with `--pass`: `; from END-SECOND,
+  or once a re-read withdraws the pass, the firewall itself refuses all
+  traffic but loopback`). With `--pass` the line may continue with the
   `hostname` hint above. With `--pass-hosts` the names include the entries
   from the pass (`NAME=ADDR (pass: LABEL)`) and any `; --host NAME replaces
   ...`. It says nothing about ceilings. Then, with `--capture`,
@@ -490,20 +525,28 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   session, without a controlling terminal` in detached mode, or
   `; private controlling terminal` with `--private-tty`. The NOTE lines
   about `names` and about `--pass-hosts` follow it, one per line;
-- when the end time is reached: what happened and that SIGKILL follows;
+- when the end time is reached: `the approval ended at TIME; the firewall
+  now refuses all traffic but loopback; sending SIGTERM to the command
+  (SIGKILL in 3 s)`. When egress could not be closed: `the approval ended
+  at TIME; egress could not be closed in the firewall (WHY), so the
+  command is killed now with SIGKILL, without the grace`;
 - with `--pass`, when a re-read finds a harmless edit: `the pass was edited
   (now sha256:...); nothing this run uses changed, so the command continues
   under the rules loaded at start. ...`;
 - with `--pass`, when a re-read withdraws the approval: the reason (for
   example `the pass no longer permits anything (revoked): ...`, `the pass
   can no longer be read (io: ...)`, `the pass was edited and destination
-  `web`, which this run uses, changed`), then that SIGTERM is sent and
-  SIGKILL follows;
+  `web`, which this run uses, changed`), then `; the firewall now refuses
+  all traffic but loopback; sending SIGTERM to the command (SIGKILL in 3
+  s)`, or the same SIGKILL-at-once ending as at the end time;
 - at the end: how the command ended; then either `no packets to
   unapproved destinations were dropped`, or a block between lines of
   asterisks starting `WARNING: N packet(s) to UNAPPROVED destinations were
   dropped.` listing each destination with protocol, port and packet count;
-  then, with `--capture`, `packet capture PATH: N bytes, sha256 HEX`.
+  then `N packet(s) refused after the approval ended` when that count was
+  read and is not 0, or playpen stopped the command because the approval
+  ended or the pass withdrew it; then, with `--capture`, `packet capture
+  PATH: N bytes, sha256 HEX`.
 - then, when the command looked up names that no `--host` maps: `The
   command looked up names that have no --host mapping:`, one line `NAME: N
   lookup(s)` per name (as shown in "Name lookups"), `(the list is
@@ -592,7 +635,9 @@ Version 1 records have `version`, a sequence number starting at 1, `event`
 and `details`. Ignore unfamiliar fields. Buffer partial lines until a newline.
 A validated request emits `validated`; `starting` is immediately before the
 supervisor releases the workload. `stopping` carries `reason` of `expiry` or
-`pass_withdrawn`. `terminal` carries the outcome, startup evidence, child
+`pass_withdrawn`, and `egress_closed`: true when the firewall confirmed the
+cut before SIGTERM, false when the command is killed at once because it
+did not (section 4.1, `--until`). `terminal` carries the outcome, startup evidence, child
 exit/signal, wrapper exit and drop assertion. A policy refusal can emit just
 the terminal record. Pre-parse errors and an invalid descriptor have no stream.
 The supervisor sets the supplied pipe writer nonblocking and closes it on a
@@ -632,21 +677,25 @@ lifetimes.
 ### 4.3 `playpen rules`
 
 ```text
-playpen rules [--allow SPEC]... [--format text|pretty|json]
-playpen rules --pass FILE [--only LABEL]... [--pass-hosts]
+playpen rules [--allow SPEC]... [--until RFC3339] [--format text|pretty|json]
+playpen rules --pass FILE [--only LABEL]... [--pass-hosts] [--until RFC3339]
               [--format text|pretty|json]
 ```
 
 Prints the ruleset that `run` would load for these rules. Sends nothing,
 creates nothing. Text: the ruleset. JSON: `{"allowed": [SPEC...], "pass":
-{...} or null, "ruleset": "..."}` with canonical specs; `pass` has the same
-fields as in the report (4.5). A bad spec is refused (exit 2, nothing
-printed on stdout). An empty `--allow` list is allowed here and prints the
-ruleset that allows nothing. With `--pass`, the pass is loaded and checked
-exactly as by `run` (window included: an expired, not-yet-valid or revoked
-pass is refused), and `--allow` beside it, `--only` without it, and an
-unknown label are refused. `--pass-hosts` is accepted as by `run` and
-changes nothing in the output: host names add no rule.
+{...} or null, "until": TIME or null, "ruleset": "..."}` with canonical
+specs; `pass` has the same fields as in the report (4.5). A bad spec is
+refused (exit 2, nothing printed on stdout). An empty `--allow` list is
+allowed here and prints the ruleset that allows nothing. With `--pass`, the
+pass is loaded and checked exactly as by `run` (window included: an
+expired, not-yet-valid or revoked pass is refused), and `--allow` beside
+it, `--only` without it, and an unknown label are refused. `--pass-hosts`
+is accepted as by `run` and changes nothing in the output: host names add
+no rule. `--until` is checked as by `run` (a time in the past, or with
+`--pass` later than `valid_until`, is refused) and adds the time rule
+(section 6.1); with `--pass` and no `--until` the time rule is at
+`valid_until`.
 
 ### 4.4 `playpen doctor`
 
@@ -798,6 +847,7 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `dropped_error` | string or null | why the counters could not be read |
 | `lookups` | object or null | the names the command looked up: `{"names": [{"name", "count", "mapped"}], "truncated": bool}`, in the order first asked, as shown in "Name lookups" (4.1); `mapped` is true for a `--host` name; null when the command did not run or the record could not be read |
 | `lookups_error` | string or null | why the record of names could not be read |
+| `refused_after_end` | integer or null | packets the command sent that the firewall refused because the approval had ended: by the time rule from the end second on, or by the cut once playpen stopped the command (section 6.1). Not part of `dropped`, not unapproved destinations, and not judged by `--fail-on-drop`. Null when the counters could not be read |
 | `socket_guard` | `"landlock"` or `"mounts_only"` | how host Unix sockets were kept from the command; `"mounts_only"` with `--without-landlock` |
 | `exposed` | array of strings | every exposed path (`--expose` and `--display`), canonical once checked; the `--expose` values as typed when refused |
 | `private_tty` | bool | whether the caller requested a private controlling terminal |
@@ -816,8 +866,9 @@ For a child exit of zero, violated or unknown makes playpen exit 1. A nonzero
 child status is retained; signals retain their normal status, and a stop by
 expiry or pass revocation cannot become success. Refusal and setup failures
 retain their existing statuses. This counts dropped IP packets, not names
-the stub answered "no such name", Unix sockets, or packets that never
-reached the ruleset. Without the
+the stub answered "no such name", Unix sockets, packets that never reached
+the ruleset, or packets refused after the approval ended
+(`refused_after_end`). Without the
 option, the existing exit contract and JSON shape are unchanged.
 
 ### Grant use in private reports
@@ -958,11 +1009,18 @@ Not part of the stable interface, hidden from `--help`:
 - `run --lo-addr ADDR` adds `ADDR` to the sandbox's `lo` before the
   ruleset is loaded. Used by tests and `doctor` to have destinations that
   exist only inside the sandbox.
-- `playpen probe reach|privs|resolve|dns|unix|unix-send|unix-recv-fd|stdout-reconnect|fds|tty|signals|listen` are the checks
+- `playpen probe reach|privs|resolve|dns|unix|unix-send|unix-recv-fd|stdout-reconnect|fds|tty|signals|listen|send` are the checks
   run inside the sandbox by `doctor` and the tests (`unix` connects to Unix
-  sockets and closes at once, writing nothing; `listen` reports
-  connections to a TCP listener; `dns [--tcp] HEX` sends one DNS message
-  to the stub and describes the reply).
+  sockets and closes at once, writing nothing; `listen ADDR:PORT/tcp`
+  reports connections to a TCP listener, `listen ADDR:PORT/udp` each
+  datagram with its payload and the wall-clock time in nanoseconds;
+  `dns [--tcp] HEX` sends one DNS message to the stub and describes the
+  reply).
+- `playpen probe send ADDR:PORT/udp [--every-ms MS]` sends the datagram
+  `1`, `2`, ... every `MS` milliseconds (default 50) until killed, and
+  prints one JSON line per attempt: `seq`, the wall-clock time `at_ns`
+  just before the send, `sent`, and `error` when the send failed. Used by
+  the tests of the end of egress.
 - `run --pass-recheck-ms MS` re-reads the pass every `MS` milliseconds
   instead of every 2 seconds. Clamped to 50 ms .. 2 s, so it can only make
   the re-read more frequent. Used by the tests.
@@ -995,7 +1053,12 @@ Each step either succeeds or stops the run with a message that ends
    in all chains, and the drop-accounting declarations and rules. Supported
    schema-1 expressions cover connection state, interfaces, IP addresses
    and prefixes, IPv6 hop limits and ICMP types, transport ports and ranges,
-   set additions, counters and verdicts. Handles and changing counter values
+   the packet mark against the `cut` set, the time, set additions, counters
+   and verdicts. The `cut` set must be empty. `nft --json` prints the time
+   rule's operand as a date without an offset (`"2026-12-01 12:34:56"`) in
+   the time zone of the `nft` process, so C lists the table with
+   `TZ=UTC0` and reads that date as UTC; the time rule must be at exactly
+   the end second. Handles and changing counter values
    are ignored. Unknown material expressions stop setup. Only then does C
    report "ready". Until this point the namespace has only `lo`. Playpen
    relies on the kernel and the configured nft binary to report the installed
@@ -1073,6 +1136,15 @@ SIGCONT it asks I to continue them. P sends I one byte every second; after
 5 seconds without any, I stops the sandbox's processes itself until the
 next one (section 4.1). I reaps orphaned processes.
 
+C waits for S and, at the same time, reads a third pipe from P that I never
+sees. When P stops the command because the approval ended or a re-read
+withdrew the pass, it writes one byte there; C adds the cut (section 6.1)
+and answers `cut`, or `cuterr WHY` when `nft` failed, on the pipe it
+reports on. P prints the notice and sends SIGTERM only after `cut`. On
+`cuterr`, or no answer within 2 seconds, P prints that egress could not be
+closed and sends SIGKILL to I at once. If the sandbox has ended before it
+answers, there is nothing left to cut.
+
 If any step before the command starts fails and
 `kernel.apparmor_restrict_unprivileged_userns` is 1, the message adds that
 AppArmor's restriction is the likely cause and what an administrator can do
@@ -1084,7 +1156,8 @@ kernel kills every process left in the PID namespace. The moment P reads
 that status is the report's `ended_at`. C then closes D's
 control pipe; D stops and sends its record of names (within 2 seconds, or
 C kills it and reports why). C reports the record, lists the table again to
-read the counters, reports them, and exits. P stops pasta
+read the counters (`dropped`, the drop sets, the grant counters, `late`
+and `cut`), reports them, and exits. P stops pasta
 if it is still running (pasta also exits when the namespace's process is
 gone; it looks once a second), removes pasta's PID file and its private
 directory, prints the summary, writes the report, and exits. With
@@ -1104,30 +1177,51 @@ of C, between two packets.
 
 In this order:
 
-1. `ct state established,related` accepted (replies, and ICMP errors for
-   accepted flows);
-2. loopback inside the sandbox: destination `127.0.0.0/8` or `::1` on `lo`
+1. loopback inside the sandbox: destination `127.0.0.0/8` or `::1` on `lo`
    accepted;
-3. IPv6 neighbour solicitation and advertisement with hop limit 255
-   accepted (address resolution with pasta's side of the link);
-4. kernel-generated IPv6 MLD reports and router solicitations to
+2. kernel-generated IPv6 MLD reports and router solicitations to
    `ff02::/16` dropped without being counted;
-5. one accept rule per `--allow`: destination address or network,
+3. with an end time only, the time rule: `meta time >= END-SECOND counter
+   name "late" drop`, where END-SECOND is the end time rounded down to a
+   whole second, in seconds since 1970 (at most 18446744073, in 2554, the
+   largest nftables can hold). From that second on, every packet not
+   accepted by 1 is dropped, whatever else would accept it. A send fails
+   with "Operation not permitted"; a TCP connect waits for its timeout. The
+   rule reads the wall clock (`CLOCK_REALTIME`) of the moment the packet is
+   filtered;
+4. the cut: `meta mark @cut counter name "cut" drop`. The set `cut` (type
+   `mark`) is empty at start. When playpen stops the command because the
+   approval ended or a re-read withdrew the pass, C adds the element `0`
+   (`nft add element inet playpen cut { 0 }`). The command cannot set a
+   packet mark, so every packet has mark 0, and from then on every packet
+   not accepted by 1 is dropped. Nothing else is changed in the ruleset
+   while the command runs;
+5. `ct state established,related` accepted (replies, and ICMP errors for
+   accepted flows). It comes after 3 and 4, so neither an open connection
+   nor a reply outlives the approval;
+6. IPv6 neighbour solicitation and advertisement with hop limit 255
+   accepted (address resolution with pasta's side of the link);
+7. one accept rule per `--allow`: destination address or network,
    protocol, destination port range. A rule for an IPv4 network does not
    accept the network address and the broadcast (all-ones) address of any
    listed network of /30 or broader (`ip daddr NET ip daddr != { ... }`):
    they are not hosts, and a packet to the all-ones address may reach every
-   host on the network. They fall through to 6 like any other unapproved
+   host on the network. They fall through to 8 like any other unapproved
    destination. For a pass, the listed networks used for these exclusions
    include unselected destinations. An address listed on its own (`203.0.113.255:443/tcp`) is a
    host and is accepted on that rule's ports and protocol. /31 and /32 and
    IPv6 networks have no such addresses. Hallpass also refuses an edge
    address (`network-or-broadcast`) unless the full pass lists it as a
    single host;
-6. everything else: added to a per-destination set with a counter
+8. everything else: added to a per-destination set with a counter
    (address, protocol, port; port 0 for protocols other than TCP and UDP),
    counted in the `dropped` counter, and rejected with ICMP
    administratively prohibited.
+
+The packets counted by `late` and `cut` are reported together as
+`refused_after_end` (section 4.5). A packet meets at most one of the two
+rules, so none is counted twice. After the end, a packet to an unapproved
+destination is refused by 3 or 4 and counted there, not in `dropped`.
 
 The finite packet-scope regression builds 255 valid full passes from an
 eight-destination universe and checks all 6,305 nonempty full-pass/subset
@@ -1147,17 +1241,22 @@ So by default:
 |---|---|
 | IPv4 and IPv6 to unapproved destinations | dropped and counted (TCP connect fails with "No route to host" over IPv4 and "Permission denied" over IPv6, UDP send with "Operation not permitted") |
 | ICMP and ICMPv6 (ping and others) | dropped and counted; cannot be approved |
-| DNS | no DNS: the only nameserver is the stub on the sandbox loopback (127.0.0.1 port 53), which answers `--host` names, says every other name does not exist, and forwards nothing; port 53 elsewhere is not approved unless you approve it |
+| DNS | no DNS: the only nameserver is the stub on the sandbox loopback (127.0.0.1 port 53), which answers `--host` names, says every other name does not exist, and forwards nothing; it is loopback, so it still answers after the approval ends; port 53 elsewhere is not approved unless you approve it |
 | the host's loopback | unreachable: pasta maps nothing to it and forwards no loopback ports |
-| the sandbox's own loopback (`127.0.0.0/8`, `::1`) | allowed |
+| the sandbox's own loopback (`127.0.0.0/8`, `::1`) | allowed, also after the approval ends |
+| everything but loopback, after the approval ended or the cut | dropped and counted in `refused_after_end` |
 | the sandbox's own non-loopback addresses (copied by pasta from the host) | treated like any other destination: only if approved; such traffic stays inside the sandbox anyway |
 
 ### 6.2 Input chain (policy drop) and forward chain (policy drop)
 
-Input accepts established/related traffic, anything arriving on `lo`, and
-IPv6 neighbour solicitation/advertisement with hop limit 255. So nothing
-from outside can open a connection to the command. Forward accepts
-nothing.
+Input, in this order: accepts anything arriving on `lo`; with an end
+time, drops everything else from the end second on (`meta time >=
+END-SECOND drop`); drops everything else once the cut is in place (`meta
+mark @cut drop`); accepts established/related traffic and IPv6 neighbour
+solicitation/advertisement with hop limit 255. So nothing from outside can
+open a connection to the command, and after the approval ends nothing from
+outside reaches it. The two input rules have no counter: what arrives was
+not sent by the command. Forward accepts nothing.
 
 ### 6.3 pasta options
 
@@ -1279,11 +1378,20 @@ Not guarded against, or known limits:
   sandbox's init, does not reach the command (section 5);
 - When SIGSTOP reaches playpen itself, its deadline and pass checks pause.
   The sandbox init begins freezing the command when it observes 5 seconds
-  of silence (section 4.1).
+  of silence (section 4.1). The ruleset's time rule does not pause: from
+  the end second on, only loopback works. A revocation is not seen while
+  playpen is stopped;
+- the time rule reads the wall clock. Setting the clock back delays it by
+  as much (the supervisor's monotonic deadline still stops the command and
+  adds the cut); setting it forward closes egress early. Because nftables
+  takes whole seconds, egress closes up to 1 second before an end time
+  that is not a whole second;
 - the command can open the caller's other terminals (`/dev/pts/N`);
 - with `--pass`: a revocation or edit takes effect when a scheduled re-read observes it
-  (normally every 2 seconds), followed by the grace; traffic in that time is still allowed. Who
-  can write the pass file can also restore it between two re-reads.
+  (normally every 2 seconds); traffic until then is still allowed. From
+  that re-read on, the cut refuses all but loopback before the notice and
+  during the grace. Who can write the pass file can also restore it
+  between two re-reads.
   Ceilings are not enforced by playpen.
 
 DESIGN.md has the full list with the reasons.

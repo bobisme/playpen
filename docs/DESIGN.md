@@ -401,11 +401,14 @@ re-reading the pass in I would put a second copy of that judgement in the
 process that sits beside the command. Why 5 seconds and not 2: a freeze is
 visible to the command (SIGSTOP and SIGCONT interrupt some system calls,
 and a shell inside sees its jobs stop), so it must not happen because P was
-slow to be scheduled; 5 seconds is the size of the gap already accepted for
-a revocation (re-read plus grace). What is left is those 5 seconds, and the
+slow to be scheduled; 5 seconds was the size of the gap accepted for a
+revocation (re-read plus grace). What is left is those 5 seconds, and the
 freeze's own limit: a process that forks faster than 20 passes over `/proc`
 can stay ahead of it until the next pass a second later. The filter itself
-is in the kernel and keeps working throughout.
+is in the kernel and keeps working throughout, and so does its time rule:
+from the end second on, a command that still runs while P is stopped
+reaches nothing but loopback (see "Ending egress in the firewall"). What
+the 5 seconds still leave open is a revocation, which only P can see.
 
 **New session where `TIOCSTI` works.** Where the kernel still lets an
 unprivileged process push input into its controlling terminal (kernels
@@ -658,13 +661,15 @@ command starts, and judges the result:
   loaded at start**.
 
 Why keep running rather than stop on any change: the ruleset in the kernel
-is fixed when the sandbox starts, and playpen never changes it afterwards
-(C, the process that holds the capabilities over the network namespace,
-only waits after "go" and reads the drop counters at the end; reloading
-rules mid-run would add a second load, and a moment of changing rules, to
-the most sensitive step). So an edit can never widen the running command's
-access, whatever it says, and every edit that would narrow what is in use
-already stops it. What is left (a raised ceiling, a later `valid_until`, a
+is fixed when the sandbox starts. The one change playpen makes afterwards
+is the cut, one set element that refuses everything but loopback when the
+command is being stopped (C, the process that holds the capabilities over
+the network namespace, otherwise only starts the DNS stub after "go",
+waits, and collects the stub's record and the counters at the end;
+reloading rules mid-run would add a second load, and
+a moment of changing rules, to the most sensitive step). So an edit can
+never widen the running command's access, whatever it says, and every edit
+that would narrow what is in use already stops it. What is left (a raised ceiling, a later `valid_until`, a
 new destination, a corrected `reference`) changes nothing the command can
 do. Stopping a long scan because the owner raised a ceiling it does not
 even use would only teach operators to avoid editing the pass during a
@@ -688,6 +693,97 @@ the supervisor requests SIGKILL if needed. A delayed supervisor or init and
 kernel signal delivery affect when the command actually stops. The hidden
 `--pass-recheck-ms` may shorten the poll interval in tests.
 
+## Ending egress in the firewall
+
+Before this, the command could reach its approved destinations until it
+exited: through the re-read interval, the 3-second grace after SIGTERM,
+and, while P was stopped, up to 5 more seconds before the freeze. Two
+things now close that in the kernel.
+
+**The time rule.** With an end time, both the output and the input chain
+have `meta time >= END-SECOND drop`, after the loopback accepts and before
+everything else, `ct state established,related accept` included. So from
+the end second on, no new connection, no packet of an open one and no
+reply gets through, and loopback still works. The rule is in the ruleset
+loaded and verified at start, so it holds whatever P does afterwards:
+stopped with SIGSTOP, stuck, or slow to be scheduled. Details:
+
+- nft takes the time as whole seconds since 1970. A fraction is a syntax
+  error, and nanoseconds are read as seconds. playpen rounds the end time
+  down, so egress closes up to 1 second early, never late. It also clamps
+  at 18446744073 (2554-07-21T23:34:33Z): nft stores the time in
+  nanoseconds in 64 bits, and a larger value wraps to a time in the past.
+- `meta time` is the wall clock (`CLOCK_REALTIME`) when the packet is
+  filtered, the clock P's own wall check reads. Setting the clock forward
+  closes egress early, as it stops the run early. Setting it back delays
+  the rule by as much; P's monotonic deadline still stops the command on
+  time and adds the cut, so the delay matters only while P is also
+  stopped. Suspend counts, as on the wall clock.
+- Drop, not reject. In the input chain a reject would itself send an ICMP
+  error out after the end; a drop sends nothing. The output chain uses the
+  same verdict. A UDP send then fails with "Operation not permitted"; a
+  TCP connect waits for its timeout instead of failing at once, which is
+  acceptable for a command that is being stopped.
+- The output rule counts in its own counter, `late`. These packets are
+  reported apart from drops (`refused_after_end`) and are not judged by
+  `--fail-on-drop`: a command that was using an approved destination
+  legitimately when the approval ended has not tried to reach a place
+  nobody approved, and a normal end must not look like one. The input rule
+  has no counter: what arrives was not sent by the command.
+- The kernel's own MLD reports and router solicitations are dropped
+  silently before the time rule, so they are not counted there either.
+- Loopback stays open, so the DNS stub on 127.0.0.1 still answers, and
+  its record of names includes lookups made during the grace. Outbound
+  packets these rules refuse never reach pasta, so a `--capture` file has
+  none of them.
+
+**The cut.** The end time does not cover a pass that is revoked, deleted
+or edited during the run. For that, and for a monotonic deadline that
+comes before the wall clock, the ruleset always has a set `cut` (type
+`mark`, empty at start) and, beside the time rule in both chains, `meta
+mark @cut drop`. When P decides to stop the command, it asks C, which
+holds the capabilities over the network namespace, to add the element `0`
+(`nft add element inet playpen cut { 0 }`). Every packet has mark 0: the
+ruleset sets no marks, and the command cannot (`SO_MARK` needs
+`CAP_NET_ADMIN` or `CAP_NET_RAW` over the network namespace; inside, it
+fails with "Operation not permitted"). From then on only loopback
+works. Why an element and not a new rule or a reload: adding an element is
+one small transaction that changes no rule, can only narrow, and leaves the
+verified shape of the ruleset as it was. Its counter `cut` is reported
+with `late`; a packet meets at most one of the two rules.
+
+**Asking C.** P has a pipe to C alone. The pipe it uses for "go" cannot
+carry the request: after "go", I reads that pipe, and a byte for C could
+be read by I instead. A signal would not do either: any process of the
+caller's user can send one, and it brings no answer. The pipe's write end
+is held only by P. C waits for S and reads this pipe in one `poll` loop
+(with a signalfd for SIGCHLD), so later duties for C while the command
+runs are one more descriptor there. C answers `cut`, or `cuterr WHY` when
+`nft` failed, on the pipe it already reports on.
+
+**The order.** P prints the notice and sends SIGTERM only after C has
+answered `cut`, so nothing the command sends after the notice leaves the
+sandbox. P waits up to 2 seconds (`CUT_LIMIT`). When C answers `cuterr` or
+does not answer in time, P says that egress could not be closed and sends
+SIGKILL at once, without the grace: a grace with egress open is the gap
+this closes. When the sandbox has ended while P waits, there is nothing
+left that could send.
+
+**No polite finish over the network.** During the 3-second grace the
+command can still use loopback and its files, but nothing else. A command
+that would send a last report or close a session with an approved server
+cannot. That is the decision: the approval has ended or was withdrawn,
+and the grace exists to let the command stop cleanly on this machine, not
+to use the network after the approval.
+
+**Reading it back.** `nft --json` prints the time rule's operand as a
+date without an offset (`"2026-12-01 12:34:56"`), in the time zone of the
+`nft` process, with or without `--numeric`. On a machine whose local zone
+is not UTC the readback would name another second. C runs `nft` with
+`TZ=UTC0` for every listing and the comparator reads the date as UTC; the
+time rule must be at exactly the end second. The `cut` set must be empty
+at start.
+
 ## The mechanism, step by step
 
 The process tree and the order are given in the spec. The points that
@@ -700,9 +796,11 @@ matter for safety:
 2. **Read back the installed policy.** After loading, Playpen compares
    the JSON for its table with the typed approval before reporting ready.
    It checks table family, chain hooks, priorities and policies, ordered rule
-   expressions and verdicts, and the accounting sets and counter. It
-   normalizes the supported numeric and symbolic spellings and ignores
-   handles, counter values and runtime set elements. Unknown material
+   expressions and verdicts, and the accounting sets and counters,
+   including the time rule and the empty `cut` set. It normalizes the
+   supported numeric and symbolic spellings (and reads the time, listed
+   with `TZ=UTC0`, as UTC) and ignores handles, counter values and the
+   elements of the drop sets. Unknown material
    objects or expressions fail closed. A real-load test adapter reports a
    narrower port range while preserving the rule count and confirms that
    the workload never starts. This check trusts Linux and the selected
@@ -975,13 +1073,14 @@ it, but only when the name still leads to the file it created.
 | The display server typing into host windows | display sockets refused and hidden unless `--display` | yes |
 | Input pushed into the operator's terminal (`TIOCSTI`) | refused by the kernel (`legacy_tiocsti = 0`), else a separate session with either no controlling terminal or a private one | yes (both modes; see the Unix sockets section for what that shows here) |
 | The command running on while playpen is suspended (Ctrl-Z), unchecked by the end time and the pass re-read | P freezes every process in the sandbox through I before it stops | yes, with a child outside the terminal's process group; the test fails without the freeze |
-| The command running on while playpen is stopped with SIGSTOP (which it cannot catch) or is stuck | I freezes the sandbox after 5 s without a byte from P, until P is heard again | yes (`sigstop_of_playpen_itself_freezes_the_command`: the end time passes while playpen is stopped; the command does not run on, and is stopped when playpen continues) |
+| The command running on while playpen is stopped with SIGSTOP (which it cannot catch) or is stuck | I freezes the sandbox after 5 s without a byte from P, until P is heard again; from the end second the time rule refuses all but loopback meanwhile | yes (`sigstop_of_playpen_itself_freezes_the_command`: the end time passes while playpen is stopped; the command does not run on, and is stopped when playpen continues. `the_end_time_closes_egress_while_playpen_is_stopped`: playpen stopped from before the end to after it, less than 5 s; a UDP sender inside reaches a fixture on a fake host before the end and not once after, and the fixture's log agrees) |
 | ptrace of the privileged helper or of playpen | helpers non-dumpable; playpen and other host processes invisible in the PID namespace; Yama ptrace_scope 1 on this machine adds another layer | `/proc/1/mem` and `/proc/1/ns/user` denied |
 | A fake or broken `nft` | output structure verified after load | yes |
 | pasta not coming up | its exit status is checked; the command is not started | yes (fake pasta) |
-| Approval running out while the command runs | timer in playpen: SIGTERM, then SIGKILL after 3 s to the PID namespace's init | yes, both paths |
-| A pass revoked, deleted or edited (destination in use) while the command runs | re-read every 2 s; SIGTERM, then SIGKILL after 3 s | yes (revoke, delete, port change; and SIGKILL for a command that ignores SIGTERM after a revocation) |
-| A pass edited to add a destination or extend the window during a run | rules and end time fixed at start; never reloaded | yes (added destination stays blocked) |
+| Approval running out while the command runs | the time rule refuses all but loopback from the end second, in both chains; timer in playpen: the cut, SIGTERM, then SIGKILL after 3 s to the PID namespace's init | yes, both paths; loopback still works after the end, an approved address does not (`loopback_still_works_after_the_end`) |
+| The command using approved destinations during the grace | the cut, confirmed before the notice and SIGTERM; SIGKILL at once when it is not confirmed within 2 s | yes (`a_revoked_pass_closes_egress_before_the_notice`: a command that ignores SIGTERM keeps sending through its grace, and the fixture gets nothing after the notice; `a_failed_cut_kills_the_command_at_once`: an `nft` that fails or hangs on the cut) |
+| A pass revoked, deleted or edited (destination in use) while the command runs | re-read every 2 s; the cut; SIGTERM, then SIGKILL after 3 s | yes (revoke, delete, port change; and SIGKILL for a command that ignores SIGTERM after a revocation) |
+| A pass edited to add a destination or extend the window during a run | rules and end time fixed at start; never reloaded; the only change, the cut, narrows | yes (added destination stays blocked) |
 | A pass swapped for a symbolic link, or made writable by others | hallpass's loader refuses both, at start and on every re-read | yes, at start (symlink, mode 0666) and during the run (renamed over by a symlink; mode 0620 and 0602) |
 | `--allow` adding a destination beside a pass | refused | yes |
 | The command reading or changing the packet capture while it runs | the capture's path is `/dev/null` inside, as with `--hide` | yes: the command finds a character device at the path |
@@ -1007,8 +1106,9 @@ it, but only when the name still leads to the file it created.
   network path.
 - **SIGSTOP to playpen itself.** Unlike Ctrl-Z it cannot be caught. The
   sandbox is frozen by its init after 5 seconds without a sign of P; for
-  those 5 seconds the end time and the pass re-read are not enforced. The
-  kernel's filter keeps working.
+  those 5 seconds the pass re-read is not done, so a revocation is not
+  seen. The kernel's filter keeps working, and from the end second on its
+  time rule refuses all but loopback.
 - **VM sockets (AF_VSOCK).** The nft table does not see them. In the
   kernel's default `global` mode the command reaches the hypervisor host
   from a VM with a vsock device, and the machine's VMs and vsock listeners
@@ -1042,7 +1142,9 @@ it, but only when the name still leads to the file it created.
   machine that was suspended (the monotonic clock stands still meanwhile)
   stops the command when it wakes after the end, instead of giving it the
   time slept on top. A clock set forward past the end stops the command at
-  once.
+  once. The ruleset's time rule follows the wall clock too: a clock set
+  back delays it by as much, so while P is also stopped, egress stays open
+  past the end until the wall clock reaches it or P runs again.
 - **What the capture holds.** A `--capture` file holds what the command
   sent and received through pasta, payloads included: passwords, tokens
   and cookies sent in clear. It is mode 0600 and hidden from the command,
@@ -1054,9 +1156,9 @@ it, but only when the name still leads to the file it created.
   process it started are gone, so the final content is playpen's, unless
   the command replaced the path with another file. Put the report in a
   directory the command is not expected to touch.
-- **The re-read gap.** A revoked pass stops the command at the next
-  re-read (up to 2 s) plus the grace (3 s); the command can still send in
-  that time. Anyone who can write the pass file can also put the old
+- **The re-read gap.** A revoked pass closes egress at the next re-read
+  (up to 2 s); the command can still send until then. During the grace
+  after it, only loopback works. Anyone who can write the pass file can also put the old
   content back between two re-reads, or edit it before the run starts;
   hallpass's own threat model applies (it does not protect against a
   writer of the engagement directory).

@@ -355,6 +355,81 @@ pub fn listen_tcp(target: Target, ms: u64) -> Result<Value, String> {
     Ok(json!({"total": accepted}))
 }
 
+/// Wall-clock time in nanoseconds since 1970: the clock the firewall's
+/// `meta time` reads.
+fn wall_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
+/// Prints one JSON line on stdout at once, ignoring a closed stdout.
+fn emit(line: &Value) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
+/// `probe listen` for UDP: listens on a UDP address for `ms` milliseconds.
+///
+/// Prints `{"listening": ADDR}` once the socket is bound, `{"received":
+/// PAYLOAD, "at_ns": T}` for each datagram as it arrives (`T` is the wall
+/// clock in nanoseconds), and the count at the end.
+///
+/// # Errors
+/// When the address cannot be bound.
+pub fn listen_udp(target: Target, ms: u64) -> Result<Value, String> {
+    let sock = UdpSocket::bind(target.addr).map_err(|e| format!("bind {}: {e}", target.addr))?;
+    sock.set_read_timeout(Some(Duration::from_millis(20)))
+        .map_err(|e| e.to_string())?;
+    emit(&json!({"listening": target.addr.to_string()}));
+    let end = std::time::Instant::now() + Duration::from_millis(ms);
+    let mut received = 0u32;
+    let mut buf = [0u8; 512];
+    while std::time::Instant::now() < end {
+        if let Ok((n, _)) = sock.recv_from(&mut buf) {
+            let at = wall_ns();
+            received += 1;
+            let payload = String::from_utf8_lossy(&buf[..n]);
+            emit(&json!({"received": payload, "at_ns": at}));
+        }
+    }
+    Ok(json!({"total": received}))
+}
+
+/// `probe send`: sends the datagram `N` (N = 1, 2, ...) to a UDP target
+/// every `every`, until killed.
+///
+/// Prints `{"seq": N, "at_ns": T, "sent": true}` or `{..., "sent": false,
+/// "error": E}` for each, where `T` is the wall clock in nanoseconds just
+/// before the send. A send the firewall refuses on the way out fails with
+/// "Operation not permitted".
+///
+/// # Errors
+/// When no socket can be made.
+pub fn send_udp(target: Target, every: Duration) -> Result<std::convert::Infallible, String> {
+    let local: SocketAddr = if target.addr.is_ipv4() {
+        "0.0.0.0:0".parse().map_err(|_| "addr")?
+    } else {
+        "[::]:0".parse().map_err(|_| "addr")?
+    };
+    let sock = UdpSocket::bind(local).map_err(|e| e.to_string())?;
+    let mut seq = 0_u64;
+    loop {
+        seq += 1;
+        let at = wall_ns();
+        let line = match sock.send_to(seq.to_string().as_bytes(), target.addr) {
+            Ok(_) => json!({"seq": seq, "at_ns": at, "sent": true}),
+            Err(e) => json!({"seq": seq, "at_ns": at, "sent": false, "error": e.to_string()}),
+        };
+        emit(&line);
+        std::thread::sleep(every);
+    }
+}
+
 /// `probe tty`: whether this process can push a character into the input
 /// of the terminal on standard input (`TIOCSTI`), and open `/dev/tty`.
 ///

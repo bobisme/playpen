@@ -83,6 +83,11 @@ enum Cmd {
         /// output is the same.
         #[arg(long, requires = "pass")]
         pass_hosts: bool,
+        /// When the approval ends (RFC 3339 with offset), as with run: adds the
+        /// rule that refuses all but loopback from then. With --pass it can only
+        /// be earlier than the pass's window end.
+        #[arg(long, value_name = "RFC3339")]
+        until: Option<String>,
     },
     /// Check that this machine can run playpen, and say exactly what is missing.
     #[command(display_order = 1, after_help = discovery::DOCTOR)]
@@ -167,11 +172,19 @@ enum ProbeCmd {
     Tty,
     /// Count deliveries of SIGUSR1 until SIGTERM.
     Signals,
-    /// Listen on ADDR:PORT/tcp for MS milliseconds; print the connections.
+    /// Listen on ADDR:PORT/tcp (or /udp) for MS milliseconds; print the
+    /// connections (or datagrams, with the wall-clock time).
     Listen {
         target: String,
         #[arg(long, default_value_t = 5000)]
         ms: u64,
+    },
+    /// Send a numbered datagram to ADDR:PORT/udp every MS milliseconds
+    /// until killed; print each result with the wall-clock time.
+    Send {
+        target: String,
+        #[arg(long, default_value_t = 50)]
+        every_ms: u64,
     },
 }
 
@@ -323,8 +336,12 @@ fn dispatch(cmd: Cmd, format: Format) -> i32 {
         Cmd::Plan(args) => preview::print(&args, format),
         Cmd::Compare { before, after } => crate::compare::run_formatted(&before, &after, format),
         Cmd::Rules {
-            allow, pass, only, ..
-        } => rules(&allow, pass.as_deref(), &only, format),
+            allow,
+            pass,
+            only,
+            until,
+            ..
+        } => rules(&allow, pass.as_deref(), &only, until.as_deref(), format),
         Cmd::Doctor { mode } => crate::doctor::run_formatted(mode, format),
         Cmd::Qualify { list: true, .. } => crate::qualification::list(format),
         Cmd::Qualify {
@@ -334,14 +351,25 @@ fn dispatch(cmd: Cmd, format: Format) -> i32 {
     }
 }
 
-fn rules(allow: &[String], pass_file: Option<&Path>, only: &[String], format: Format) -> i32 {
+fn rules(
+    allow: &[String],
+    pass_file: Option<&Path>,
+    only: &[String],
+    until: Option<&str>,
+    format: Format,
+) -> i32 {
     let refuse =
         |e: &str| discovery::error(format, "refused", &format!("refused: {e}"), EXIT_REFUSED);
-    let (approval, identity) = if let Some(path) = pass_file {
+    let now = OffsetDateTime::now_utc();
+    let until = match until.map(EndsAt::parse).transpose() {
+        Ok(until) => until,
+        Err(e) => return refuse(&e.to_string()),
+    };
+    let (mut approval, identity) = if let Some(path) = pass_file {
         if !allow.is_empty() {
             return refuse(PASS_AND_ALLOW);
         }
-        match pass::load(path, only, OffsetDateTime::now_utc()) {
+        match pass::load(path, only, now) {
             Ok(p) => (p.approval, Some(p.identity)),
             Err(e) => return refuse(&e),
         }
@@ -359,6 +387,17 @@ fn rules(allow: &[String], pass_file: Option<&Path>, only: &[String], format: Fo
         };
         (Approval::new(parsed, None), None)
     };
+    if let Some(until) = until {
+        if let Some(id) = &identity
+            && let Err(e) = check_until_in_pass(until, id.valid_until)
+        {
+            return refuse(&e);
+        }
+        approval.ends_at = Some(until);
+    }
+    if let Err(e) = approval.check_active(now) {
+        return refuse(&e.to_string());
+    }
     let text = crate::ruleset::render_approval(&approval);
     match format {
         Format::Text | Format::Pretty => print!("{text}"),
@@ -367,6 +406,7 @@ fn rules(allow: &[String], pass_file: Option<&Path>, only: &[String], format: Fo
             serde_json::json!({
                 "allowed": approval.rules().iter().map(ToString::to_string).collect::<Vec<_>>(),
                 "pass": identity.as_ref().map(pass_report),
+                "until": approval.ends_at.map(EndsAt::to_rfc3339),
                 "ruleset": text, "advice": [],
             })
         ),
@@ -474,18 +514,39 @@ fn probe(what: ProbeCmd) -> i32 {
                 EXIT_ERROR
             }
         },
-        ProbeCmd::Listen { target, ms } => {
-            match crate::probe::parse_target(&target).and_then(|t| crate::probe::listen_tcp(t, ms))
-            {
-                Ok(v) => {
-                    println!("{v}");
-                    0
-                }
-                Err(e) => {
-                    eprintln!("probe: {e}");
-                    EXIT_ERROR
-                }
+        traffic @ (ProbeCmd::Listen { .. } | ProbeCmd::Send { .. }) => probe_traffic(traffic),
+    }
+}
+
+/// `probe listen` and `probe send`: traffic to or from a fixture.
+fn probe_traffic(what: ProbeCmd) -> i32 {
+    let result = match what {
+        ProbeCmd::Listen { target, ms } => crate::probe::parse_target(&target).and_then(|t| {
+            if t.udp {
+                crate::probe::listen_udp(t, ms)
+            } else {
+                crate::probe::listen_tcp(t, ms)
             }
+        }),
+        ProbeCmd::Send { target, every_ms } => crate::probe::parse_target(&target)
+            .and_then(|t| {
+                if t.udp {
+                    crate::probe::send_udp(t, Duration::from_millis(every_ms))
+                } else {
+                    Err(format!("{target:?}: probe send sends UDP only"))
+                }
+            })
+            .map(|never| match never {}),
+        _ => Err("not a traffic probe".into()),
+    };
+    match result {
+        Ok(v) => {
+            println!("{v}");
+            0
+        }
+        Err(e) => {
+            eprintln!("probe: {e}");
+            EXIT_ERROR
         }
     }
 }
@@ -586,14 +647,7 @@ fn check_pass(args: &RunArgs, path: &Path, now: OffsetDateTime) -> Result<FromPa
     let mut from_pass = pass::load(path, &args.only, now)?;
     if let Some(text) = &args.until {
         let until = EndsAt::parse(text).map_err(|e| e.to_string())?;
-        if until.at() > from_pass.identity.valid_until {
-            return Err(format!(
-                "--until {} is later than the pass's valid_until {}; --until can only end the run earlier than the window the owner approved. Leave --until out to run until {}",
-                until.to_rfc3339(),
-                hallpass::stamp(from_pass.identity.valid_until),
-                hallpass::stamp(from_pass.identity.valid_until)
-            ));
-        }
+        check_until_in_pass(until, from_pass.identity.valid_until)?;
         from_pass.approval.ends_at = Some(until);
     }
     from_pass.watch.require_enforced = args.require_enforced;
@@ -603,6 +657,19 @@ fn check_pass(args: &RunArgs, path: &Path, now: OffsetDateTime) -> Result<FromPa
             Duration::from_millis(ms).clamp(MIN_RECHECK_INTERVAL, RECHECK_INTERVAL);
     }
     Ok(from_pass)
+}
+
+/// Refuses an `--until` later than the pass's `valid_until`.
+fn check_until_in_pass(until: EndsAt, valid_until: OffsetDateTime) -> Result<(), String> {
+    if until.at() > valid_until {
+        return Err(format!(
+            "--until {} is later than the pass's valid_until {}; --until can only end the run earlier than the window the owner approved. Leave --until out to run until {}",
+            until.to_rfc3339(),
+            hallpass::stamp(valid_until),
+            hallpass::stamp(valid_until)
+        ));
+    }
+    Ok(())
 }
 
 /// Every `--host` address, and every address `--pass-hosts` took from the
@@ -800,13 +867,15 @@ impl Events for StderrEvents<'_> {
     fn ended(&mut self, at: OffsetDateTime) {
         self.ended_at = Some(at);
     }
-    fn until_reached(&mut self) {
-        self.pipe
-            .send("stopping", &serde_json::json!({"reason":"expiry"}));
+    fn until_reached(&mut self, cut: &sandbox::Cut) {
+        self.pipe.send(
+            "stopping",
+            &serde_json::json!({"reason":"expiry","egress_closed":*cut == sandbox::Cut::Closed}),
+        );
         eprintln!(
-            "playpen: the approval ended at {}; sending SIGTERM to the command (SIGKILL in {} s)",
+            "playpen: the approval ended at {}; {}",
             self.until.as_deref().unwrap_or("?"),
-            sandbox::GRACE.as_secs()
+            stopping(cut)
         );
     }
     fn own_addresses(&mut self, addresses: &[std::net::IpAddr]) {
@@ -824,13 +893,25 @@ impl Events for StderrEvents<'_> {
     fn pass_edited(&mut self, message: &str) {
         eprintln!("playpen: {message}");
     }
-    fn pass_withdrawn(&mut self, reason: &str) {
-        self.pipe
-            .send("stopping", &serde_json::json!({"reason":"pass_withdrawn"}));
-        eprintln!(
-            "playpen: {reason}; sending SIGTERM to the command (SIGKILL in {} s)",
-            sandbox::GRACE.as_secs()
+    fn pass_withdrawn(&mut self, reason: &str, cut: &sandbox::Cut) {
+        self.pipe.send(
+            "stopping",
+            &serde_json::json!({"reason":"pass_withdrawn","egress_closed":*cut == sandbox::Cut::Closed}),
         );
+        eprintln!("playpen: {reason}; {}", stopping(cut));
+    }
+}
+
+/// The rest of the notice that the command is being stopped.
+fn stopping(cut: &sandbox::Cut) -> String {
+    match cut {
+        sandbox::Cut::Closed => format!(
+            "the firewall now refuses all traffic but loopback; sending SIGTERM to the command (SIGKILL in {} s)",
+            sandbox::GRACE.as_secs()
+        ),
+        sandbox::Cut::Failed(why) => format!(
+            "egress could not be closed in the firewall ({why}), so the command is killed now with SIGKILL, without the grace"
+        ),
     }
 }
 
@@ -937,12 +1018,30 @@ fn start_line_net(c: &Checked, network: bool) -> String {
             (format!("under {}: ", pass::describe(&p.identity)), hint)
         });
         format!(
-            "playpen: {under}allowing only {} {until} ({names}); everything else is dropped{hint}",
-            list.join(", ")
+            "playpen: {under}allowing only {} {until} ({names}); everything else is dropped{}{hint}",
+            list.join(", "),
+            ends_clause(c)
         )
     } else {
         format!("playpen: no network, loopback only, {until} ({names})")
     }
+}
+
+/// What the start line says about the end of egress in the firewall: from
+/// the end second (the end time rounded down), and with a pass also when a
+/// re-read withdraws it.
+fn ends_clause(c: &Checked) -> String {
+    let Some(second) = crate::ruleset::end_second(&c.approval) else {
+        return String::new();
+    };
+    let at = OffsetDateTime::from_unix_timestamp(second)
+        .map_or_else(|_| String::new(), |t| EndsAt::from_time(t).to_rfc3339());
+    let or_pass = if c.from_pass.is_some() {
+        ", or once a re-read withdraws the pass,"
+    } else {
+        ""
+    };
+    format!("; from {at}{or_pass} the firewall itself refuses all traffic but loopback")
 }
 
 fn base_report(args: &RunArgs) -> Report {
@@ -980,6 +1079,7 @@ fn base_report(args: &RunArgs) -> Report {
         capture: None,
         playpen_exit_status: EXIT_REFUSED,
         dropped: None,
+        refused_after_end: None,
         grant_use: None,
         drop_assertion: None,
         dropped_error: None,
@@ -1305,6 +1405,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         Ok(l) => report.lookups = Some(l),
         Err(e) => report.lookups_error = Some(e),
     }
+    report.refused_after_end = result.refused_after_end;
     let code = apply_drop_assertion(&mut report, code, args.fail_on_drop);
     report.playpen_exit_status = code;
     eprint!("{}", text_summary(&report));

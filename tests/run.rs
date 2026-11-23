@@ -748,9 +748,88 @@ fn narrower_nft_readback_refuses_to_start_workload() {
     );
     assert_not_started_with_allow(
         ("PLAYPEN_NFT", &adapter),
-        "the loaded ruleset is not the one playpen built: output rule 6 differs",
+        "the loaded ruleset is not the one playpen built: output rule 7 differs",
         "192.0.2.1:8000-8002/tcp",
     );
+}
+
+/// An nft that fails, or hangs, when playpen adds the cut.
+fn nft_without_cut(name: &str, action: &str) -> PathBuf {
+    let nft = ["/usr/bin", "/usr/sbin", "/bin", "/sbin"]
+        .into_iter()
+        .map(|dir| Path::new(dir).join("nft"))
+        .find(|path| path.is_file())
+        .expect("native nft");
+    fake_tool(
+        name,
+        &format!(
+            "#!/bin/sh\n\
+        if [ \"$1\" = add ] && [ \"$2\" = element ]; then\n\
+            {action}\n\
+        fi\n\
+        exec '{}' \"$@\"\n",
+            nft.display()
+        ),
+    )
+}
+
+/// When egress cannot be closed in the firewall, the command gets no grace:
+/// playpen says so and kills it at once.
+#[test]
+fn a_failed_cut_kills_the_command_at_once() {
+    require_sandbox!();
+    for (name, action, why) in [
+        (
+            "nft-cut-fails",
+            "echo 'simulated failure' >&2; exit 1",
+            "simulated failure",
+        ),
+        (
+            "nft-cut-hangs",
+            "sleep 3",
+            "the sandbox did not confirm the cut within 2 s",
+        ),
+    ] {
+        let adapter = nft_without_cut(name, action);
+        let dir = tmpdir(name);
+        let report = dir.join("report.json");
+        let started = Instant::now();
+        let out = playpen(&[
+            "run",
+            "--no-network",
+            "--until",
+            &rfc3339_in(1),
+            "--report",
+            report.to_str().unwrap_or(""),
+            "--",
+            "sh",
+            "-c",
+            "trap '' TERM; while :; do sleep 0.1; done",
+        ])
+        .env("PLAYPEN_NFT", &adapter)
+        .output()
+        .unwrap_or_else(|e| panic!("{e}"));
+        let took = started.elapsed();
+        let err = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(128 + 9), "{name}: {err}");
+        assert!(
+            err.contains("egress could not be closed in the firewall") && err.contains(why),
+            "{name}: {err}"
+        );
+        assert!(err.contains("killed now with SIGKILL"), "{name}: {err}");
+        assert!(!err.contains("SIGTERM"), "{name}: {err}");
+        // No grace: the end, at most the 2 s wait for the cut, and the
+        // hanging nft's 3 s before the sandbox can be torn down.
+        assert!(
+            took < Duration::from_millis(1000 + 3000 + 1500),
+            "{name}: took {took:?}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report).unwrap_or_default())
+                .unwrap_or_default();
+        assert_eq!(json["stopped_by_until"], true, "{name}: {json}");
+        assert_eq!(json["signal"], 9, "{name}: {json}");
+    }
 }
 
 #[test]
@@ -1431,9 +1510,155 @@ fn rules_prints_the_ruleset_and_refuses_hostile_specs() {
     let out = run(&["rules", "--allow", "192.0.2.1:443/tcp", "--format", "json"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
     assert!(v["ruleset"].as_str().unwrap_or("").contains("policy drop"));
+    assert!(v["until"].is_null(), "{v}");
     let out = run(&["rules", "--allow", "192.0.2.1:443/tcp } ; flush ruleset"]);
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(out.stdout, b"");
+}
+
+#[test]
+fn rules_show_the_end_rules() {
+    // Without an end time: no time rule, and the cut rule in both chains.
+    let out = run(&["rules", "--allow", "192.0.2.1:443/tcp"]);
+    let t = text(&out.stdout);
+    assert!(!t.contains("meta time"), "{t}");
+    assert!(
+        t.contains("\t\tmeta mark @cut counter name \"cut\" drop\n"),
+        "{t}"
+    );
+    assert!(t.contains("\t\tmeta mark @cut drop\n"), "{t}");
+    // With one: the time rule in both chains, at the end second.
+    let until = "2099-01-02T03:04:05.6+01:00";
+    let out = run(&["rules", "--allow", "192.0.2.1:443/tcp", "--until", until]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let t = text(&out.stdout);
+    assert!(
+        t.contains("\t\tmeta time >= 4071002645 counter name \"late\" drop\n"),
+        "{t}"
+    );
+    assert!(t.contains("\t\tmeta time >= 4071002645 drop\n"), "{t}");
+    assert!(t.contains("# From 2099-01-02T02:04:05Z, when the approval ends"));
+    let out = run(&[
+        "rules",
+        "--allow",
+        "192.0.2.1:443/tcp",
+        "--until",
+        until,
+        "--format",
+        "json",
+    ]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    assert_eq!(v["until"], "2099-01-02T02:04:05.6Z", "{v}");
+    // An end that has passed, or is no time, is refused.
+    for bad in ["2020-01-01T00:00:00Z", "tomorrow"] {
+        let out = run(&["rules", "--allow", "192.0.2.1:443/tcp", "--until", bad]);
+        assert_eq!(out.status.code(), Some(2), "{bad}");
+        assert_eq!(out.stdout, b"", "{bad}");
+    }
+}
+
+/// `nft --json` prints the time rule as a date in its own time zone.
+/// playpen reads it back the same in any zone, including ones with a
+/// half-hour offset.
+#[test]
+fn the_time_rule_is_read_back_in_any_time_zone() {
+    require_sandbox!();
+    for zone in ["Asia/Kolkata", "America/St_Johns", "UTC"] {
+        let out = playpen(&[
+            "run",
+            "--allow",
+            "192.0.2.1:9101/tcp",
+            "--lo-addr",
+            "192.0.2.1",
+            "--until",
+            &rfc3339_in(60),
+            "--",
+            "true",
+        ])
+        .env("TZ", zone)
+        .output()
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(out.status.code(), Some(0), "{zone}: {}", text(&out.stderr));
+        // The clause follows the DNS parenthesis and precedes the sockets.
+        let err = text(&out.stderr);
+        let line = err.lines().next().unwrap_or("");
+        assert!(
+            line.starts_with("playpen: allowing only 192.0.2.1:9101/tcp until ")
+                && line.contains(" (no DNS; lookups recorded); everything else is dropped; from ")
+                && line.ends_with(
+                    " the firewall itself refuses all traffic but loopback; host Unix sockets: none reachable"
+                ),
+            "{zone}: {err}"
+        );
+    }
+}
+
+/// After the end time the firewall refuses everything but loopback. The
+/// command, alive in its grace, still reaches loopback services, and no
+/// longer an approved address.
+#[test]
+fn loopback_still_works_after_the_end() {
+    require_sandbox!();
+    let end = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        + 3;
+    let until = time::OffsetDateTime::from_unix_timestamp(i64::try_from(end).unwrap_or(0))
+        .ok()
+        .and_then(|t| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_default();
+    let script = r#"trap '' TERM
+bin="$1"; end="$2"
+"$bin" probe reach --serve 192.0.2.1:9101/udp --try 192.0.2.1:9101/udp
+while [ "$(date +%s)" -lt "$end" ]; do sleep 0.05; done
+sleep 0.5
+exec "$bin" probe reach --serve 127.0.0.1:9201/tcp --serve 127.0.0.1:9202/udp \
+  --serve [::1]:9203/tcp --serve 192.0.2.1:9101/udp \
+  --try 127.0.0.1:9201/tcp --try 127.0.0.1:9202/udp --try [::1]:9203/tcp \
+  --try 192.0.2.1:9101/udp
+"#;
+    let dir = tmpdir("loopback-after-end");
+    let report = dir.join("report.json");
+    let end_text = end.to_string();
+    let out = run(&[
+        "run",
+        "--allow",
+        "192.0.2.1:9101/udp",
+        "--lo-addr",
+        "192.0.2.1",
+        "--until",
+        &until,
+        "--report",
+        report.to_str().unwrap_or(""),
+        "--",
+        "sh",
+        "-c",
+        script,
+        "sh",
+        BIN,
+        &end_text,
+    ]);
+    let stdout = text(&out.stdout);
+    let err = text(&out.stderr);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let before = parse_reach(lines.first().copied().unwrap_or(""));
+    let after = parse_reach(&lines.get(1..).unwrap_or_default().join("\n"));
+    assert!(reached(&before, "192.0.2.1:9101/udp"), "{stdout} {err}");
+    for target in ["127.0.0.1:9201/tcp", "127.0.0.1:9202/udp", "[::1]:9203/tcp"] {
+        assert!(reached(&after, target), "{target}: {stdout} {err}");
+    }
+    assert!(!reached(&after, "192.0.2.1:9101/udp"), "{stdout} {err}");
+    assert!(stdout.contains("Operation not permitted"), "{stdout}");
+    assert!(err.contains("the approval ended at"), "{err}");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap_or_default())
+            .unwrap_or_default();
+    assert_eq!(json["stopped_by_until"], true, "{json}");
+    assert!(json["refused_after_end"].as_u64() >= Some(1), "{json}");
+    assert_eq!(json["dropped"]["packets"], 0, "{json}");
 }
 
 #[test]

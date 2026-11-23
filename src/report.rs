@@ -98,6 +98,11 @@ pub struct Report {
     pub playpen_exit_status: i32,
     /// Drop counters, when they could be read.
     pub dropped: Option<DropSummary>,
+    /// Packets the command sent that the firewall refused because the
+    /// approval had ended (the end time, or the cut when playpen stopped
+    /// the command), when the counters could be read. Not part of
+    /// `dropped`, and not judged by `--fail-on-drop`.
+    pub refused_after_end: Option<u64>,
     /// Optional observations for explicit accept rules.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grant_use: Option<crate::grant_use::GrantUse>,
@@ -274,6 +279,14 @@ pub fn text_summary(r: &Report) -> String {
         }
         (None, None) => {}
     }
+    if let Some(n) = r.refused_after_end
+        && (n > 0 || r.stopped_by_until || r.stopped_by_pass)
+    {
+        let _ = writeln!(
+            out,
+            "playpen: {n} packet(s) refused after the approval ended"
+        );
+    }
     if let Some(c) = &r.capture {
         let _ = writeln!(
             out,
@@ -358,6 +371,7 @@ mod tests {
             capture: None,
             playpen_exit_status: 0,
             dropped: Some(DropSummary::default()),
+            refused_after_end: Some(0),
             grant_use: None,
             drop_assertion: None,
             dropped_error: None,
@@ -488,6 +502,30 @@ mod tests {
         assert_eq!(crate::cli::apply_drop_assertion(&mut r, 0, true), 1);
         assert_eq!(r.drop_assertion, Some(DropAssertion::Unknown));
         assert!(!text_summary(&r).contains("no packets"));
+    }
+
+    #[test]
+    fn packets_refused_after_the_end_have_their_own_line_and_do_not_fail_drop_checks() {
+        let mut r = base();
+        assert!(!text_summary(&r).contains("refused after"));
+        r.stopped_by_until = true;
+        assert!(
+            text_summary(&r).contains("playpen: 0 packet(s) refused after the approval ended\n")
+        );
+        r.stopped_by_until = false;
+        r.refused_after_end = Some(4);
+        let t = text_summary(&r);
+        assert!(t.contains("playpen: 4 packet(s) refused after the approval ended\n"));
+        assert!(t.contains("no packets to unapproved destinations were dropped"));
+        assert!(!t.contains("WARNING"));
+        assert_eq!(crate::cli::apply_drop_assertion(&mut r, 0, true), 0);
+        assert_eq!(r.drop_assertion, Some(DropAssertion::Pass));
+        let json = serde_json::to_value(&r).unwrap_or_default();
+        assert_eq!(json["refused_after_end"], 4);
+        assert_eq!(json["dropped"]["packets"], 0);
+        r.refused_after_end = None;
+        assert!(!text_summary(&r).contains("refused after"));
+        assert!(serde_json::to_value(&r).unwrap_or_default()["refused_after_end"].is_null());
     }
 
     #[test]

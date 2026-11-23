@@ -880,6 +880,7 @@ fn live_events_record_atomic_revocation_after_the_command_is_ready() {
         ]
     );
     assert_eq!(records[2]["details"]["reason"], "pass_withdrawn");
+    assert_eq!(records[2]["details"]["egress_closed"], true);
     assert_eq!(records[3]["details"]["signal"], 15);
 }
 
