@@ -22,6 +22,7 @@ pub mod probe;
 pub mod qualification;
 pub mod report;
 pub mod resolver;
+pub mod routes;
 pub mod ruleset;
 pub mod sandbox;
 pub mod sockets;

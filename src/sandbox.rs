@@ -23,7 +23,10 @@
 //! `pasta` is started by P after C reports the ruleset is loaded and
 //! verified, and attaches to C's namespaces. Until that moment the network
 //! namespace has nothing but `lo`, so there is no window in which traffic
-//! could leave unfiltered.
+//! could leave unfiltered. Under `--no-network` C adds the discard
+//! interface after the ruleset instead, and with pasta C adds the default
+//! routes pasta did not, before the command exists (see
+//! [`crate::routes`]); either failure is reported as `uncounted WHY`.
 //!
 //! Children report to P over one pipe with one line per event; P talks to C
 //! over another pipe (the byte `g` means "go", end of file means "abort").
@@ -239,6 +242,10 @@ pub struct RunResult {
     /// Packets the cut alone refused on their way out; `None` when the
     /// counter could not be read.
     pub cut_packets: Option<u64>,
+    /// Why packets to other hosts may have failed at routing, before the
+    /// ruleset could count them; `None` when every address family had a
+    /// route (see [`crate::routes`]).
+    pub uncounted: Option<String>,
 }
 
 /// Whether egress was closed in the firewall when playpen began to stop
@@ -297,6 +304,10 @@ pub trait Events {
     /// Approved addresses that turned out to be the sandbox's own: pasta
     /// gave them to its interface, so connections to them stay inside.
     fn own_addresses(&mut self, _addresses: &[IpAddr]) {}
+    /// Packets to other hosts fail at routing in this sandbox and are not
+    /// counted, for the reason given (see [`crate::routes`]). Said once,
+    /// after [`Events::starting`].
+    fn uncounted(&mut self, _why: &str) {}
     /// A re-read of the pass found an edit that changes nothing in use.
     fn pass_edited(&mut self, message: &str);
     /// A re-read of the pass withdrew the approval; egress is closed as
@@ -987,6 +998,10 @@ struct ParentState {
     trip_pending: Option<Vec<ruleset::DroppedDest>>,
     /// The `cut` counter, read by C at teardown.
     cut_packets: Option<u64>,
+    /// Why packets to other hosts fail at routing, from C.
+    uncounted: Option<String>,
+    /// The reasons C gave that [`Events::uncounted`] has not been told yet.
+    uncounted_unsaid: Option<String>,
 }
 
 impl ParentState {
@@ -1022,6 +1037,13 @@ impl ParentState {
             "statuserr" => self.status_error = Some(rest.to_owned()),
             "private-tstp" => self.private_tstp = Some(rest == "outer"),
             "own" => self.own = rest.split(' ').filter_map(|a| a.parse().ok()).collect(),
+            "uncounted" => {
+                let join = |before: Option<String>| {
+                    before.map_or_else(|| rest.to_owned(), |b| format!("{b}; {rest}"))
+                };
+                self.uncounted = Some(join(self.uncounted.take()));
+                self.uncounted_unsaid = Some(join(self.uncounted_unsaid.take()));
+            }
             "synced" => self.synced += 1,
             "outside" => {
                 if let Some(at) = rest.parse().ok().and_then(byte_index) {
@@ -1093,6 +1115,14 @@ impl ParentState {
             Ok(n) => self.receive(&chunk[..n]),
             Err(Errno::EINTR | Errno::EAGAIN) => {}
             Err(_) => self.eof = true,
+        }
+    }
+
+    /// Passes on C's reports that packets to other hosts are not counted,
+    /// each once.
+    fn report_uncounted(&mut self, events: &mut dyn Events) {
+        if let Some(why) = self.uncounted_unsaid.take() {
+            events.uncounted(&why);
         }
     }
 
@@ -1300,6 +1330,8 @@ fn parent(
         return Err(RunError::NotStarted(why));
     }
     events.starting();
+    // Under --no-network C has said it before "ready".
+    st.report_uncounted(events);
     send_byte(&down_w, GO);
     events.released(time::OffsetDateTime::now_utc());
 
@@ -1402,6 +1434,7 @@ fn parent(
         if !st.own.is_empty() {
             events.own_addresses(&std::mem::take(&mut st.own));
         }
+        st.report_uncounted(events);
         st.report_denied(events);
         // The firewall has closed all egress at a dropped packet. With
         // `stop` P stops the command as at the end time; its cut request
@@ -1508,6 +1541,7 @@ fn parent(
     }
     drop(down_w);
     drop(witness);
+    st.report_uncounted(events);
     st.report_denied(events);
     events.ended(st.ended_at.unwrap_or_else(time::OffsetDateTime::now_utc));
     let _ = waitpid(child, None);
@@ -1555,6 +1589,7 @@ fn parent(
         tripped_by: st.tripped,
         stopped_by_drop,
         cut_packets: st.cut_packets,
+        uncounted: st.uncounted,
     })
 }
 
@@ -1944,6 +1979,14 @@ fn stage_c(
     load_ruleset(&plan.nft, ruleset_text)?;
     let with = plan.instrumentation();
     verify_ruleset(&plan.nft, &plan.approval, with)?;
+    // After the ruleset: the kernel's own reports when the interface comes
+    // up meet its uncounted drop rule. A packet to another host now has a
+    // route, so the ruleset counts and refuses it (see `routes`).
+    if !plan.network
+        && let Err(why) = crate::routes::make_discard_interface()
+    {
+        write_line(up_w, &format!("uncounted {why}"));
+    }
     // Made now, so that C can watch S and P's control pipe at once later,
     // and a failure stops the run before anything runs.
     let mut chld = SigSet::empty();
@@ -1957,8 +2000,14 @@ fn stage_c(
         Ok(1) if go[0] == GO => {}
         _ => exit_now(0),
     }
-    // pasta is attached and has configured the namespace.
+    // pasta is attached and has configured the namespace. No command exists
+    // yet.
     if plan.network {
+        // A family the host has no default route for gets one into pasta's
+        // interface, so its packets reach the ruleset (see `routes`).
+        if let Err(why) = crate::routes::route_missing_families() {
+            write_line(up_w, &format!("uncounted {why}"));
+        }
         let own = own_approved_addresses(plan);
         if !own.is_empty() {
             let list: Vec<String> = own.iter().map(ToString::to_string).collect();
@@ -3442,7 +3491,15 @@ mod tests {
             tripped: None,
             trip_pending: None,
             cut_packets: None,
+            uncounted: None,
+            uncounted_unsaid: None,
         };
+        st.handle_line("uncounted IPv6 packets to other hosts fail at routing");
+        st.handle_line("uncounted a second reason");
+        assert_eq!(
+            st.uncounted.as_deref(),
+            Some("IPv6 packets to other hosts fail at routing; a second reason")
+        );
         st.handle_line("cuterr nft could not close egress");
         assert_eq!(st.cut, Some(Err("nft could not close egress".into())));
         st.handle_line("cut");

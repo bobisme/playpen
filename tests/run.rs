@@ -367,6 +367,8 @@ fn assert_all_denied(v: &serde_json::Value) {
         "add_address",
         "add_link",
         "set_link_up",
+        "add_route",
+        "delete_route",
         "raw_socket_v4",
         "raw_socket_v6",
         "packet_socket",
@@ -388,6 +390,11 @@ fn assert_all_denied(v: &serde_json::Value) {
     ] {
         let val = v[key].as_str().unwrap_or("missing");
         assert!(val.contains("(os error 13)"), "{key}: {val}");
+    }
+    // The route changes fail for want of privilege, not for a bad request.
+    for key in ["add_link", "add_route", "delete_route"] {
+        let val = v[key].as_str().unwrap_or("missing");
+        assert_eq!(val, "denied: EPERM: Operation not permitted", "{key}");
     }
     assert_eq!(v["cap_eff"], "0000000000000000");
     assert_eq!(v["cap_prm"], "0000000000000000");
@@ -1306,7 +1313,7 @@ fn a_signal_sent_to_pid_1_inside_reaches_the_command() {
 }
 
 #[test]
-fn no_network_has_only_loopback() {
+fn no_network_has_only_loopback_and_the_discard_interface() {
     require_sandbox!();
     // pasta is not needed for --no-network.
     let out = playpen(&[
@@ -1334,10 +1341,15 @@ fn no_network_has_only_loopback() {
     let r = parse_reach(&text(&out.stdout));
     assert!(reached(&r, "127.0.0.1:9701/tcp"));
     assert!(!reached(&r, "192.0.2.1:9701/tcp"));
+    // Besides lo, only the discard interface (see tests/routes.rs).
     let ifaces = run(&["run", "--no-network", "--", "cat", "/proc/net/dev"]);
     let list = text(&ifaces.stdout);
-    assert!(list.contains("lo:"));
-    assert_eq!(list.lines().count(), 3, "{list}");
+    let names: Vec<&str> = list
+        .lines()
+        .skip(2)
+        .filter_map(|l| l.split_once(':').map(|(name, _)| name.trim()))
+        .collect();
+    assert_eq!(names, ["lo", "discard0"], "{list}");
 }
 
 #[test]

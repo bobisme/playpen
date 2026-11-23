@@ -237,7 +237,8 @@ struct RunArgs {
     /// then. With --pass it can only be earlier than the pass's window end.
     #[arg(help_heading = "Network policy", long, value_name = "RFC3339")]
     until: Option<String>,
-    /// Allow only private loopback. No DNS or external network.
+    /// Allow only private loopback. No DNS or external network: a packet to
+    /// any other host is dropped and counted, as with a network.
     #[arg(help_heading = "Network policy", long)]
     no_network: bool,
     /// At the first packet the firewall drops, close all egress but loopback:
@@ -297,7 +298,10 @@ struct RunArgs {
     /// Require the effective scope to match the digest from playpen plan.
     #[arg(help_heading = "Launch and reporting", long, value_name = "SHA256")]
     expect_plan: Option<hallpass::Digest>,
-    /// Fail if any dropped packets were counted, or counters are unavailable.
+    /// Exit 1 if the firewall dropped a packet, or cannot say. It counts each
+    /// packet to another host that no grant allows, --no-network included;
+    /// loopback, lookups the DNS stub answered and host Unix sockets are not
+    /// counted. Unreadable counters or a family with no route make it unknown.
     #[arg(help_heading = "Launch and reporting", long)]
     fail_on_drop: bool,
     /// Print each new dropped destination on stderr while the command runs
@@ -978,6 +982,11 @@ impl Events for StderrEvents<'_> {
             list.join(", ")
         );
     }
+    fn uncounted(&mut self, why: &str) {
+        eprintln!(
+            "playpen: NOTE: {why}. The drop counts of this run are incomplete: --fail-on-drop says unknown, and --on-drop and --live-drops do not see these packets"
+        );
+    }
     fn pass_edited(&mut self, message: &str) {
         eprintln!("playpen: {message}");
     }
@@ -1198,7 +1207,7 @@ fn start_line_net(c: &Checked, network: bool) -> Vec<String> {
     names.push_str("; lookups recorded");
     if !network {
         return vec![
-            format!("playpen: no network, loopback only, {until}"),
+            format!("playpen: no network, loopback only, {until}; everything else is dropped"),
             names,
         ];
     }
@@ -1286,6 +1295,7 @@ fn base_report(args: &RunArgs) -> Report {
             .then(crate::contacts::ContactFields::default),
         drop_assertion: None,
         dropped_error: None,
+        uncounted: None,
         lookups: None,
         lookups_error: None,
         socket_guard: if args.without_landlock {
@@ -1618,6 +1628,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         }
     }
     report.refused_after_end = result.refused_after_end;
+    report.uncounted = result.uncounted;
     if let Some(on_drop) = args.on_drop {
         let seen = tripwire::Observed {
             drops: report.dropped.as_ref(),
@@ -1648,6 +1659,8 @@ pub(crate) fn apply_drop_assertion(report: &mut Report, code: i32, enabled: bool
         Some(d) if d.destinations.iter().any(|entry| entry.packets > 0) => {
             crate::report::DropAssertion::Unknown
         }
+        // Packets that failed at routing may have gone uncounted.
+        Some(_) if report.uncounted.is_some() => crate::report::DropAssertion::Unknown,
         Some(_) => crate::report::DropAssertion::Pass,
         None => crate::report::DropAssertion::Unknown,
     };

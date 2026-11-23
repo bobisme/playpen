@@ -35,6 +35,7 @@ Agent workflow
   --capture FILE keeps a pcap of what crossed the sandbox's outside interface, and the report gives its size and sha256. It holds payloads, credentials sent in clear included: keep it like the pass.
   --report-contacts lists in the report each address, protocol and port the command reached through a grant. playpen suggest REPORT turns that list into the narrowest --allow and --host options.
   Read startup_evidence before retrying a job with side effects. not_started permits a retry after fixing the cause. unknown requires investigation.
+  --fail-on-drop counts each packet to another host that no grant allows, with --no-network too. Loopback, lookups the DNS stub answered and host Unix sockets are not counted. If the report's dropped_error or uncounted is set, the count is incomplete and drop_assertion is unknown.
   A policy refusal exits 2, a setup error exits 1, and a launched command normally supplies its own exit status. --fail-on-drop and --on-drop stop can turn child success into exit 1.";
 pub(super) const PLAN: &str = "Examples
   playpen plan --no-network -- printf hello

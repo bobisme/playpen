@@ -3,7 +3,9 @@
 //! Besides looking for the tools and kernel settings, it runs the real
 //! mechanism once: a sandbox whose only reachable destinations are
 //! documentation addresses added to the sandbox's own `lo`, so no packet can
-//! leave the machine even if something were wrong.
+//! leave the machine even if something were wrong. It also checks that
+//! every address family has a default route in the sandbox, so that a
+//! packet to any address reaches the firewall (see [`crate::routes`]).
 
 use crate::cli::discovery::Format;
 use std::path::Path;
@@ -215,9 +217,120 @@ fn self_command(run_args: &[&str], command: &[&str]) -> Check {
     }
 }
 
+/// Runs `playpen run --format json ARGS -- playpen probe PROBE...` and
+/// returns the run's report, which JSON mode prints on stdout.
+fn self_report(run_args: &[&str], probe: &[&str]) -> Result<serde_json::Value, String> {
+    let me = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
+    let out = Command::new(&me)
+        .args(["run", "--format", "json"])
+        .args(run_args)
+        .arg("--")
+        .arg(&me)
+        .arg("probe")
+        .args(probe)
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", me.display()))?;
+    serde_json::from_slice(&out.stdout).map_err(|e| {
+        format!(
+            "no report ({e}), exit status {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+                .trim()
+                .replace('\n', " | ")
+        )
+    })
+}
+
+/// The interface names and the default routes `probe interfaces` printed.
+fn interfaces_and_routes(out: &str) -> (Vec<String>, crate::routes::DefaultRoutes) {
+    let value = serde_json::from_str::<serde_json::Value>(out.trim()).unwrap_or_default();
+    let list = |v: &serde_json::Value| -> Vec<String> {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    };
+    let routes = &value["default_routes"];
+    (
+        list(&value["interfaces"]),
+        crate::routes::DefaultRoutes {
+            ipv4: list(&routes["ipv4"]),
+            ipv6: list(&routes["ipv6"]),
+        },
+    )
+}
+
+/// The offline sandbox has `lo` and the discard interface, both default
+/// routes lead to the discard interface, and a packet to another host is
+/// refused and counted.
 fn offline_interfaces_check() -> Check {
     let name = "offline loopback only";
+    let fail = |detail: String| Check {
+        name,
+        ok: false,
+        detail,
+    };
     let out = match self_run(&["--no-network"], &["interfaces"]) {
+        Ok(out) => out,
+        Err(e) => return fail(e),
+    };
+    let discard = crate::routes::DISCARD;
+    let (names, routes) = interfaces_and_routes(&out);
+    if names != ["lo", discard] {
+        return fail(format!(
+            "expected lo and {discard}, found {}",
+            names.join(", ")
+        ));
+    }
+    if routes.ipv4 != [discard] || routes.ipv6 != [discard] {
+        return fail(format!(
+            "expected the IPv4 and IPv6 default routes on {discard}, found {routes:?}"
+        ));
+    }
+    // Documentation addresses: refused before they reach the discard
+    // interface, and so before anything could leave.
+    let tries = ["192.0.2.1:9/tcp", "[2001:db8::1]:9/udp"];
+    let report = match self_report(
+        &["--no-network"],
+        &["reach", "--try", tries[0], "--try", tries[1]],
+    ) {
+        Ok(r) => r,
+        Err(e) => return fail(e),
+    };
+    let counted = |address: &str, protocol: &str| {
+        report["dropped"]["destinations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|d| d["address"] == address && d["protocol"] == protocol && d["port"] == 9)
+    };
+    if !counted("192.0.2.1", "tcp")
+        || !counted("2001:db8::1", "udp")
+        || !report["uncounted"].is_null()
+    {
+        return fail(format!(
+            "attempts to {} were not all refused and counted: dropped {}, uncounted {}",
+            tries.join(" and "),
+            report["dropped"],
+            report["uncounted"]
+        ));
+    }
+    Check {
+        name,
+        ok: true,
+        detail: format!(
+            "the sandbox has its loopback interface and {discard}, which discards what is sent to it; both default routes lead to {discard}, and IPv4 and IPv6 attempts to other hosts were refused and counted"
+        ),
+    }
+}
+
+/// Every address family has a default route in a sandbox with pasta, and
+/// says which ones playpen added because this host has none.
+fn routes_check() -> Check {
+    let name = "default routes";
+    let out = match self_run(SANDBOX, &["interfaces"]) {
         Ok(out) => out,
         Err(e) => {
             return Check {
@@ -227,26 +340,27 @@ fn offline_interfaces_check() -> Check {
             };
         }
     };
-    let interfaces = serde_json::from_str::<serde_json::Value>(out.trim())
-        .ok()
-        .and_then(|value| value["interfaces"].as_array().cloned())
-        .unwrap_or_default();
-    let names = interfaces
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .collect::<Vec<_>>();
-    if names == ["lo"] {
-        Check {
-            name,
-            ok: true,
-            detail: "the sandbox exposes only its loopback interface".into(),
-        }
-    } else {
-        Check {
-            name,
-            ok: false,
-            detail: format!("expected only lo, found {}", names.join(", ")),
-        }
+    let (_, inside) = interfaces_and_routes(&out);
+    let host = crate::routes::DefaultRoutes::read().unwrap_or_default();
+    let mut said = Vec::new();
+    let mut ok = true;
+    for family in crate::netlink::Family::BOTH {
+        let f = family.name();
+        said.push(match (host.of(family).is_empty(), inside.of(family).is_empty()) {
+            (_, true) => {
+                ok = false;
+                format!("{f}: the sandbox has no default route, so {f} attempts fail at routing and are not counted")
+            }
+            (false, false) => format!("{f}: this host's default route"),
+            (true, false) => format!(
+                "{f}: this host has no default route, so playpen adds one into pasta's interface; {f} attempts are refused and counted, and approved {f} destinations are reachable only where this host has a route to them"
+            ),
+        });
+    }
+    Check {
+        name,
+        ok,
+        detail: said.join("; "),
     }
 }
 
@@ -378,7 +492,7 @@ fn privs_check(nft: &Path, offline: bool) -> Check {
         Check {
             name,
             ok: true,
-            detail: "nft, netlink address/link changes, raw and packet sockets, binding port 53 all denied; no capabilities".into(),
+            detail: "nft, netlink address, link and route changes, raw and packet sockets, binding port 53 all denied; no capabilities".into(),
         }
     } else {
         Check {
@@ -517,7 +631,12 @@ pub(crate) fn run_formatted(mode: Mode, format: Format) -> i32 {
                 privs_check(nft, true),
                 sockets_check(),
             ],
-            Mode::Egress => vec![reach_check(), privs_check(nft, false), sockets_check()],
+            Mode::Egress => vec![
+                reach_check(),
+                routes_check(),
+                privs_check(nft, false),
+                sockets_check(),
+            ],
         };
         for check in executed {
             probes.push(ProbeResult {
@@ -540,6 +659,7 @@ pub(crate) fn run_formatted(mode: Mode, format: Format) -> i32 {
             ],
             Mode::Egress => &[
                 "allowed reached, others blocked",
+                "default routes",
                 "command cannot change the network",
                 "host Unix sockets unreachable",
             ],

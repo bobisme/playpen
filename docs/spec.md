@@ -56,6 +56,15 @@ If you used v0.1, these will be different:
   `stopped_by_drop`, the shareable report has `on_drop` and
   `stopped_by_drop`, and the plan has `on_drop`. Without it the ruleset,
   the plan and the reports are as before.
+- **Under `--no-network`, a packet to another host is refused and
+  counted**, as with a network. The sandbox has the discard interface
+  `discard0` beside `lo` (section 5, step 6), so `--fail-on-drop`,
+  `--on-drop` and `--live-drops` see such packets. Before, they failed at
+  routing ("Network is unreachable") and were in no counter. With pasta,
+  an address family this host has no default route for gets one into
+  pasta's interface, for the same reason (step 8). When playpen cannot add
+  the route, it prints a NOTE, the report has the new field `uncounted`,
+  and `--fail-on-drop` says `unknown`.
 
 ## 1. Purpose and non-goals
 
@@ -99,8 +108,9 @@ The namespace code does not know where the rules came from.
 
 - a user namespace whose root is mapped to the caller (the *outer* user
   namespace), owning
-- a network namespace that has `lo` and, unless `--no-network`, one
-  interface managed by pasta;
+- a network namespace that has `lo` and one interface managed by pasta,
+  or with `--no-network` the discard interface `discard0` (section 5,
+  step 6);
 - a PID namespace, so the command sees only its own processes and they all
   end when it ends;
 - a private mount namespace, with a fresh `/proc`, generated resolver
@@ -309,7 +319,11 @@ cloud instance metadata address; a command that reaches it may read this
 machine's cloud credentials`. A grant covers the address when its network
 contains it, so `169.254.0.0/16:80/tcp` does.
 
-**`--no-network`**. No pasta: the sandbox has only `lo`. Cannot be combined
+**`--no-network`**. No pasta: the sandbox has `lo` and `discard0`, a
+`dummy` interface that discards what is sent to it. Both default routes
+lead to `discard0`, so a packet to another host reaches the output chain
+and is dropped and counted like any other (section 6). Nothing passes the
+filter to `discard0`, and what did would go nowhere. Cannot be combined
 with `--allow`.
 
 With none of `--pass`, `--allow` and `--no-network`, playpen refuses: an
@@ -674,10 +688,11 @@ The supervisor’s human-readable diagnostics on stderr include the following me
 - just before the command starts, the start line. The first line is short:
   `allowing only SPECS until TIME; everything else is dropped`, with
   `with no time limit` when there is no `--until`; with `--no-network`:
-  `no network, loopback only, until TIME`. Each further clause group is on
-  its own line, prefixed `playpen:   ` (playpen, colon, three spaces), so
-  that a log filtered by the `playpen:` prefix keeps every line. The
-  clauses keep their wording. In this order:
+  `no network, loopback only, until TIME; everything else is dropped`.
+  Each further clause group is on its own line, prefixed `playpen:   `
+  (playpen, colon, three spaces), so that a log filtered by the
+  `playpen:` prefix keeps every line. The clauses keep their wording. In
+  this order:
   - with `--pass`, `under pass ID ("NAME", owner "OWNER", sha256:DIGEST,
     window ends TIME, destinations LABEL, ...)`;
   - the names: `no DNS[, names NAME=ADDR, ...]; lookups recorded`. With
@@ -717,6 +732,13 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   playpen does not enforce, the `--pass-hosts` notes, and, when an allowed
   grant covers a cloud metadata address, the note described under
   `--allow`. The JSON report is unchanged;
+- when packets to other hosts fail at routing in this sandbox (section 5,
+  steps 6 and 8), once, after the start line: `NOTE: WHY. The drop counts
+  of this run are incomplete: --fail-on-drop says unknown, and --on-drop
+  and --live-drops do not see these packets`. WHY names the families and
+  the cause, for example `IPv6 packets to other hosts fail at routing and
+  are not counted (the host has no IPv6 default route, and playpen could
+  not add one to pasta's interface: ...)`;
 - when the end time is reached: `the approval ended at TIME; the firewall
   now refuses all traffic but loopback; sending SIGTERM to the command
   (SIGKILL in 3 s)`. When egress could not be closed: `the approval ended
@@ -746,6 +768,7 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   unapproved destinations were dropped`, or a block between lines of
   asterisks starting `WARNING: N packet(s) to UNAPPROVED destinations were
   dropped.` listing each destination with protocol, port and packet count;
+  then, when `uncounted` is set, `the drop count is incomplete: WHY`;
   then, with `--on-drop`, when the cut tripped, `the firewall closed all
   egress at the first dropped packet (--on-drop cut|stop): DESTINATIONS;
   N packet(s) refused after that` (each part only when known), and with
@@ -754,6 +777,8 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   then, with `--fail-on-drop`, when the command exited 0 and playpen exits
   1: `exiting with status 1: --fail-on-drop and N packet(s) to unapproved
   destinations were dropped`, or `exiting with status 1: --fail-on-drop and
+  packets to other hosts may have failed before the firewall could count
+  them` (when `uncounted` is set), or `exiting with status 1: --fail-on-drop and
   the drop counters were unknown or unreadable, or inconsistent`, or
   `exiting with status 1: --fail-on-drop and playpen stopped the command`
   (no line when the check passes);
@@ -970,7 +995,10 @@ playpen doctor [--mode offline|egress] [--format text|pretty|json]
 
 `--mode egress` is the default and retains the full egress check. `--mode
 offline` does not require `pasta`; it demonstrates a real `--no-network`
-command and verifies that only loopback is visible. Both modes require user
+command and verifies (`offline loopback only`) that the sandbox has only
+`lo` and `discard0`, that both default routes lead to `discard0`, and that
+a TCP attempt to `192.0.2.1` port 9 and a UDP attempt to `2001:db8::1`
+port 9 are refused and counted. Both modes require user
 namespaces, a working `nft`, and Landlock ABI 9 or later, and run local
 privilege and Unix-socket checks. Egress mode additionally requires `pasta`
 and tests approved TCP, UDP, and IPv6 destinations against blocked ones.
@@ -1006,11 +1034,17 @@ The egress checks, without changing any host setting:
    sandbox's own `lo`, approves some ports on the first of each, and checks
    that approved TCP, UDP and IPv6 destinations are reached and the others
    are not;
-6. a second sandbox in which the command tries `nft flush ruleset`, `nft
-   add table`, netlink address, link and link-state changes, raw IPv4, raw
-   IPv6 and packet sockets, joining the user namespace of PID 1, and
-   reading PID 1's memory, and must have no capabilities;
-7. a third sandbox (`--no-network`) that must reach its own private Unix
+6. `default routes`: a sandbox with pasta must have a default route for
+   IPv4 and for IPv6. The detail says, for each family, whether the route
+   is this host's (copied by pasta) or one playpen added because this host
+   has none (section 5, step 8);
+7. a second sandbox in which the command tries `nft flush ruleset`, `nft
+   add table`, netlink address, link, link-state and route changes (adding
+   an IPv4 default route, deleting the IPv6 one), raw IPv4, raw IPv6 and
+   packet sockets, joining the user namespace of PID 1, and reading PID
+   1's memory; none may succeed, and the command must have no
+   capabilities;
+8. a third sandbox (`--no-network`) that must reach its own private Unix
    socket and must fail to connect to the host pathname and abstract sockets
    doctor creates. Doctor requires one structured result for each endpoint.
 
@@ -1110,6 +1144,7 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `dropped` | object or null | `{"packets": N, "destinations": [{"address", "protocol", "port", "packets"}], "destinations_truncated": bool}`; `port` is null for protocols other than TCP and UDP; destinations are sorted by packet count, largest first |
 | `drop_assertion` | `"pass"`, `"violated"`, or `"unknown"` | present only with `--fail-on-drop` |
 | `dropped_error` | string or null | why the counters could not be read |
+| `uncounted` | string or null | why packets to other hosts may have failed at routing in this run, before the output chain could count them: playpen could not give an address family a default route (section 5, steps 6 and 8). Null when every family had one. With it, `--fail-on-drop` gives `unknown` for a zero count, and `compare` calls the drop evidence incomplete. Not in the shareable report |
 | `lookups` | object or null | the names the command looked up: `{"names": [{"name", "count", "mapped"}], "truncated": bool}`, in the order first asked, as shown in "Name lookups" (4.1); `mapped` is true for a `--host` name; null when the command did not run or the record could not be read |
 | `lookups_error` | string or null | why the record of names could not be read |
 | `contacted` | object or null | present only with `--report-contacts`: `{"destinations": [{"address", "protocol", "port", "packets", "answered", "reset"}], "truncated": bool}`, as shown in "Contacted destinations in private reports"; null when `outcome` is not `"ran"` or the record could not be read |
@@ -1132,13 +1167,18 @@ assertion indeterminate and the wrapper exits unsuccessfully.
 
 With `--fail-on-drop`, the report includes `drop_assertion`: `pass` for a
 known zero total, `violated` for a positive total even with partial detail,
-and `unknown` when counters are unavailable or the command did not start.
+and `unknown` when counters are unavailable, when `uncounted` is set, or
+the command did not start.
 For a child exit of zero, violated or unknown makes playpen exit 1. A nonzero
 child status is retained; signals retain their normal status, and a stop by
 expiry or pass revocation cannot become success. Refusal and setup failures
-retain their existing statuses. This counts dropped IP packets, not names
-the stub answered "no such name", Unix sockets, packets that never reached
-the ruleset, or packets refused after the approval ended
+retain their existing statuses. This counts each IP packet to another host
+that no grant allows, with `--no-network` too: playpen gives every address
+family a default route (section 5), so such a packet reaches the output
+chain. It does not count names the stub answered "no such name", Unix
+sockets, packets the command could not send at all (a raw socket it may
+not open, for example), the IPv6 reports the output chain drops uncounted
+(section 6.1), or packets refused after the approval ended
 (`refused_after_end`), or packets the cut refused after `--on-drop`
 tripped it (`egress_cut.refused`); the packet that tripped it is counted
 in `dropped`. Without the
@@ -1314,8 +1354,9 @@ counters, malformed detail, unstarted runs and unsupported/reduced schemas
 cannot establish equality. So cannot a report whose `--on-drop` cut
 tripped and then refused packets (`egress_cut.refused` not 0, or null):
 the cut refuses them before the drop sets, so the report does not say
-where they went, and its drop evidence is incomplete. `on_drop` and
-`stopped_by_drop` are not policy: they change what is observed, not what
+where they went, and its drop evidence is incomplete. Nor can a report
+whose `uncounted` is not null: packets that failed at routing are in no
+counter. `on_drop` and `stopped_by_drop` are not policy: they change what is observed, not what
 is allowed.
 
 Names looked up without a `--host` mapping are observations too, compared
@@ -1459,8 +1500,11 @@ Not part of the stable interface, hidden from `--help`:
 - `run --lo-addr ADDR` adds `ADDR` to the sandbox's `lo` before the
   ruleset is loaded. Used by tests and `doctor` to have destinations that
   exist only inside the sandbox.
-- `playpen probe reach|privs|resolve|dns|unix|unix-send|unix-recv-fd|stdout-reconnect|fds|tty|signals|listen|send` are the checks
-  run inside the sandbox by `doctor` and the tests (`unix` connects to Unix
+- `playpen probe reach|privs|resolve|dns|unix|unix-send|unix-recv-fd|stdout-reconnect|fds|tty|signals|listen|send|interfaces` are the checks
+  run inside the sandbox by `doctor` and the tests (`interfaces` prints
+  the interface names and, in `default_routes`, the interfaces with an
+  IPv4 and an IPv6 default route; `privs` tries the changes of 4.4, check
+  7; `unix` connects to Unix
   sockets and closes at once, writing nothing; `listen ADDR:PORT/tcp`
   reports connections to a TCP listener, `listen ADDR:PORT/udp` each
   datagram with its payload and the wall-clock time in nanoseconds;
@@ -1515,10 +1559,15 @@ Each step either succeeds or stops the run with a message that ends
    the time zone of the `nft` process, so C lists the table with
    `TZ=UTC0` and reads that date as UTC; the time rule must be at exactly
    the end second. Handles and changing counter values
-   are ignored. Unknown material expressions stop setup. Only then does C
-   report "ready". Until this point the namespace has only `lo`. Playpen
-   relies on the kernel and the configured nft binary to report the installed
-   table faithfully.
+   are ignored. Unknown material expressions stop setup. Until this point
+   the namespace has only `lo`. Playpen relies on the kernel and the
+   configured nft binary to report the installed table faithfully. With
+   `--no-network`, C then adds the discard interface: `discard0`, of kind
+   `dummy`, up, with the addresses `192.0.0.8/32` and `100:0:0:1::8/128`
+   (no duplicate address detection) and an IPv4 and an IPv6 default route
+   through it with no gateway. A failure does not stop the run: C reports
+   `uncounted WHY` and goes on, and P prints the NOTE of 4.1 after the
+   start line. Only then does C report "ready".
 7. **P: attach pasta** (unless `--no-network`) to C's namespaces with the
    options in section 6.3, and wait for it to exit 0 (it daemonizes after
    configuring the namespace). Failure stops the run. With `--capture`, P
@@ -1527,7 +1576,15 @@ Each step either succeeds or stops the run with a message that ends
    `--pass`, re-reads the pass
    once, prints the start line, and tells C to go. That moment is the
    report's `started_at`. (Steps 4 to 6 must finish within 30 seconds.)
-8. **C makes itself non-dumpable and starts the DNS stub D.** D sets
+8. **C adds missing default routes, makes itself non-dumpable and starts
+   the DNS stub D.** With pasta, C first reads its default routes
+   (`/proc/net/route`, `/proc/net/ipv6_route`). pasta copies the host's
+   default route for each family; it makes none for a family the host has
+   an address but no default route for. For each family without one, C
+   adds a default route through pasta's interface with no gateway. A
+   failure does not stop the run: C reports `uncounted WHY`, as in step 6.
+   Then it checks for approved addresses that are the sandbox's own
+   (section 8). D sets
    "die with parent", makes itself non-dumpable, binds 127.0.0.1 port 53
    for UDP and TCP (C's root in the user namespace may bind ports below
    1024), then clears every capability set, sets `no_new_privs`, checks
@@ -1751,7 +1808,8 @@ So by default:
 
 | Traffic | Default |
 |---|---|
-| IPv4 and IPv6 to unapproved destinations | dropped and counted (TCP connect fails with "No route to host" over IPv4 and "Permission denied" over IPv6, UDP send with "Operation not permitted") |
+| IPv4 and IPv6 to unapproved destinations | dropped and counted (TCP connect fails with "No route to host" over IPv4 and "Permission denied" over IPv6, UDP send with "Operation not permitted"); also with `--no-network`, and for a family this host has no default route for (section 5, steps 6 and 8) |
+| approved destinations in a family this host has no default route for | sent to pasta, which cannot reach them from the host: a TCP connect fails with "Connection refused", a UDP datagram is lost; not counted as dropped |
 | ICMP and ICMPv6 (ping and others) | dropped and counted; cannot be approved |
 | DNS | no DNS: the only nameserver is the stub on the sandbox loopback (127.0.0.1 port 53), which answers `--host` names, says every other name does not exist, and forwards nothing; it is loopback, so it still answers after the approval ends; port 53 elsewhere is not approved unless you approve it |
 | the host's loopback | unreachable: pasta maps nothing to it and forwards no loopback ports |
@@ -1831,8 +1889,10 @@ show as `nobody`.
 ## 8. Threat model and known limits
 
 Guarded against: accidental or misconfigured traffic, redirects and name
-resolution to unapproved places, the command's children and daemons, the
-command trying to change the firewall, interfaces or addresses, open raw
+resolution to unapproved places, attempts that would fail at routing (with
+`--no-network`, or in a family this host has no default route for: they
+are refused and counted), the command's children and daemons, the
+command trying to change the firewall, interfaces, addresses or routes, open raw
 sockets, or join another network namespace, and the command reaching the
 host's network through a host daemon's Unix socket, an inherited
 descriptor, a socket on standard input or output, host IPC, the display
@@ -1903,6 +1963,11 @@ Not guarded against, or known limits:
   in the last interval before the command ends can have no record, and a
   destination beyond the 1024 of its family's set has none. The report's
   `dropped` is the complete record;
+- a packet to another host is counted only if it has a route to the
+  output chain. playpen gives every address family one (section 5); when
+  it cannot, the start says so in a NOTE, the report has `uncounted`, and
+  `--fail-on-drop` says `unknown`. Without the kernel's `dummy` driver,
+  `--no-network` runs are in that case;
 - `--on-drop` trips on refused IP packets only. A refused Unix socket, a
   lookup the stub answers "no such name", a non-IP socket family and the
   IPv6 reports the output chain drops uncounted do not trip it. What the

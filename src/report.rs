@@ -117,6 +117,10 @@ pub struct Report {
     pub drop_assertion: Option<DropAssertion>,
     /// Why the drop counters could not be read.
     pub dropped_error: Option<String>,
+    /// Why packets to other hosts may have failed at routing, before the
+    /// firewall could count them; null when every address family had a
+    /// route (see [`crate::routes`]). Never in the shareable report.
+    pub uncounted: Option<String>,
     /// The names the command looked up through the DNS stub, when they
     /// could be read. Never in the shareable report.
     pub lookups: Option<Lookups>,
@@ -307,6 +311,9 @@ pub fn text_summary(r: &Report) -> String {
         }
         (None, None) => {}
     }
+    if let Some(why) = &r.uncounted {
+        let _ = writeln!(out, "playpen: the drop count is incomplete: {why}");
+    }
     egress_cut_summary(&mut out, r);
     fail_on_drop_summary(&mut out, r);
     if let Some(n) = r.refused_after_end
@@ -366,6 +373,9 @@ fn fail_on_drop_summary(out: &mut String, r: &Report) {
             "{} packet(s) to unapproved destinations were dropped",
             d.packets
         ),
+        (Some(DropAssertion::Unknown), Some(_)) if r.uncounted.is_some() => {
+            "packets to other hosts may have failed before the firewall could count them".to_owned()
+        }
         (Some(DropAssertion::Violated | DropAssertion::Unknown), _) => {
             "the drop counters were unknown or unreadable, or inconsistent".to_owned()
         }
@@ -490,6 +500,7 @@ mod tests {
             contacts: None,
             drop_assertion: None,
             dropped_error: None,
+            uncounted: None,
             lookups: Some(Lookups::default()),
             lookups_error: None,
             socket_guard: "landlock",
@@ -749,6 +760,48 @@ mod tests {
         r.drop_assertion = Some(DropAssertion::Unknown);
         r.exit_code = Some(2);
         assert_eq!(line(&text_summary(&r)), None);
+    }
+
+    /// A zero count cannot pass when packets to other hosts could fail at
+    /// routing, before the firewall; a positive count is still a violation.
+    #[test]
+    fn uncounted_packets_make_a_zero_count_unknown() {
+        let mut r = base();
+        r.exit_code = Some(0);
+        r.uncounted =
+            Some("IPv6 packets to other hosts fail at routing and are not counted (why)".into());
+        r.playpen_exit_status = crate::cli::apply_drop_assertion(&mut r, 0, true);
+        assert_eq!(r.playpen_exit_status, 1);
+        assert_eq!(r.drop_assertion, Some(DropAssertion::Unknown));
+        let summary = text_summary(&r);
+        assert!(
+            summary.contains(
+                "playpen: the drop count is incomplete: IPv6 packets to other hosts fail at routing and are not counted (why)\n"
+            ),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("--fail-on-drop and packets to other hosts may have failed before the firewall could count them"),
+            "{summary}"
+        );
+        let json = serde_json::to_value(&r).unwrap_or_default();
+        assert!(
+            json["uncounted"]
+                .as_str()
+                .is_some_and(|w| w.contains("IPv6"))
+        );
+        let shared = serde_json::to_value(ShareableReport::from(&r)).unwrap_or_default();
+        assert!(shared.get("uncounted").is_none(), "{shared}");
+        assert_eq!(shared["drop_assertion"], "unknown");
+        r.dropped = Some(DropSummary {
+            packets: 1,
+            destinations: vec![],
+            destinations_truncated: true,
+        });
+        assert_eq!(crate::cli::apply_drop_assertion(&mut r, 0, true), 1);
+        assert_eq!(r.drop_assertion, Some(DropAssertion::Violated));
+        // Every family had a route: the report says null.
+        assert!(serde_json::to_value(base()).unwrap_or_default()["uncounted"].is_null());
     }
 
     #[test]

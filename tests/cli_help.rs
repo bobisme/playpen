@@ -425,3 +425,42 @@ fn the_contacted_record_and_suggest_are_listed() {
         "{text}"
     );
 }
+
+/// The help says what `--fail-on-drop` counts, `--no-network` included, and
+/// what makes the count incomplete.
+#[test]
+fn run_help_says_what_fail_on_drop_counts() {
+    let help = json(&invoke(&["help", "run", "--format", "json"], None).stdout);
+    let said = |long: &str| {
+        help["arguments"]
+            .as_array()
+            .expect("arguments")
+            .iter()
+            .find(|a| a["long"] == long)
+            .and_then(|a| a["help"].as_str())
+            .unwrap_or_else(|| panic!("no --{long} in {help}"))
+            .to_owned()
+    };
+    let fail = said("fail-on-drop");
+    for part in [
+        "each packet to another host that no grant allows",
+        "--no-network included",
+        "loopback, lookups the DNS stub answered and host Unix sockets are not counted",
+        "a family with no route",
+    ] {
+        assert!(fail.contains(part), "{part}: {fail}");
+    }
+    let offline = said("no-network");
+    assert!(
+        offline.contains("a packet to any other host is dropped and counted"),
+        "{offline}"
+    );
+    let workflow = help["workflow"].as_str().unwrap_or("");
+    assert!(
+        workflow.contains("--fail-on-drop counts each packet to another host that no grant allows, with --no-network too")
+            && workflow.contains("uncounted"),
+        "{workflow}"
+    );
+    let text = String::from_utf8(invoke(&["run", "--help"], None).stdout).expect("help");
+    assert!(text.contains("--fail-on-drop"), "{text}");
+}

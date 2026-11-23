@@ -33,6 +33,13 @@ runs fast. The policy is still drop,
 so anything that gets past the reject (nothing should) is dropped. With
 `--on-drop` the last rule is a drop instead ("The tripwire").
 
+**A route for every packet.** A packet with no route fails before the
+output hook and is not counted. So the sandbox always has a default route
+for both families: through a `dummy` interface under `--no-network`, and
+through pasta's interface for a family the host has none for. Where that
+cannot be done, the run says the count is incomplete ("A route for every
+packet").
+
 **nix, not rustix.** playpen needs fork, unshare, setns, mount, signalfd,
 prctl (pdeathsig, dumpable, no_new_privs), setresuid/gid, waitpid, poll and
 netlink sockets. nix has safe wrappers for all of them; rustix has no
@@ -814,9 +821,11 @@ The process tree and the order are given in the spec. The points that
 matter for safety:
 
 1. **No connectivity before the rules.** The network namespace starts with
-   only `lo`. The ruleset is loaded and verified first; pasta is attached
-   only afterwards. There is no moment at which a route out exists without
-   the filter.
+   only `lo`. The ruleset is loaded and verified first; pasta, or under
+   `--no-network` the discard interface, is attached only afterwards.
+   There is no moment at which a route out exists without the filter.
+   Then every address family has a default route, so that every packet to
+   another host reaches the filter ("A route for every packet").
 2. **Read back the installed policy.** After loading, Playpen compares
    the JSON for its table with the typed approval before reporting ready.
    It checks table family, chain hooks, priorities and policies, ordered rule
@@ -862,6 +871,134 @@ matter for safety:
    is gone, and it exits, which kills everything in the PID namespace
    (`killing_playpen_kills_the_sandbox`). What a killed playpen leaves
    behind is the small directory of pasta's PID file.
+
+## A route for every packet
+
+The kernel routes a packet before the output hook sees it. A connect or
+send with no route fails at once with "Network is unreachable"
+(`ENETUNREACH`) and never reaches the ruleset. The ruleset does not
+refuse it or count it, so `--fail-on-drop`, `--on-drop` and
+`--live-drops` do not see it. Two cases had no route:
+
+- **`--no-network`.** The namespace had only `lo`, so every packet to
+  another host failed at routing. A build that sent TCP and UDP to
+  `203.0.113.50`, then printed "build ok" and exited 0, passed
+  `--fail-on-drop` with 0 packets dropped.
+- **An address family the host has no default route for, with pasta.**
+  pasta copies the host's addresses and routes (`--config-net`). A host
+  with an IPv4 default route and only unique local IPv6 addresses
+  (`fd00::/8`, routes from router advertisements, no default) gives the
+  sandbox no IPv6 default route. `curl -6` to an unapproved address was
+  not counted.
+
+So C gives the sandbox a default route for each family before the command
+exists. The ruleset then decides about such a packet as about any other.
+Routes of other kinds do not do this: with a `blackhole` default route a
+connect fails with "Invalid argument", and with an `unreachable` one with
+"No route to host", and in both cases a counter in the output hook stays
+at 0 (measured in a throwaway namespace).
+
+**`--no-network`: the discard interface.** After the ruleset is loaded
+and verified, C adds `discard0`, an interface of kind `dummy`, with the
+IPv4 and IPv6 default routes through it. A `dummy` interface frees every
+packet handed to it, so nothing can leave through it, even a packet that
+passed the filter. None does: `--no-network` has no grants, so the output
+chain accepts only loopback, replies, and IPv6 neighbour discovery with
+hop limit 255. A packet to another host gets to the last rule, is counted
+and is rejected, as with a network: an IPv4 TCP connect fails at once with
+"No route to host", an IPv6 one with "Permission denied" after about 1
+second (the kernel sends the SYN twice, and both are counted), and a UDP
+send with "Operation not permitted". The interface's transmit counter
+stays at 0. When the interface comes up, the kernel sends IPv6 multicast
+listener reports and router solicitations to `ff02::/16`. The output
+chain drops them without counting them, so a run that sends nothing
+counts 0.
+
+`discard0` has the addresses `192.0.0.8/32` and `100:0:0:1::8/128`.
+
+- **Why addresses at all.** Without them the kernel sends with source
+  `0.0.0.0` over IPv4 and the link-local address over IPv6. The refusal
+  works all the same, but glibc's `getaddrinfo` with `AI_ADDRCONFIG`
+  then sees an IPv6 address and no IPv4 one besides loopback, and leaves
+  out IPv4 results. With one address of each family it returns both, as
+  it did with `lo` alone. With an address, a packet to another host has
+  the source `192.0.0.8` or `100:0:0:1::8` (checked with `ip route get`).
+  The IPv6 address skips duplicate address detection, so it is usable at
+  once.
+- **Why these.** `192.0.0.8` is the "IPv4 dummy address" of RFC 7600, and
+  `100:0:0:1::/64` the "Dummy IPv6 Prefix" of RFC 9780. IANA lists both as
+  a source only, never a destination, not forwardable and not globally
+  reachable. No approval can name them: `--allow` and `--pass` cannot be
+  combined with `--no-network`, and the check for approved addresses that
+  are the sandbox's own ("The host's own addresses") runs only with
+  pasta. They are not the documentation addresses (`192.0.2.0/24`,
+  `2001:db8::/32`) that the tests and `doctor` send to. A connect to one
+  of them from inside is local and goes over `lo`, and the output chain
+  accepts only `127.0.0.0/8` and `::1` there, so it is refused and counted
+  like any other.
+
+The command cannot change any of this. rtnetlink checks `CAP_NET_ADMIN`
+over the network namespace before it reads a request, and the command has
+no capabilities there (point 4 of "The mechanism, step by step"). `probe privs` tries to add an IPv4
+default route and to delete the IPv6 one; both fail with `EPERM`.
+
+Loopback, the DNS stub on `127.0.0.1:53` and `--fixture` use `lo` and are
+unchanged.
+
+**When the driver is missing.** Most distribution kernels build the
+`dummy` driver as a module (`CONFIG_DUMMY=m`). For C, which holds
+`CAP_NET_ADMIN` over its namespace, the kernel loads the module on request
+when it is not loaded, and the module then stays loaded. This was not
+measured: on the test host the module was already loaded. A kernel
+without the driver refuses the interface with "Operation not supported".
+Then the run goes on, as it did before this change, but not silently:
+the start has a NOTE that says which packets are not counted and why, the
+report has `uncounted`, `--fail-on-drop` says `unknown` and exits 1, and
+`compare` calls the drop evidence incomplete. Refusing `--no-network`
+would stop runs that need no drop count. Refusing only the drop options
+would make `--fail-on-drop` fail with no report. `unknown` already means
+"the count cannot be trusted", which is the case.
+
+**With pasta: a route into pasta's interface.** Once pasta has configured
+the namespace, before the command exists, C reads the default routes
+(`/proc/net/route`, `/proc/net/ipv6_route`; a route is a default route
+when it is up, is not a reject route, and has prefix length 0). For each
+family without one, C adds `default dev IF` through pasta's interface,
+without a gateway. A refused packet is then refused and counted before it
+needs a neighbour. An approved one needs a link-layer address for its
+destination: pasta answers ARP and neighbour solicitations for every
+address on its link, so the packet gets to pasta. pasta then tries to
+reach the destination from the host, which has no route for it either. A
+TCP connect fails at once with "Connection refused" (pasta resets the
+connection), and a UDP datagram is lost. Neither is a drop. Measured with
+pasta 2026_09_25.
+
+What pasta does by itself, in that version:
+
+- a family the host has no address for (an IPv4-only host): pasta
+  configures it in its local mode, with a default route (IPv4 through
+  `169.254.2.2`, IPv6 through `fe80::1`). The family has a route, and C
+  adds nothing. An older pasta that does not do this gets C's route;
+- a family the host has an address for but no default route (this
+  host's IPv6, or an IPv4 address with no default route): pasta copies
+  the address and its prefix routes and adds no default route. This is
+  the case C fixes.
+
+The alternative was to report the missing route and make
+`--fail-on-drop` say `unknown`, without adding one. On such a host every
+run would then be `unknown`, and `--fail-on-drop` would be of no use
+there. A route costs nothing that matters: the approved destinations of
+that family were unreachable before, and are still. The report path
+remains for when the route cannot be added: C reports `uncounted WHY`, as
+with `--no-network`. The doctor's egress check `default routes` says, for
+each family, whether the sandbox has the host's default route or C's.
+
+`tests/routes.rs` checks both remedies: the build above fails
+`--fail-on-drop`, `--on-drop stop` stops at the first attempt,
+`--live-drops` names IPv4 and IPv6 destinations, and in throwaway
+namespaces that play a host with no IPv6 default route, no IPv4 default
+route, and no IPv6 at all, attempts in the missing family are counted
+while an approved IPv4 destination is still reached.
 
 ## Name lookups
 
@@ -1494,7 +1631,8 @@ less.
 | A lookup that carries terminal escape sequences, or a name too long to show | escaped by the stub, cut at 253 bytes, checked again in P and in `compare` | yes (OSC and CSI sequences, a 255-byte name, a malformed label; property tests of the parser and the escaping) |
 | A bug in the stub's parser, reached by a hostile query | bounds-checked parser with no `unsafe`; the stub has no capabilities, `no_new_privs`, and Landlock that leaves it only its descriptors | property tests on arbitrary bytes; `deny_all_leaves_only_the_descriptors_held`; the stub's `CapEff` and `NoNewPrivs` checked from the host |
 | Host files changed | none are: all overrides are bind mounts in a private mount namespace | yes (`/etc/hosts` unchanged) |
-| Command changes the rules, adds addresses or links, opens raw/packet sockets, joins init's user namespace, reads init's memory | nested user namespace, no capabilities, init non-dumpable | yes, each one, for the command and for a grandchild; and the rules still block after the command ran `nft flush ruleset` |
+| A packet that fails at routing and so is not counted (`--no-network`, or a family the host has no default route for) | a default route for each family: through `discard0` (a `dummy` interface) under `--no-network`, through pasta's interface otherwise; when that fails, a NOTE, `uncounted`, and `unknown` for `--fail-on-drop` | yes (`tests/routes.rs`, with throwaway hosts that lack an IPv4 or an IPv6 default route; `doctor` in both modes) |
+| Command changes the rules, adds addresses or links, changes routes, opens raw/packet sockets, joins init's user namespace, reads init's memory | nested user namespace, no capabilities, init non-dumpable | yes, each one, for the command and for a grandchild; and the rules still block after the command ran `nft flush ruleset` |
 | Command joins the host's network namespace | it would need `CAP_SYS_ADMIN` in the host's user namespace; host processes are invisible (PID namespace, fresh `/proc`) | indirectly (no capabilities; `setns` to init's namespace denied) |
 | Inherited sockets from the caller (a host-namespace socket on fd 3+) | every descriptor above 2 is marked close-on-exec before the sandbox starts | yes (file, Unix, TCP, UDP, listener, pipe) |
 | Standard streams that are host-network sockets (UDP, TCP in any state, other families; without Landlock also Unix sockets that can still be connected somewhere) | refused before anything runs | yes, with the reconnect attempted from inside |

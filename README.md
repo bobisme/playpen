@@ -249,14 +249,27 @@ It cannot say which one differs, because only the digest was reviewed.
 
 ### Check dropped traffic in CI
 
-For CI, fail a successful command if it sends a counted denied packet:
+For CI, fail a successful command if it tried to reach a host nobody
+approved:
 
 ```sh
 playpen run --allow 192.0.2.1:443/tcp --fail-on-drop --report report.json -- ./check
+playpen run --no-network --fail-on-drop --report report.json -- ./build
 ```
 
-Unavailable counters also fail the assertion. The report keeps the child
-status separately from playpen's exit status.
+The firewall counts each packet the command sends to another host that no
+grant allows, over IPv4 and IPv6. This holds with `--no-network` too, and
+for an address family this host has no default route for: playpen gives
+the sandbox a route for every family, so the packet reaches the firewall
+(DESIGN.md, "A route for every packet"). These are not counted: traffic on
+the sandbox's loopback, lookups the DNS stub answered (the summary lists
+the names that have no `--host` mapping), host Unix sockets, and the
+kernel's own IPv6 multicast listener reports and router solicitations.
+
+An incomplete count also fails the assertion, as `unknown`: the counters
+could not be read (`dropped_error`), or playpen could not give an address
+family a route (`uncounted`; a NOTE at the start says so). The report
+keeps the child status separately from playpen's exit status.
 
 ### Learn of a refused destination while the command runs
 
@@ -454,7 +467,9 @@ Do not run playpen inside `playpen run`; the inner one cannot start.
 - Landlock ABI 9 or later, to refuse host Unix sockets. On older kernels
   `--without-landlock` runs with weaker, mount-only hiding.
 - `nft` (nftables) and `pasta` (from the passt package). `--no-network`
-  needs only `nft`.
+  needs only `nft`, and the kernel's `dummy` interface driver
+  (`CONFIG_DUMMY`) to count what the command sends to other hosts. Without
+  the driver, the run says that the drop count is incomplete.
 - No root, no setuid helper, no subuid/subgid ranges, no change to host
   settings. playpen refuses to run as root.
 
@@ -469,11 +484,16 @@ guarded offline invocation above to check ordinary command support.
 
 ### Check this host
 
-Offline mode runs a real command with only the sandbox loopback interface.
-It checks the command’s network privileges and verifies that a private Unix socket
+Offline mode runs a real command in a sandbox with no network. The
+sandbox has its loopback interface and `discard0`, which discards what is
+sent to it and has both default routes. The check requires a TCP attempt
+to an IPv4 address and a UDP attempt to an IPv6 address to be refused and
+counted. It checks the command’s network privileges and verifies that a private Unix socket
 connects while the host pathname and abstract sockets are unreachable.
 Egress mode also uses pasta and tests allowed and denied TCP, UDP and IPv6
-destinations. Both modes require user namespaces, nft and Landlock ABI 9 or later.
+destinations. It reports, for each address family, whether the sandbox has
+this host's default route or one that playpen added because this host has
+none. Both modes require user namespaces, nft and Landlock ABI 9 or later.
 
 ```console
 $ playpen doctor --mode offline --format json | jq -r .capability.status
@@ -527,8 +547,13 @@ playpen guards against:
 - children and background processes of the command: they stay in the same
   sandbox and are killed when the command exits;
 - the command trying to undo the guard: it cannot change the firewall,
-  add addresses or interfaces, open raw sockets, or join another network
-  namespace (each is tested);
+  add addresses or interfaces, change routes, open raw sockets, or join
+  another network namespace (each is tested);
+- attempts that would fail before the firewall: with `--no-network`, or
+  over an address family this host has no default route for, a packet to
+  another host still reaches the firewall and is refused and counted. If
+  playpen cannot set up the route, it says so at the start, and
+  `--fail-on-drop` fails as unknown;
 - side doors to the host's network: host daemons reached through Unix
   sockets anywhere in the file system (refused unless you `--expose`
   them), host abstract sockets, descriptors inherited from the caller, a

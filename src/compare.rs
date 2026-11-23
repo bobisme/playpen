@@ -138,6 +138,8 @@ fn dropped_endpoints(v: &Value) -> (BTreeSet<Endpoint>, bool) {
     }
     complete &= sum == v["dropped"]["packets"].as_u64();
     complete &= !cut_hid_drops(v);
+    // Packets that failed at routing are not in the counters at all.
+    complete &= v["uncounted"].is_null();
     (endpoints, complete)
 }
 

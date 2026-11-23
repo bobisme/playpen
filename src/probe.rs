@@ -25,7 +25,11 @@ pub struct Target {
     pub udp: bool,
 }
 
-/// Lists interface names visible through the current network namespace.
+/// Lists the interfaces and default routes of the current network namespace.
+///
+/// `interfaces` has the interface names; `default_routes` has, for `ipv4`
+/// and `ipv6`, the interfaces with a default route, or the error that kept
+/// them from being read.
 #[must_use]
 pub fn interfaces() -> String {
     let contents = fs::read_to_string("/proc/net/dev").unwrap_or_default();
@@ -34,7 +38,9 @@ pub fn interfaces() -> String {
         .skip(2)
         .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim().to_owned()))
         .collect::<Vec<_>>();
-    json!({"interfaces": names}).to_string()
+    let routes =
+        crate::routes::DefaultRoutes::read().map_or_else(|e| json!({"error": e}), |r| json!(r));
+    json!({"interfaces": names, "default_routes": routes}).to_string()
 }
 
 /// Parses a probe target.
@@ -171,6 +177,8 @@ pub fn privs(nft: &str) -> Value {
         "add_address": errno_outcome(crate::netlink::add_address(crate::netlink::LO_INDEX, doc)),
         "add_link": errno_outcome(crate::netlink::add_link("escape0", "dummy")),
         "set_link_up": errno_outcome(crate::netlink::set_link_up(crate::netlink::LO_INDEX)),
+        "add_route": errno_outcome(crate::netlink::add_default_route(crate::netlink::Family::V4, crate::netlink::LO_INDEX)),
+        "delete_route": errno_outcome(crate::netlink::delete_default_route(crate::netlink::Family::V6, default_route_index(crate::netlink::Family::V6))),
         "raw_socket_v4": errno_outcome(try_socket(AddressFamily::Inet, Some(SockProtocol::Icmp))),
         "raw_socket_v6": errno_outcome(try_socket(AddressFamily::Inet6, Some(SockProtocol::IcmpV6))),
         "packet_socket": errno_outcome(try_socket(AddressFamily::Packet, None)),
@@ -185,6 +193,17 @@ pub fn privs(nft: &str) -> Value {
         "uid": nix::unistd::getuid().as_raw(),
         "gid": nix::unistd::getgid().as_raw(),
     })
+}
+
+/// The index of an interface with a default route for `family`, so that
+/// the probe tries to delete a route that exists; `lo` when there is none
+/// (the kernel checks the capability first either way).
+fn default_route_index(family: crate::netlink::Family) -> u32 {
+    crate::routes::DefaultRoutes::read()
+        .ok()
+        .and_then(|routes| routes.of(family).first().cloned())
+        .and_then(|name| nix::net::if_::if_nametoindex(name.as_str()).ok())
+        .unwrap_or(crate::netlink::LO_INDEX)
 }
 
 /// Tries to join the user namespace of PID 1 (the sandbox's init, which

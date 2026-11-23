@@ -1,8 +1,9 @@
 //! A few route-netlink requests, built by hand.
 //!
-//! They bring an interface up, add an address and create a link. Used to set
-//! up `lo` inside the namespace and by the probes that check the command
-//! cannot change the network.
+//! They bring an interface up, add an address, create a link, and add or
+//! delete a default route. Used to set up `lo` and the routes inside the
+//! namespace (see [`crate::routes`]) and by the probes that check the
+//! command cannot change the network.
 
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -14,6 +15,8 @@ use nix::sys::socket::{
 
 const RTM_NEWLINK: u16 = 16;
 const RTM_NEWADDR: u16 = 20;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_DELROUTE: u16 = 25;
 const NLMSG_ERROR: u16 = 2;
 const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_ACK: u16 = 0x4;
@@ -29,6 +32,42 @@ const IFLA_INFO_KIND: u16 = 1;
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 const RT_SCOPE_HOST: u8 = 254;
+const RT_SCOPE_LINK: u8 = 253;
+const RT_SCOPE_UNIVERSE: u8 = 0;
+const RT_TABLE_MAIN: u8 = 254;
+const RTPROT_STATIC: u8 = 4;
+const RTN_UNICAST: u8 = 1;
+const RTA_OIF: u16 = 4;
+
+/// An IP address family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    /// IPv4.
+    V4,
+    /// IPv6.
+    V6,
+}
+
+impl Family {
+    /// Both families, IPv4 first.
+    pub const BOTH: [Self; 2] = [Self::V4, Self::V6];
+
+    /// `IPv4` or `IPv6`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::V4 => "IPv4",
+            Self::V6 => "IPv6",
+        }
+    }
+
+    const fn af(self) -> u8 {
+        match self {
+            Self::V4 => AF_INET,
+            Self::V6 => AF_INET6,
+        }
+    }
+}
 
 /// Interface index of `lo`, which is always 1 in a new network namespace.
 pub const LO_INDEX: u32 = 1;
@@ -101,16 +140,33 @@ pub fn set_link_up(index: u32) -> Result<(), Errno> {
     request(&message(RTM_NEWLINK, 0, &body))
 }
 
-/// Adds `addr` with a full-length prefix to interface `index`.
+/// Adds `addr` with a full-length prefix and host scope to interface
+/// `index`: for addresses on `lo`, which are never a source for another
+/// interface.
 ///
 /// # Errors
 /// The kernel's error.
 pub fn add_address(index: u32, addr: IpAddr) -> Result<(), Errno> {
+    address(index, addr, RT_SCOPE_HOST)
+}
+
+/// Adds `addr` with a full-length prefix and global scope to `index`.
+///
+/// The kernel then picks it as the source of a packet routed out of that
+/// interface. IPv6 addresses skip duplicate address detection.
+///
+/// # Errors
+/// The kernel's error.
+pub fn add_source_address(index: u32, addr: IpAddr) -> Result<(), Errno> {
+    address(index, addr, RT_SCOPE_UNIVERSE)
+}
+
+fn address(index: u32, addr: IpAddr, scope: u8) -> Result<(), Errno> {
     let (family, prefix, bytes, flags): (u8, u8, Vec<u8>, u8) = match addr {
         IpAddr::V4(a) => (AF_INET, 32, a.octets().to_vec(), 0),
         IpAddr::V6(a) => (AF_INET6, 128, a.octets().to_vec(), IFA_F_NODAD),
     };
-    let mut body = vec![family, prefix, flags, RT_SCOPE_HOST];
+    let mut body = vec![family, prefix, flags, scope];
     body.extend_from_slice(&index.to_ne_bytes());
     if family == AF_INET {
         attr(&mut body, IFA_LOCAL, &bytes);
@@ -138,4 +194,51 @@ pub fn add_link(name: &str, kind: &str) -> Result<(), Errno> {
     attr(&mut info, IFLA_INFO_KIND, &kind_z);
     attr(&mut body, IFLA_LINKINFO, &info);
     request(&message(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, &body))
+}
+
+/// A request for the default route of `family` in the main table, out of
+/// interface `index` without a gateway (every destination is on the link).
+fn default_route(ty: u16, flags: u16, family: Family, index: u32) -> Vec<u8> {
+    // IPv6 ignores the scope; `ip route` gives such an IPv4 route link scope.
+    let scope = match family {
+        Family::V4 => RT_SCOPE_LINK,
+        Family::V6 => RT_SCOPE_UNIVERSE,
+    };
+    // struct rtmsg: family, dst_len, src_len, tos, table, protocol, scope,
+    // type, flags.
+    let mut body = vec![
+        family.af(),
+        0,
+        0,
+        0,
+        RT_TABLE_MAIN,
+        RTPROT_STATIC,
+        scope,
+        RTN_UNICAST,
+    ];
+    body.extend_from_slice(&0u32.to_ne_bytes());
+    attr(&mut body, RTA_OIF, &index.to_ne_bytes());
+    message(ty, flags, &body)
+}
+
+/// Adds a default route for `family` out of interface `index`, without a
+/// gateway. Fails with `EEXIST` when the main table has one already.
+///
+/// # Errors
+/// The kernel's error.
+pub fn add_default_route(family: Family, index: u32) -> Result<(), Errno> {
+    request(&default_route(
+        RTM_NEWROUTE,
+        NLM_F_CREATE | NLM_F_EXCL,
+        family,
+        index,
+    ))
+}
+
+/// Deletes the default route for `family` out of interface `index`.
+///
+/// # Errors
+/// The kernel's error, for example `EPERM` without `CAP_NET_ADMIN`.
+pub fn delete_default_route(family: Family, index: u32) -> Result<(), Errno> {
+    request(&default_route(RTM_DELROUTE, 0, family, index))
 }
