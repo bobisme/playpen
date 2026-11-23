@@ -1289,8 +1289,13 @@ fn private_tty_resizes_and_restores_the_outer_terminal_after_interrupt() {
     require_pty!(t);
     t.send("before=$(stty -g)\n");
     t.expect("$ ");
+    // Ctrl-C follows stty's output at once, often while stty exits. A
+    // non-interactive bash that gets SIGINT while it waits for a command
+    // that then exits normally takes the signal as handled by that
+    // command, and loops on: about 1 run in 100 under load. A SIGINT trap
+    // runs however that command ends.
     t.send(
-        r#"$P run --no-network --private-tty -- sh -c 'trap "stty size </dev/tty" WINCH; printf "resize-%s\n" ready; while :; do sleep 0.1; done'
+        r#"$P run --no-network --private-tty -- sh -c 'trap "exit 130" INT; trap "stty size </dev/tty" WINCH; printf "resize-%s\n" ready; while :; do sleep 0.1; done'
 "#,
     );
     t.expect("resize-ready\r\n");
@@ -1430,16 +1435,46 @@ fn private_tty_signals_foreground_pipeline_after_its_leader_exits() {
 #[test]
 fn private_tty_restores_mode_when_session_leader_is_killed() {
     require_sandbox!();
-    assert_private_tty_restored_after_leader_kill(false);
+    assert_private_tty_restored_after_leader_kill(Leader::Playpen);
 }
 
 #[test]
 fn private_tty_restores_mode_after_leader_kill_with_redirected_stdin() {
     require_sandbox!();
-    assert_private_tty_restored_after_leader_kill(true);
+    assert_private_tty_restored_after_leader_kill(Leader::PlaypenWithoutStdin);
 }
 
-fn assert_private_tty_restored_after_leader_kill(redirected_stdin: bool) {
+/// The terminal leaves the relay's session while playpen still runs: the
+/// shell that leads the session is killed, and playpen ends only once its
+/// command has the hangup.
+///
+/// When playpen itself leads the session and is killed, the relay sees
+/// the same state for less than a millisecond: Linux takes the terminal
+/// from the session before it reparents the relay and sends it the
+/// parent-death signal. A relay that sampled the terminal then marked it
+/// inactive without restoring it, and about 1 in 100 runs of
+/// `private_tty_restores_mode_when_session_leader_is_killed` under load
+/// left the terminal raw. Here that state lasts until playpen exits, so
+/// the old relay failed every time.
+#[test]
+fn private_tty_restores_mode_when_its_session_ends_while_playpen_runs() {
+    require_sandbox!();
+    assert_private_tty_restored_after_leader_kill(Leader::Shell);
+}
+
+/// What leads the session of the terminal in
+/// `assert_private_tty_restored_after_leader_kill`.
+#[derive(Clone, Copy)]
+enum Leader {
+    /// Playpen itself.
+    Playpen,
+    /// Playpen, with standard input from `/dev/null`.
+    PlaypenWithoutStdin,
+    /// A shell that started playpen and waits for it.
+    Shell,
+}
+
+fn assert_private_tty_restored_after_leader_kill(leader: Leader) {
     use std::os::unix::process::ExitStatusExt as _;
 
     // Retain the slave in the test process, outside Playpen's session, so
@@ -1469,14 +1504,23 @@ fn assert_private_tty_restored_after_leader_kill(redirected_stdin: bool) {
         }
     };
     let before = mode();
-    let mut cmd = if redirected_stdin {
+    let mut cmd = match leader {
+        Leader::Playpen => Command::new(BIN),
         // The fixture gives the shell a controlling terminal. It keeps
         // the same session-leader PID when it execs Playpen with a null fd 0.
-        let mut shell = Command::new("sh");
-        shell.args(["-c", "exec \"$@\" </dev/null", "session-leader", BIN]);
-        shell
-    } else {
-        Command::new(BIN)
+        Leader::PlaypenWithoutStdin => {
+            let mut shell = Command::new("sh");
+            shell.args(["-c", "exec \"$@\" </dev/null", "session-leader", BIN]);
+            shell
+        }
+        // Playpen is the shell's child in the shell's process group, which
+        // is the terminal's foreground group. The `:` after it keeps the
+        // shell from replacing itself with playpen.
+        Leader::Shell => {
+            let mut shell = Command::new("sh");
+            shell.args(["-c", "\"$@\"; :", "session-leader", BIN]);
+            shell
+        }
     };
     cmd.args([
         "run",

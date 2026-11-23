@@ -590,6 +590,21 @@ to the host terminal may emit a newline without a carriage return. At
 teardown the relay drains pending
 output and restores the caller's terminal settings.
 
+The relay also restores them when its session loses the terminal (bn-2xc).
+That happens when the session's leader exits: Playpen itself, when it
+leads the session and is killed, or the shell that started it. Linux takes
+the terminal from the session before it reparents the relay and sends it
+the parent-death signal. A relay that looked at the terminal in that gap
+saw it no longer in the foreground and let it go without restoring it.
+After a kill of Playpen the gap is less than a millisecond, and about 1 run
+in 100 under load left the terminal raw. After the death of a shell that
+started Playpen, it lasts until Playpen ends, and every run left the
+terminal raw. Now the relay restores the terminal at any point where it
+lets it go, if its own group is in the foreground or its session has lost
+the terminal. Outside a session, a terminal that another session has taken
+since looks the same as one that nobody has. The relay cannot tell the two
+apart, but it restores within one 20 ms look after the loss.
+
 **Attached jobs.** The command shares the supervisor's process group. That
 is what lets other pipeline stages read the real terminal and lets a
 command open `/dev/tty` with redirected stdin. It also means that a signal

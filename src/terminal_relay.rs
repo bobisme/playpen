@@ -134,15 +134,7 @@ impl Relay {
         Err(io::Error::last_os_error())
     }
     fn restore(&self) {
-        if unsafe { libc::tcgetpgrp(self.tty.as_raw_fd()) == libc::getpgrp() } {
-            unsafe {
-                libc::tcsetattr(
-                    self.tty.as_raw_fd(),
-                    libc::TCSANOW,
-                    &raw const self.original,
-                );
-            }
-        }
+        restore_original(self.tty.as_raw_fd(), &self.original);
     }
     /// Restore the host tty and reap the helper.
     ///
@@ -259,11 +251,9 @@ fn helper(master: RawFd, tty: RawFd, control: RawFd, parent: libc::pid_t) -> i32
         }
         let foreground = unsafe { libc::tcgetpgrp(tty) == libc::getpgrp() };
         if active && (!enabled || !foreground) {
-            if foreground {
-                unsafe {
-                    libc::tcsetattr(tty, libc::TCSANOW, &raw const original);
-                }
-            }
+            // Also when the session has just lost the terminal: this may
+            // be the last look before the parent-death signal.
+            restore_original(tty, &original);
             active = false;
         }
         if enabled && foreground {
@@ -326,7 +316,7 @@ fn helper(master: RawFd, tty: RawFd, control: RawFd, parent: libc::pid_t) -> i32
                 b'p' => {
                     enabled = false;
                     if active {
-                        ok = restore_foreground(tty, &original);
+                        ok = restore_original(tty, &original);
                         active = false;
                     }
                 }
@@ -349,7 +339,7 @@ fn helper(master: RawFd, tty: RawFd, control: RawFd, parent: libc::pid_t) -> i32
                 b'q' => {
                     ok = drain_output(master, tty, &mut to_tty);
                     if active {
-                        ok &= restore_foreground(tty, &original);
+                        ok &= restore_original(tty, &original);
                         active = false;
                     }
                 }
@@ -393,16 +383,8 @@ fn helper(master: RawFd, tty: RawFd, control: RawFd, parent: libc::pid_t) -> i32
             break;
         }
     }
-    // If the supervisor was the terminal's session leader, its death can
-    // disassociate the tty entirely. Restore that unowned tty, but never one
-    // already reassigned to another foreground session.
-    if active
-        && (unsafe { libc::tcgetpgrp(tty) == libc::getpgrp() }
-            || unsafe { libc::tcgetsid(tty) < 0 })
-    {
-        unsafe {
-            libc::tcsetattr(tty, libc::TCSANOW, &raw const original);
-        }
+    if active {
+        restore_original(tty, &original);
     }
     0
 }
@@ -547,11 +529,27 @@ fn close_except(mut keep: [RawFd; 3]) {
     }
 }
 
-fn restore_foreground(tty: RawFd, original: &libc::termios) -> bool {
-    unsafe {
-        libc::tcgetpgrp(tty) == libc::getpgrp()
-            && libc::tcsetattr(tty, libc::TCSANOW, original) == 0
-    }
+/// Puts the caller's terminal back in its `original` mode when
+/// [`may_restore`] allows it. False when it does not, or the call fails.
+fn restore_original(tty: RawFd, original: &libc::termios) -> bool {
+    may_restore(tty) && unsafe { libc::tcsetattr(tty, libc::TCSANOW, original) == 0 }
+}
+
+/// Whether the terminal's mode is still the caller's to restore: while the
+/// caller's group is the terminal's foreground group, or once the caller's
+/// session has lost the terminal.
+///
+/// The session loses the terminal when its leader exits: playpen itself
+/// when it leads the session and is killed, or the shell that started it.
+/// Linux takes the terminal from the session before it reparents the
+/// relay and sends the parent-death signal, so the relay can see the
+/// terminal lost while its parent is still there. Outside a session,
+/// `tcgetsid` fails also for a terminal that another session has taken
+/// since. The relay cannot tell the two apart, but it looks every 20 ms.
+/// While another group of the session is in the foreground, the mode
+/// belongs to that group.
+fn may_restore(tty: RawFd) -> bool {
+    unsafe { libc::tcgetpgrp(tty) == libc::getpgrp() || libc::tcgetsid(tty) < 0 }
 }
 
 const fn outer_signals(
