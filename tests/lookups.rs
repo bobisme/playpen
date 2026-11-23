@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+mod common;
+
+use common::Guard;
+
 const BIN: &str = env!("CARGO_BIN_EXE_playpen");
 
 /// Why the sandbox cannot run here, if it cannot.
@@ -344,15 +348,16 @@ kill -0 "$(cat {handoff})" 2>/dev/null; echo "seen=$?"
 getent hosts after-the-kill.example; echo "rc=$?""#,
         handoff = handoff.display()
     );
-    let child = Command::new(BIN)
-        .args(["run", "--no-network", "--report"])
-        .arg(&report)
-        .args(["--", "sh", "-c", &script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("cannot run playpen: {e}"));
+    let mut child = Guard::spawn(
+        Command::new(BIN)
+            .args(["run", "--no-network", "--report"])
+            .arg(&report)
+            .args(["--", "sh", "-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .unwrap_or_else(|e| panic!("cannot run playpen: {e}"));
     // P -> C -> (the stub, S): the stub is C's child without children.
     let deadline = Instant::now() + Duration::from_secs(10);
     let stub = loop {

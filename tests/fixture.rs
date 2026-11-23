@@ -3,6 +3,10 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod common;
+
+use common::Guard;
+
 const BIN: &str = env!("CARGO_BIN_EXE_playpen");
 
 fn recipe(name: &str, body: &str) -> std::path::PathBuf {
@@ -25,17 +29,18 @@ fn concurrent_clients_get_private_routes_and_real_statuses() {
             curl -qsS --noproxy '*' -d hello -w ':%{http_code}' "$PLAYPEN_FIXTURE_URL/items"
             curl -qsS --noproxy '*' -o /dev/null -w ':%{http_code}' "$PLAYPEN_FIXTURE_URL/missing"
         "#;
-        let child = Command::new(BIN)
-            .args(["run", "--no-network", "--fixture"])
-            .arg(file)
-            .args(["--", "sh", "-ec", request])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("client");
+        let child = Guard::spawn(
+            Command::new(BIN)
+                .args(["run", "--no-network", "--fixture"])
+                .arg(file)
+                .args(["--", "sh", "-ec", request])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .expect("client");
         children.push((body, child));
     }
-    for (body, child) in children {
+    for (body, mut child) in children {
         let out = child.wait_with_output().expect("wait");
         assert!(
             out.status.success(),
@@ -83,13 +88,13 @@ fn check_cleanup(mode: &str) {
     } else {
         "printf 'ready\\n'; exec sleep 20"
     };
-    let mut child = cmd
-        .args(["--", "sh", "-ec", script])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn");
+    let mut child = Guard::spawn(
+        cmd.args(["--", "sh", "-ec", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("spawn");
     let mut ready = String::new();
     BufReader::new(child.stdout.take().expect("pipe"))
         .read_line(&mut ready)

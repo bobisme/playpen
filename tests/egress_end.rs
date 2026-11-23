@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 use std::io::{BufRead as _, BufReader};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +28,10 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+mod common;
+
+use common::Guard;
 
 const BIN: &str = env!("CARGO_BIN_EXE_playpen");
 const FIXTURE: &str = "198.51.100.7";
@@ -193,7 +197,7 @@ fn received(path: &Path) -> Vec<Received> {
 type Lines = Arc<Mutex<Vec<(u64, String)>>>;
 
 struct Run {
-    child: Child,
+    child: Guard,
     dir: PathBuf,
     stderr: Lines,
     reader: std::thread::JoinHandle<()>,
@@ -253,24 +257,25 @@ fn start(name: &str, port: &str, options: &[&str], command: &[&str]) -> Run {
     let uid = nix::unistd::getuid().to_string();
     let gid = nix::unistd::getgid().to_string();
     let out = std::fs::File::create(dir.join("sends.jsonl")).unwrap_or_else(|e| panic!("{e}"));
-    let mut child = Command::new("unshare")
-        .args(["--user", "--map-root-user", "--net", "sh"])
-        .arg(&outer)
-        .args([BIN, port])
-        .arg(dir.join("listener.jsonl"))
-        .args([&uid, &gid])
-        .arg(dir.join("playpen.pid"))
-        .args([BIN, "run"])
-        .args(options)
-        .arg("--report")
-        .arg(dir.join("report.json"))
-        .arg("--")
-        .args(command)
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("{e}"));
+    let mut child = Guard::spawn(
+        Command::new("unshare")
+            .args(["--user", "--map-root-user", "--net", "sh"])
+            .arg(&outer)
+            .args([BIN, port])
+            .arg(dir.join("listener.jsonl"))
+            .args([&uid, &gid])
+            .arg(dir.join("playpen.pid"))
+            .args([BIN, "run"])
+            .args(options)
+            .arg("--report")
+            .arg(dir.join("report.json"))
+            .arg("--")
+            .args(command)
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(Stdio::piped()),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     let stderr: Lines = Arc::default();
     let pipe = child.stderr.take();
     let lines = Arc::clone(&stderr);

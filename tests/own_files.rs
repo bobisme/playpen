@@ -9,11 +9,15 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+mod common;
+
+use common::Guard;
 
 const BIN: &str = env!("CARGO_BIN_EXE_playpen");
 
@@ -95,14 +99,15 @@ fn write_pass(path: &Path, contents: &str) {
 
 const LO: &[&str] = &["--lo-addr", "192.0.2.1", "--lo-addr", "192.0.2.2"];
 
-fn spawn(args: &[&str]) -> Child {
-    Command::new(BIN)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("cannot run playpen: {e}"))
+fn spawn(args: &[&str]) -> Guard {
+    Guard::spawn(
+        Command::new(BIN)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .unwrap_or_else(|e| panic!("cannot run playpen: {e}"))
 }
 
 fn run(args: &[&str]) -> Output {
@@ -112,7 +117,7 @@ fn run(args: &[&str]) -> Output {
 /// Waits for playpen. A run that outlives 20 s means an attack kept it
 /// alive: playpen is killed (which kills the sandbox) and the test fails,
 /// instead of hanging.
-fn finish(mut child: Child) -> Output {
+fn finish(mut child: Guard) -> Output {
     let started = Instant::now();
     while child.try_wait().ok().flatten().is_none() {
         if started.elapsed() > Duration::from_secs(20) {

@@ -23,7 +23,7 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,6 +32,10 @@ use nix::unistd::pipe2;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+mod common;
+
+use common::Guard;
 
 const BIN: &str = env!("CARGO_BIN_EXE_playpen");
 const EPERM: &str = "Operation not permitted";
@@ -200,7 +204,7 @@ impl Finished {
 }
 
 fn wait(
-    mut child: Child,
+    mut child: Guard,
     dir: &Path,
     stderr: (Lines, std::thread::JoinHandle<()>),
     events: Option<(Lines, std::thread::JoinHandle<()>)>,
@@ -248,7 +252,7 @@ fn run_inside(dir: &Path, args: &[&str]) -> Finished {
             Ok(())
         });
     }
-    let mut child = cmd.spawn().unwrap_or_else(|e| panic!("{e}"));
+    let mut child = Guard::spawn(&mut cmd).unwrap_or_else(|e| panic!("{e}"));
     drop(w);
     let stderr = read_lines(child.stderr.take().unwrap_or_else(|| panic!("stderr")));
     let events = read_lines(std::fs::File::from(r));
@@ -336,24 +340,25 @@ fn run_fake_host(dir: &Path, ports: [&str; 3], options: &[&str]) -> (Finished, T
         .unwrap_or_else(|e| panic!("{e}"));
     let uid = nix::unistd::getuid().to_string();
     let gid = nix::unistd::getgid().to_string();
-    let mut child = Command::new("unshare")
-        .args(["--user", "--map-root-user", "--net", "sh"])
-        .arg(&outer)
-        .arg(BIN)
-        .arg(dir)
-        .args([&uid, &gid])
-        .args(ports)
-        .args([BIN, "run", "--allow", &a, "--allow", &b])
-        .args(options)
-        .arg("--report")
-        .arg(dir.join("report.json"))
-        .args(["--", "sh", "-c", INNER, BIN, &a, &b, &stray])
-        .arg(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("{e}"));
+    let mut child = Guard::spawn(
+        Command::new("unshare")
+            .args(["--user", "--map-root-user", "--net", "sh"])
+            .arg(&outer)
+            .arg(BIN)
+            .arg(dir)
+            .args([&uid, &gid])
+            .args(ports)
+            .args([BIN, "run", "--allow", &a, "--allow", &b])
+            .args(options)
+            .arg("--report")
+            .arg(dir.join("report.json"))
+            .args(["--", "sh", "-c", INNER, BIN, &a, &b, &stray])
+            .arg(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     let stderr = read_lines(child.stderr.take().unwrap_or_else(|| panic!("stderr")));
     let finished = wait(child, dir, stderr, None);
     let traffic = Traffic {

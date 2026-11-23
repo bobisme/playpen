@@ -13,6 +13,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod common;
+
+use common::Guard;
+
 const BIN: &str = env!("CARGO_BIN_EXE_playpen");
 
 /// Why the sandbox cannot run here, if it cannot.
@@ -581,18 +585,19 @@ fn sigstop_of_playpen_itself_freezes_the_command() {
     let _ = std::fs::remove_file(&ticks);
     let until = rfc3339_in(4);
     let script = format!("while :; do echo t >> {}; sleep 0.1; done", ticks.display());
-    let mut child = playpen(&[
-        "run",
-        "--no-network",
-        "--until",
-        &until,
-        "--",
-        "sh",
-        "-c",
-        &script,
-    ])
-    .stderr(Stdio::piped())
-    .spawn()
+    let mut child = Guard::spawn(
+        playpen(&[
+            "run",
+            "--no-network",
+            "--until",
+            &until,
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .stderr(Stdio::piped()),
+    )
     .unwrap_or_else(|e| panic!("{e}"));
     let pid = child.id().to_string();
     let kill = |sig: &str| {
@@ -644,10 +649,8 @@ fn killing_playpen_kills_the_sandbox() {
         let mut args = vec!["run"];
         args.extend_from_slice(extra);
         args.extend_from_slice(&["--", "sh", "-c", &script]);
-        let mut child = playpen(&args)
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap_or_else(|e| panic!("{e}"));
+        let mut child =
+            Guard::spawn(playpen(&args).stderr(Stdio::null())).unwrap_or_else(|e| panic!("{e}"));
         let count = || std::fs::read_to_string(&ticks).map_or(0, |t| t.lines().count());
         let deadline = Instant::now() + Duration::from_secs(5);
         while count() < 4 && Instant::now() < deadline {
@@ -1021,17 +1024,18 @@ fn death_by_signal_is_reported() {
 #[test]
 fn signals_are_forwarded_to_the_command() {
     require_sandbox!();
-    let mut child = playpen(&[
-        "run",
-        "--no-network",
-        "--",
-        "sh",
-        "-c",
-        "trap 'echo got-term; exit 42' TERM; echo ready; while :; do sleep 0.1; done",
-    ])
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
+    let mut child = Guard::spawn(
+        playpen(&[
+            "run",
+            "--no-network",
+            "--",
+            "sh",
+            "-c",
+            "trap 'echo got-term; exit 42' TERM; echo ready; while :; do sleep 0.1; done",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped()),
+    )
     .unwrap_or_else(|e| panic!("{e}"));
     let mut stdout = child.stdout.take().unwrap_or_else(|| panic!("no stdout"));
     let mut first = [0u8; 6];
@@ -1088,26 +1092,16 @@ enum SendTo {
     EachPlaypen,
 }
 
-fn spawn_headless_signal_workload(extra: &[&str], workload: &[&str]) -> std::process::Child {
-    use std::os::unix::process::CommandExt as _;
-
+fn spawn_headless_signal_workload(extra: &[&str], workload: &[&str]) -> Guard {
     let mut args = vec!["run", "--no-network"];
     args.extend_from_slice(extra);
     args.push("--");
     args.extend_from_slice(workload);
     let mut command = playpen(&args);
     command.stdout(Stdio::piped()).stderr(Stdio::inherit());
-    // SAFETY: setsid is async-signal-safe. Run it after fork to guarantee a
-    // private process group and detach from any terminal inherited from Cargo.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    command.spawn().expect("start a headless local sandbox")
+    // The guard starts it in a session of its own: a private process group,
+    // detached from any terminal inherited from Cargo.
+    Guard::spawn(&mut command).expect("start a headless local sandbox")
 }
 
 fn usr1_deliveries(extra: &[&str], how: SendTo, workload: &[&str]) -> Vec<usize> {

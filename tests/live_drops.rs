@@ -13,7 +13,7 @@ use std::io::{BufRead as _, BufReader};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +22,10 @@ use nix::unistd::pipe2;
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+mod common;
+
+use common::Guard;
 
 const BIN: &str = env!("CARGO_BIN_EXE_playpen");
 
@@ -101,7 +105,7 @@ fn read_lines(stream: impl std::io::Read + Send + 'static) -> (Lines, std::threa
 /// A run of playpen with its stderr and its `--events-fd` stream read as
 /// they come.
 struct Run {
-    child: Child,
+    child: Guard,
     stderr: (Lines, std::thread::JoinHandle<()>),
     events: (Lines, std::thread::JoinHandle<()>),
 }
@@ -162,7 +166,7 @@ fn start(dir: &Path, args: &[&str]) -> Run {
             Ok(())
         });
     }
-    let mut child = cmd.spawn().unwrap_or_else(|e| panic!("{e}"));
+    let mut child = Guard::spawn(&mut cmd).unwrap_or_else(|e| panic!("{e}"));
     drop(w);
     let stderr = read_lines(child.stderr.take().unwrap_or_else(|| panic!("stderr")));
     let events = read_lines(std::fs::File::from(r));

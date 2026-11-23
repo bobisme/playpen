@@ -10,11 +10,15 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+mod common;
+
+use common::Guard;
 
 const BIN: &str = env!("CARGO_BIN_EXE_playpen");
 
@@ -150,14 +154,15 @@ fn run(args: &[&str]) -> Output {
         .unwrap_or_else(|e| panic!("cannot run playpen: {e}"))
 }
 
-fn spawn(args: &[&str]) -> Child {
-    Command::new(BIN)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("cannot run playpen: {e}"))
+fn spawn(args: &[&str]) -> Guard {
+    Guard::spawn(
+        Command::new(BIN)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .unwrap_or_else(|e| panic!("cannot run playpen: {e}"))
 }
 
 fn report(path: &Path) -> serde_json::Value {
@@ -468,7 +473,7 @@ fn run_cmd_then(
         "--",
     ];
     args.extend_from_slice(command);
-    let child = spawn(&args);
+    let mut child = spawn(&args);
     std::thread::sleep(after);
     change();
     let out = child.wait_with_output().unwrap_or_else(|e| panic!("{e}"));
@@ -487,7 +492,7 @@ fn a_pass_that_expired_while_playpen_was_stopped_is_stopped_by_until() {
         &pass_text(&hours(-1), &secs_from_now(5), false, &[WEB]),
     );
     let rep = dir.join("report.json");
-    let child = spawn(&[
+    let mut child = spawn(&[
         "run",
         "--pass",
         s(&pass),
@@ -688,7 +693,7 @@ fn a_harmless_edit_keeps_the_run_under_the_rules_loaded_at_start() {
     ];
     args.extend_from_slice(LO);
     args.extend_from_slice(&["--", "sh", "-c", &script]);
-    let child = spawn(&args);
+    let mut child = spawn(&args);
     std::thread::sleep(Duration::from_millis(400));
     write_pass(&pass, &after);
     let out = child.wait_with_output().unwrap_or_else(|e| panic!("{e}"));
@@ -903,7 +908,7 @@ fn live_events_record_atomic_revocation_after_the_command_is_ready() {
             Ok(())
         });
     }
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = Guard::spawn(&mut cmd).expect("spawn");
     drop(w);
     let mut ready = String::new();
     BufReader::new(child.stdout.take().expect("stdout"))
@@ -951,17 +956,18 @@ fn atomic_revocation_during_setup_prevents_release() {
     // Relay the real nft result untouched. Pause once, at the initial readback.
     std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$1\" = --json ]; then\n : > \"$CHECKPOINT\"\n i=0; while [ ! -f \"$RESUME\" ] && [ \"$i\" -lt 500 ]; do sleep 0.01; i=$((i+1)); done\nfi\nexec nft \"$@\"\n").expect("wrapper");
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("mode");
-    let child = Command::new(BIN)
-        .env("PLAYPEN_NFT", &wrapper)
-        .env("CHECKPOINT", &checkpoint)
-        .env("RESUME", &release)
-        .args(["run", "--pass"])
-        .arg(&pass)
-        .args(["--", "touch"])
-        .arg(&marker)
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn");
+    let mut child = Guard::spawn(
+        Command::new(BIN)
+            .env("PLAYPEN_NFT", &wrapper)
+            .env("CHECKPOINT", &checkpoint)
+            .env("RESUME", &release)
+            .args(["run", "--pass"])
+            .arg(&pass)
+            .args(["--", "touch"])
+            .arg(&marker)
+            .stderr(Stdio::piped()),
+    )
+    .expect("spawn");
     let end = Instant::now() + Duration::from_secs(5);
     while !checkpoint.exists() && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(10));
@@ -1081,7 +1087,7 @@ fn strict_running_job_stops_if_selected_names_are_added() {
     let before = valid_pass(&[WEB]).replace("[ceilings]\ncalls = 6\n", "");
     let pass = new_pass(&dir, &before);
     let rep = dir.join("report.json");
-    let child = spawn(&[
+    let mut child = spawn(&[
         "run",
         "--pass",
         s(&pass),
@@ -1435,7 +1441,7 @@ fn a_hostname_edit_mid_run_keeps_the_names_loaded_at_start() {
     let before = valid_pass(&[WEB]);
     let pass = new_pass(&dir, &before);
     let rep = dir.join("report.json");
-    let child = spawn(&[
+    let mut child = spawn(&[
         "run",
         "--pass",
         s(&pass),

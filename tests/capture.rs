@@ -7,6 +7,7 @@
 //! that address is the approved destination. Nothing can leave the
 //! machine, even if the filter were wrong.
 
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -372,12 +373,15 @@ fn a_run_stopped_by_its_deadline_leaves_a_complete_capture() {
         text(&out.stderr)
     );
     // pasta had exited when playpen read the file: nothing was added after.
+    // The full path has the test's PID in it, so no other run of the test
+    // on the host matches.
+    let path = pcap.as_os_str().as_bytes();
     let pasta_left = std::fs::read_dir("/proc")
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
-        .any(|c| c.windows(13).any(|w| w == b"deadline.pcap"));
+        .any(|c| c.windows(path.len()).any(|w| w == path));
     assert!(!pasta_left, "pasta still runs");
     let bytes = checked_capture(&pcap, &report);
     let frames = frames(&bytes).unwrap_or_else(|e| panic!("{e}"));
