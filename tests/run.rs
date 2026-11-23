@@ -542,7 +542,9 @@ fn until_shortly_ahead_stops_the_command() {
 #[test]
 fn until_kills_a_command_that_ignores_sigterm() {
     require_sandbox!();
-    let until = rfc3339_in(1);
+    // Enough margin that a loaded machine still builds the sandbox before
+    // the end; otherwise the run is refused instead of stopped.
+    let until = rfc3339_in(3);
     let started = Instant::now();
     let out = run(&[
         "run",
@@ -798,7 +800,8 @@ fn a_failed_cut_kills_the_command_at_once() {
             "run",
             "--no-network",
             "--until",
-            &rfc3339_in(1),
+            // Margin for building the sandbox on a loaded machine, as above.
+            &rfc3339_in(3),
             "--report",
             report.to_str().unwrap_or(""),
             "--",
@@ -821,7 +824,7 @@ fn a_failed_cut_kills_the_command_at_once() {
         // No grace: the end, at most the 2 s wait for the cut, and the
         // hanging nft's 3 s before the sandbox can be torn down.
         assert!(
-            took < Duration::from_millis(1000 + 3000 + 1500),
+            took < Duration::from_millis(3000 + 3000 + 1500),
             "{name}: took {took:?}"
         );
         let json: serde_json::Value =
