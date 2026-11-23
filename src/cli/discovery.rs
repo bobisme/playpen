@@ -54,7 +54,7 @@ pub(super) const COMPARE: &str = "Examples
   playpen compare before.json after.json --format json
 
 Agent workflow
-  Supply two full private run reports. Read policy, evidence and new_denials together. Exit 1 means new denials. Otherwise exit 2 means policy changed, evidence was incomplete or input was invalid. Exit 0 means comparable policy with complete evidence and no new denials.";
+  Supply two full private run reports. Read policy, evidence, new_denials and new_unmapped_lookups together. Exit 1 means new denials or new lookups of names without a --host mapping. Otherwise exit 2 means policy changed, evidence was incomplete or input was invalid. Exit 0 means comparable policy with complete evidence and nothing new.";
 pub(super) const DOCTOR: &str = "Examples
   playpen doctor --mode offline --format json
   playpen doctor --mode egress

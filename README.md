@@ -151,6 +151,22 @@ playpen:   198.51.100.7 udp port 53: 1 packet(s)
 playpen: ************************************************************
 ```
 
+There is no DNS inside the sandbox. A stub on the sandbox's own loopback
+(127.0.0.1 port 53) answers the names given with `--host`, says every
+other name does not exist, and forwards nothing. A lookup of a name with no
+mapping fails at once, and playpen lists the name on exit:
+
+```text
+playpen: The command looked up names that have no --host mapping:
+playpen:   updates.example.com: 2 lookup(s)
+playpen: Each was answered "no such name". If the command needs one, map it with --host NAME=ADDR (ADDR must be approved).
+```
+
+The private report has the same list in `lookups`; the shareable report
+leaves it out. A name is shown lower-cased, with every byte in a label
+other than a letter, digit, `-` or `_` escaped (`\027` for ESC); a name
+longer than 253 bytes is cut and ends in `...`.
+
 To see the firewall rules without running anything:
 
 ```console
@@ -335,8 +351,10 @@ playpen guards against:
 - accidents and misconfigured tools: a wrong target, a forgotten default
   host, a tool reaching for updates or telemetry;
 - tools that follow redirects, or resolve names, to places nobody approved:
-  the system resolver uses the sandbox hosts file. A client that implements
-  its own DNS still needs permission to reach the resolver;
+  the system resolver uses the sandbox hosts file, then the stub on the
+  sandbox loopback, which answers only `--host` names and forwards nothing.
+  A client that implements its own DNS, or DNS over HTTPS or TLS, still
+  needs permission to reach its resolver;
 - children and background processes of the command: they stay in the same
   sandbox and are killed when the command exits;
 - the command trying to undo the guard: it cannot change the firewall,

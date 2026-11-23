@@ -1208,7 +1208,7 @@ wait",
     let start = start_line(&err);
     assert!(
         start.contains(
-            "(no DNS, names app.example.test=192.0.2.1 (pass: web), sip.example.test=192.0.2.2 (pass: sip))"
+            "(no DNS, names app.example.test=192.0.2.1 (pass: web), sip.example.test=192.0.2.2 (pass: sip); lookups recorded)"
         ),
         "{start}"
     );
@@ -1297,7 +1297,7 @@ fn pass_hosts_follow_only_an_explicit_host_wins_and_a_shared_name_gets_both() {
     let start = start_line(&err);
     assert!(
         start.contains(
-            "names app.example.test=192.0.2.2, sip.example.test=192.0.2.2 (pass: sip); --host app.example.test replaces app.example.test=192.0.2.1 (pass: web))"
+            "names app.example.test=192.0.2.2, sip.example.test=192.0.2.2 (pass: sip); --host app.example.test replaces app.example.test=192.0.2.1 (pass: web); lookups recorded)"
         ),
         "{start}"
     );

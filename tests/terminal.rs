@@ -760,11 +760,12 @@ fn attached_signal_for_each_playpen_process_has_one_delivery() {
         ));
         t.expect("ready");
         let mut helpers = playpen_processes(t.child.id());
-        // P, C, S, I and the witness; the last two after the others.
-        assert_eq!(helpers.len(), 5, "playpen processes: {helpers:?}");
+        // P, C, the DNS stub, S, I and the witness; the last two after
+        // the others.
+        assert_eq!(helpers.len(), 6, "playpen processes: {helpers:?}");
         let supervisor = helpers[0].0;
         let in_group = helpers.iter().filter(|h| h.1 == helpers[0].1).count();
-        assert_eq!(in_group, 4, "init leaves the group: {helpers:?}");
+        assert_eq!(in_group, 5, "init leaves the group: {helpers:?}");
         if descending {
             helpers.reverse();
         }

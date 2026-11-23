@@ -10,6 +10,9 @@
 //! The ruleset handles nothing else, so files, directories and devices are
 //! not restricted by it; abstract Unix sockets are scoped as well (they are
 //! already private to the sandbox's network namespace).
+//!
+//! `deny_all` is for the DNS stub, which needs no file and no new
+//! connection once its sockets are bound.
 
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -119,6 +122,50 @@ fn add_rule(ruleset: &OwnedFd, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Every file system access right up to ABI 9 (`EXECUTE` to `RESOLVE_UNIX`).
+const ACCESS_FS_ALL: u64 = (1 << 17) - 1;
+/// `LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP`.
+const ACCESS_NET_ALL: u64 = 0b11;
+const SCOPE_SIGNAL: u64 = 1 << 1;
+
+/// Restricts this process to the descriptors it holds.
+///
+/// No file system access at all, no TCP bind or connect, no abstract Unix
+/// sockets, and no signal to (or trace of) a process outside the domain.
+/// Requires `no_new_privs` and ABI 9.
+///
+/// # Errors
+/// When the kernel refuses any step.
+pub fn deny_all() -> Result<(), String> {
+    let attr = RulesetAttr {
+        handled_access_fs: ACCESS_FS_ALL,
+        handled_access_net: ACCESS_NET_ALL,
+        scoped: SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL,
+    };
+    // SAFETY: as in `create_ruleset`.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &raw const attr,
+            std::mem::size_of::<RulesetAttr>(),
+            0u32,
+        )
+    };
+    let fd = i32::try_from(rc).map_err(|_| "landlock_create_ruleset: bad return".to_owned())?;
+    if fd < 0 {
+        return Err(format!("landlock_create_ruleset: {}", Errno::last()));
+    }
+    // SAFETY: the kernel just returned this descriptor to us; nothing else
+    // owns it.
+    let ruleset = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: plain syscall on a descriptor we own, flags 0.
+    let rc = unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset.as_raw_fd(), 0u32) };
+    if rc != 0 {
+        return Err(format!("landlock_restrict_self: {}", Errno::last()));
+    }
+    Ok(())
+}
+
 /// Restricts this process and everything it starts: no connection to a
 /// Unix socket created outside, except at or below `exposed`. Requires
 /// `no_new_privs`.
@@ -136,4 +183,68 @@ pub fn restrict(exposed: &[PathBuf]) -> Result<(), String> {
         return Err(format!("landlock_restrict_self: {}", Errno::last()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::wait::{WaitStatus, waitpid};
+    use nix::unistd::{ForkResult, fork, getppid};
+    use std::io::{Read as _, Write as _};
+
+    /// What a process confined by `deny_all` can still do, as an exit code:
+    /// 0 when it uses what it held and is refused everything else.
+    fn confined_child(held: &mut std::fs::File, udp: &std::net::UdpSocket) -> i32 {
+        if nix::sys::prctl::set_no_new_privs().is_err() || deny_all().is_err() {
+            return 1;
+        }
+        if std::fs::File::open("/etc/hostname").is_ok() || std::fs::read_dir("/").is_ok() {
+            return 2;
+        }
+        if nix::sys::signal::kill(getppid(), None).is_ok() {
+            return 3;
+        }
+        let connect = std::net::TcpStream::connect("127.0.0.1:9").map_err(|e| e.raw_os_error());
+        if connect.err() != Some(Some(libc::EACCES)) {
+            return 4;
+        }
+        if std::net::TcpListener::bind("127.0.0.1:0").is_ok() {
+            return 5;
+        }
+        let mut byte = [0u8; 1];
+        if held.read_exact(&mut byte).is_err() {
+            return 6;
+        }
+        let to_self = udp.local_addr().map(|a| udp.send_to(b"x", a));
+        if !matches!(to_self, Ok(Ok(1))) || udp.recv(&mut byte).is_err() {
+            return 7;
+        }
+        0
+    }
+
+    #[test]
+    fn deny_all_leaves_only_the_descriptors_held() {
+        if !resolve_unix_supported() {
+            eprintln!("SKIPPED: Landlock ABI {RESOLVE_UNIX_ABI} is not available");
+            return;
+        }
+        let mut held = std::fs::File::open("/proc/self/stat").unwrap_or_else(|e| panic!("{e}"));
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("{e}"));
+        // SAFETY: the child makes system calls, allocates (glibc's malloc
+        // is reset in a forked child) and ends with `_exit`; it returns to
+        // no test code.
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                let code = confined_child(&mut held, &udp);
+                let _ = std::io::stdout().flush();
+                // SAFETY: ends the child at once, without unwinding into
+                // the test harness.
+                unsafe { libc::_exit(code) }
+            }
+            Ok(ForkResult::Parent { child }) => {
+                assert_eq!(waitpid(child, None), Ok(WaitStatus::Exited(child, 0)));
+            }
+            Err(e) => panic!("fork: {e}"),
+        }
+    }
 }

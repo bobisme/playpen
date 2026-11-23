@@ -372,9 +372,22 @@ fn assert_all_denied(v: &serde_json::Value) {
         "packet_socket",
         "setns_net_of_pid1",
         "read_pid1_memory",
+        "lower_unprivileged_port_start",
+        "bind_dns_udp",
+        "bind_dns_tcp",
     ] {
         let val = v[key].as_str().unwrap_or("missing");
         assert!(val.starts_with("denied"), "{key}: {val}");
+    }
+    // Refused for want of privilege, not because the stub holds the port:
+    // the command could not take port 53 if the stub were gone either.
+    for key in [
+        "lower_unprivileged_port_start",
+        "bind_dns_udp",
+        "bind_dns_tcp",
+    ] {
+        let val = v[key].as_str().unwrap_or("missing");
+        assert!(val.contains("(os error 13)"), "{key}: {val}");
     }
     assert_eq!(v["cap_eff"], "0000000000000000");
     assert_eq!(v["cap_prm"], "0000000000000000");
@@ -791,7 +804,11 @@ fn host_names_resolve_to_the_approved_address() {
         .collect();
     assert_eq!(lines[0]["addresses"], serde_json::json!(["192.0.2.10"]));
     assert_eq!(lines[1]["addresses"], serde_json::json!([]));
-    assert!(!stdout.contains("nameserver"));
+    let nameservers: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("nameserver"))
+        .collect();
+    assert_eq!(nameservers, ["nameserver 127.0.0.1"], "{stdout}");
 }
 
 #[test]
@@ -943,10 +960,11 @@ fn signals_are_forwarded_to_the_command() {
     assert_eq!(status.code(), Some(42));
 }
 
-/// The pid of the one child of `parent`, from `/proc`.
-fn only_child(parent: u32) -> Option<u32> {
-    let mut found = std::fs::read_dir("/proc")
-        .ok()?
+/// The pids of the children of `parent`, from `/proc`, in ascending order.
+fn children(parent: u32) -> Vec<u32> {
+    let mut found: Vec<u32> = std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
         .filter_map(Result::ok)
         .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()))
         .filter(|pid| {
@@ -955,9 +973,18 @@ fn only_child(parent: u32) -> Option<u32> {
             stat.rsplit_once(") ")
                 .and_then(|(_, tail)| tail.split(' ').nth(1)?.parse().ok())
                 == Some(parent)
-        });
-    let first = found.next()?;
-    found.next().is_none().then_some(first)
+        })
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+/// The pid of the one child of `parent`, from `/proc`.
+fn only_child(parent: u32) -> Option<u32> {
+    match children(parent).as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    }
 }
 
 /// How a test sends SIGUSR1 to a running playpen.
@@ -1027,14 +1054,25 @@ fn usr1_deliveries(extra: &[&str], how: SendTo, workload: &[&str]) -> Vec<usize>
             SendTo::Supervisor => vec![pid],
             SendTo::Group => vec![-pid],
             SendTo::EachPlaypen => {
-                // P, C, S and I, each the only child of the one before.
-                let mut helpers = vec![pid];
-                for _ in 0..3 {
-                    let last = helpers[helpers.len() - 1];
-                    let next = only_child(u32::try_from(last).map_err(|e| e.to_string())?)
-                        .ok_or_else(|| format!("no child of {last}"))?;
-                    helpers.push(i32::try_from(next).map_err(|e| e.to_string())?);
+                // P; C, its only child; C's two children, the DNS stub and
+                // S (the one with a child); and I, the only child of S.
+                let as_pid = |p: u32| i32::try_from(p).map_err(|e| e.to_string());
+                let c = only_child(child.id()).ok_or("no only child of playpen")?;
+                let of_c = children(c);
+                let s = of_c
+                    .iter()
+                    .copied()
+                    .find(|&p| only_child(p).is_some())
+                    .ok_or_else(|| format!("no child of {c} has a child: {of_c:?}"))?;
+                let i = only_child(s).ok_or("no init")?;
+                if of_c.len() != 2 {
+                    return Err(format!("C has children {of_c:?}, not the stub and S"));
                 }
+                let mut helpers = vec![pid, as_pid(c)?];
+                for p in of_c {
+                    helpers.push(as_pid(p)?);
+                }
+                helpers.push(as_pid(i)?);
                 helpers
             }
         };
@@ -1530,7 +1568,7 @@ fn compare_reports_uses_endpoints_and_requires_complete_evidence() {
     let dir = tmpdir("compare");
     let old = dir.join("old.json");
     let new = dir.join("new.json");
-    let base = serde_json::json!({"playpen_version":"0.1.0", "outcome":"ran", "allowed":["192.0.2.1:80/tcp"], "network":"pasta", "hosts":[], "exposed":[], "socket_guard":"landlock", "display":false, "dropped":{"packets":1,"destinations_truncated":false,"destinations":[{"address":"192.0.2.2","protocol":"tcp","port":80,"packets":1}]}});
+    let base = serde_json::json!({"playpen_version":"0.1.0", "outcome":"ran", "allowed":["192.0.2.1:80/tcp"], "network":"pasta", "hosts":[], "exposed":[], "socket_guard":"landlock", "display":false, "dropped":{"packets":1,"destinations_truncated":false,"destinations":[{"address":"192.0.2.2","protocol":"tcp","port":80,"packets":1}]}, "lookups":{"names":[],"truncated":false}});
     let save = |path: &Path, v: &serde_json::Value| {
         std::fs::write(path, v.to_string()).unwrap_or_else(|e| panic!("{e}"));
     };
@@ -1570,7 +1608,7 @@ fn compare_reads_a_pass_hosts_entry_as_its_mapping() {
     let dir = tmpdir("compare-hosts");
     let old = dir.join("old.json");
     let new = dir.join("new.json");
-    let base = serde_json::json!({"playpen_version":"0.1.0", "outcome":"ran", "allowed":["192.0.2.1:80/tcp"], "network":"pasta", "hosts":["app.example.test=192.0.2.1"], "exposed":[], "socket_guard":"landlock", "display":false, "dropped":{"packets":0,"destinations_truncated":false,"destinations":[]}});
+    let base = serde_json::json!({"playpen_version":"0.1.0", "outcome":"ran", "allowed":["192.0.2.1:80/tcp"], "network":"pasta", "hosts":["app.example.test=192.0.2.1"], "exposed":[], "socket_guard":"landlock", "display":false, "dropped":{"packets":0,"destinations_truncated":false,"destinations":[]}, "lookups":{"names":[],"truncated":false}});
     let save = |path: &Path, v: &serde_json::Value| {
         std::fs::write(path, v.to_string()).unwrap_or_else(|e| panic!("{e}"));
     };

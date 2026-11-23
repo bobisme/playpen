@@ -1,6 +1,7 @@
 //! `playpen probe`: small checks run *inside* the sandbox by `playpen
 //! doctor` and by the tests. Hidden from `--help`; not a stable interface.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process::Command;
@@ -153,6 +154,10 @@ pub fn privs(nft: &str) -> Value {
         Err(e) => Err(format!("cannot run nft: {e}")),
     };
     let doc = std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 77));
+    // First, so that a lowered limit would show in the binds below.
+    let port_start =
+        fs::write("/proc/sys/net/ipv4/ip_unprivileged_port_start", "0").map_err(|e| e.to_string());
+    let stub = SocketAddr::from((crate::dns_stub::ADDRESS, crate::dns_stub::PORT));
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     let field = |k: &str| {
         status
@@ -171,6 +176,9 @@ pub fn privs(nft: &str) -> Value {
         "packet_socket": errno_outcome(try_socket(AddressFamily::Packet, None)),
         "setns_net_of_pid1": outcome(setns_pid1()),
         "read_pid1_memory": outcome(std::fs::File::open("/proc/1/mem").map(drop).map_err(|e| e.to_string())),
+        "lower_unprivileged_port_start": outcome(port_start),
+        "bind_dns_udp": outcome(UdpSocket::bind(stub).map(drop).map_err(|e| e.to_string())),
+        "bind_dns_tcp": outcome(TcpListener::bind(stub).map(drop).map_err(|e| e.to_string())),
         "cap_eff": field("CapEff:"),
         "cap_prm": field("CapPrm:"),
         "no_new_privs": field("NoNewPrivs:"),
@@ -398,6 +406,70 @@ pub fn resolve(name: &str) -> Value {
             json!({"name": name, "addresses": list})
         }
         Err(e) => json!({"name": name, "addresses": [], "error": e.to_string()}),
+    }
+}
+
+/// `probe dns [--tcp] HEX`: sends one DNS message to the stub.
+///
+/// The message `hex` goes to 127.0.0.1 port 53 over UDP or TCP. The reply
+/// is described as `{"rcode", "truncated", "answers", "reply"}` (the reply
+/// in hex), or `{"error"}`.
+#[must_use]
+pub fn dns(hex: &str, tcp: bool) -> Value {
+    let bytes: Option<Vec<u8>> = hex
+        .len()
+        .is_multiple_of(2)
+        .then(|| {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+                .collect()
+        })
+        .flatten();
+    let Some(message) = bytes else {
+        return json!({"error": "the message is not hex"});
+    };
+    let server = SocketAddr::from((crate::dns_stub::ADDRESS, crate::dns_stub::PORT));
+    let timeout = Some(Duration::from_secs(2));
+    let exchange = || -> std::io::Result<Vec<u8>> {
+        use std::io::{Read as _, Write as _};
+        if tcp {
+            let mut stream = TcpStream::connect_timeout(&server, Duration::from_secs(2))?;
+            stream.set_read_timeout(timeout)?;
+            let len = u16::try_from(message.len()).map_err(std::io::Error::other)?;
+            stream.write_all(&len.to_be_bytes())?;
+            stream.write_all(&message)?;
+            let mut len = [0u8; 2];
+            stream.read_exact(&mut len)?;
+            let mut reply = vec![0u8; usize::from(u16::from_be_bytes(len))];
+            stream.read_exact(&mut reply)?;
+            Ok(reply)
+        } else {
+            let socket = UdpSocket::bind("127.0.0.1:0")?;
+            socket.set_read_timeout(timeout)?;
+            socket.send_to(&message, server)?;
+            let mut buf = vec![0u8; 65_535];
+            let n = socket.recv(&mut buf)?;
+            buf.truncate(n);
+            Ok(buf)
+        }
+    };
+    match exchange() {
+        Ok(reply) => {
+            let flags = reply.get(2..4).map(|f| u16::from_be_bytes([f[0], f[1]]));
+            let answers = reply.get(6..8).map(|a| u16::from_be_bytes([a[0], a[1]]));
+            let hex = reply.iter().fold(String::new(), |mut out, b| {
+                let _ = write!(out, "{b:02x}");
+                out
+            });
+            json!({
+                "rcode": flags.map(|f| f & 0xf),
+                "truncated": flags.map(|f| f & 0x0200 != 0),
+                "answers": answers,
+                "reply": hex,
+            })
+        }
+        Err(e) => json!({"error": e.to_string()}),
     }
 }
 

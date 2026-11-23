@@ -555,6 +555,75 @@ matter for safety:
    (`killing_playpen_kills_the_sandbox`). What a killed playpen leaves
    behind is the small directory of pasta's PID file.
 
+## Name lookups
+
+There is no DNS inside the sandbox. A stub (D in the spec's start-up
+sequence) answers on 127.0.0.1 port 53. A lookup of an unmapped name still
+fails at once, a client that does not read `/etc/hosts` (`dig`, Node's
+`dns.resolve`) finds the `--host` names, and playpen can say which names
+the command wanted.
+
+**Where it runs.** C forks D after it is told to go and before it forks
+S. D is in the sandbox's network namespace, so 127.0.0.1 is the sandbox's
+own loopback. It is in C's PID namespace, which is the host's: the
+command, in S's PID namespace with a fresh `/proc`, cannot list it, name
+it in `kill(2)` or trace it. D binds the port with C's capability (C is
+root in the user namespace that owns the network namespace), then clears
+every capability set, sets `no_new_privs`, checks the drop as X does,
+points its standard streams at `/dev/null` and closes every descriptor
+but its two sockets and its two pipes to C. Unless `--without-landlock`,
+it then restricts itself with Landlock: no file access at all, no TCP
+bind or connect, no abstract Unix sockets, and no signal to or trace of a
+process outside its domain. It is non-dumpable. S closes its copies of
+D's pipes before it forks I.
+
+**Why the command cannot take port 53.** Binding a port below
+`net.ipv4.ip_unprivileged_port_start` needs `CAP_NET_BIND_SERVICE` over
+the network namespace, and changing that limit (per namespace, 1024 in a
+new one) needs `CAP_NET_ADMIN` there. The command holds neither: it is in
+the nested user namespace. The kernel checks the privilege before it
+checks whether the port is in use, so the bind fails with `EACCES` while D
+holds the port, and would fail the same way if D were gone. A query then
+gets "connection refused", as quickly as before there was a stub
+(`probe privs`: `bind_dns_udp`, `bind_dns_tcp`,
+`lower_unprivileged_port_start`).
+
+**Why `hosts: files dns` cannot reach a host daemon.** `files` reads the
+generated `/etc/hosts`. `dns` is glibc's own resolver code, in the
+command's process: it sends to the nameservers in `/etc/resolv.conf`, and
+the generated file lists only 127.0.0.1, which in this network namespace
+is D. The host's other sources are left out: `resolve` asks
+systemd-resolved over a Unix socket, `mdns` asks avahi, and `myhostname`
+and `mymachines` answer from the host's own state. glibc asks nscd over
+its socket in `/run` before any source; that socket is refused like
+every host socket (covered, without Landlock). `search .` stops glibc
+from also asking for the name with the host's domain appended. Without a
+`resolv.conf` or an `nsswitch.conf` on the host, playpen binds neither;
+glibc's defaults then ask the nameserver at 127.0.0.1, which is D.
+
+**Why it forwards nothing.** D has no upstream and no cache; it answers
+from the `--host` list alone. Its sockets are bound to 127.0.0.1, and the
+kernel refuses to send from a loopback address over a route that is not
+loopback (`EINVAL`), so even a reply to a forged source address stays in
+the namespace. Anything else D sent would meet the same filter as the
+command's traffic.
+
+**What it believes.** Only the question. The other sections of a query
+(an EDNS OPT record, for example) are ignored and never echoed. A
+malformed message is refused (`FORMERR`) and not recorded. A name is
+recorded as shown: escaped, and cut at 253 bytes (spec, "Name lookups").
+So a name made of terminal escape sequences reaches neither the
+operator's terminal nor the report as typed. The record crosses two
+process boundaries on its way to P, and P checks every name again and
+drops an entry it would not show.
+
+**The record.** At most 256 names, with a count each. At teardown C
+closes D's control pipe; D writes its record as one JSON line and exits;
+C passes it to P. If D does not answer within 2 seconds, C kills it and
+the report says why in `lookups_error`. `compare` then treats the lookup
+evidence as incomplete. The record is not in the shareable report: names
+can say what a run was for.
+
 ## The host's own addresses
 
 pasta configures the sandbox's interface from the host's (`--config-net`):
@@ -706,7 +775,11 @@ it, but only when the name still leads to the file it created.
 | pasta forwarding namespace loopback ports to the host (`-T auto`, its default) | `--tcp-ns none --udp-ns none`. The filter does **not** catch this: it accepts loopback inside the namespace, and pasta's sockets there are spliced to the host | yes: a host listener on 127.0.0.1 and ::1 below 32768 is not reached. Removing the flags makes the test fail (checked). Note: pasta's auto mode skips the ephemeral range, so a test on an ephemeral port proves nothing |
 | pasta forwarding host ports into the namespace | `--tcp-ports none --udp-ports none`; input chain drops new inbound connections anyway | flag unit-tested |
 | DNS forwarded by pasta | `--dns none --search none`, no `--dns-forward`; port 53 to the gateway is not approved | flag unit-tested |
-| Names resolved by host daemons over filesystem sockets (systemd-resolved varlink, nscd, avahi) | generated `nsswitch.conf` with `hosts: files`; their sockets are refused like every host socket | `--host` name resolves, other names do not; the sockets are in the walk of `no_host_socket_is_connectable_from_inside` |
+| Names resolved by host daemons over filesystem sockets (systemd-resolved varlink, nscd, avahi) | generated `nsswitch.conf` with `hosts: files dns` and `resolv.conf` with `nameserver 127.0.0.1` alone: `dns` asks only the stub in the sandbox's own namespace; their sockets are refused like every host socket | a `--host` name resolves through `getent`, `dig` (UDP and TCP) and Node's `dns.resolve4`; other names get "no such name" at once; the sockets are in the walk of `no_host_socket_is_connectable_from_inside` |
+| The stub forwarding a name, or answering one nobody mapped | no upstream: it answers from `--host` alone, sockets bound to 127.0.0.1 | yes (`tests/lookups.rs`; every unmapped name gets `NXDOMAIN`) |
+| The command taking the stub's port, or signalling, tracing or replacing the stub | port 53 needs `CAP_NET_BIND_SERVICE` over the namespace, which the command lacks; the stub is outside the command's PID namespace | yes: binding 127.0.0.1:53 (UDP, TCP) and lowering `ip_unprivileged_port_start` fail with `EACCES`; no process visible inside holds the stub's sockets; `kill` of its host PID fails |
+| A lookup that carries terminal escape sequences, or a name too long to show | escaped by the stub, cut at 253 bytes, checked again in P and in `compare` | yes (OSC and CSI sequences, a 255-byte name, a malformed label; property tests of the parser and the escaping) |
+| A bug in the stub's parser, reached by a hostile query | bounds-checked parser with no `unsafe`; the stub has no capabilities, `no_new_privs`, and Landlock that leaves it only its descriptors | property tests on arbitrary bytes; `deny_all_leaves_only_the_descriptors_held`; the stub's `CapEff` and `NoNewPrivs` checked from the host |
 | Host files changed | none are: all overrides are bind mounts in a private mount namespace | yes (`/etc/hosts` unchanged) |
 | Command changes the rules, adds addresses or links, opens raw/packet sockets, joins init's user namespace, reads init's memory | nested user namespace, no capabilities, init non-dumpable | yes, each one, for the command and for a grandchild; and the rules still block after the command ran `nft flush ruleset` |
 | Command joins the host's network namespace | it would need `CAP_SYS_ADMIN` in the host's user namespace; host processes are invisible (PID namespace, fresh `/proc`) | indirectly (no capabilities; `setns` to init's namespace denied) |
@@ -756,6 +829,12 @@ it, but only when the name still leads to the file it created.
   kernel's filter keeps working.
 - **The approved destination.** If it is a proxy, a VPN endpoint or a
   jump host, traffic continues from there. playpen cannot see it.
+- **Names resolved elsewhere.** A client that brings its own resolver (DNS
+  over HTTPS or TLS, or plain DNS to an approved address) resolves names
+  without the stub, and they are not in the record.
+- **The stub without Landlock.** With `--without-landlock` the stub has no
+  Landlock domain. A bug in its parser would then run code with the user's
+  identity but no capabilities, in the host's PID and mount namespaces.
 - **Volume and content.** No rate limits, no inspection.
 - **Covert channels through approved flows**, and timing channels.
 - **Kernel or tool bugs.** A kernel exploit, or a bug in nftables

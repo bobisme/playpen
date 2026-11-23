@@ -7,6 +7,7 @@ pub mod approval;
 pub mod capture;
 pub mod cli;
 mod compare;
+pub mod dns_stub;
 pub mod doctor;
 pub mod fixture;
 mod grant_use;

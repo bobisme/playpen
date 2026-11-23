@@ -378,7 +378,7 @@ fn privs_check(nft: &Path, offline: bool) -> Check {
         Check {
             name,
             ok: true,
-            detail: "nft, netlink address/link changes, raw and packet sockets all denied; no capabilities".into(),
+            detail: "nft, netlink address/link changes, raw and packet sockets, binding port 53 all denied; no capabilities".into(),
         }
     } else {
         Check {

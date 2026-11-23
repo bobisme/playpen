@@ -7,6 +7,9 @@
 //! playpen (P, host namespaces)
 //!  └─ C   new user + network namespace, mapped root inside; loads the
 //!     │   ruleset, later reads the counters. Never runs user code.
+//!     ├─ D   the DNS stub on 127.0.0.1 port 53 (see `dns_stub`); binds,
+//!     │      then drops every capability and, with Landlock, confines
+//!     │      itself to its descriptors; answers `--host` names only.
 //!     └─ S   unshares a PID namespace, waits for its init.
 //!        └─ I   PID 1 of the new PID namespace, in a private mount
 //!           │   namespace: mounts /proc, the resolver files, hides host
@@ -172,6 +175,8 @@ pub struct RunResult {
     pub drops: Result<DropSummary, String>,
     /// Observed per-grant packet counts in instrumentation order.
     pub grant_packets: Vec<Option<u64>>,
+    /// The names the command looked up, or why they could not be read.
+    pub lookups: Result<crate::dns_stub::Lookups, String>,
 }
 
 /// Why the command did not run, or what went wrong after it started.
@@ -260,7 +265,7 @@ fn cloexec_inherited_fds() -> Result<(), String> {
     Ok(())
 }
 
-fn write_line(fd: &OwnedFd, line: &str) {
+pub(crate) fn write_line(fd: &OwnedFd, line: &str) {
     let mut bytes = line.replace('\n', " ").into_bytes();
     bytes.push(b'\n');
     let mut rest = &bytes[..];
@@ -291,7 +296,7 @@ fn exit_now(code: i32) -> ! {
 }
 
 /// Forks. The caller must be single-threaded.
-fn fork_checked() -> Result<ForkResult, String> {
+pub(crate) fn fork_checked() -> Result<ForkResult, String> {
     // SAFETY: playpen never starts threads, and P checks that the process
     // is single-threaded before the first fork (`run` refuses otherwise),
     // so every process in the tree is single-threaded when it forks. In a
@@ -830,6 +835,7 @@ struct ParentState {
     ended_at: Option<time::OffsetDateTime>,
     drops: Option<Result<DropSummary, String>>,
     grant_packets: Vec<Option<u64>>,
+    lookups: Option<Result<crate::dns_stub::Lookups, String>>,
     ready: bool,
     eof: bool,
     /// Approved addresses C found on the sandbox's own interfaces.
@@ -874,6 +880,14 @@ impl ParentState {
             }
             "dropserr" => self.drops = Some(Err(rest.to_owned())),
             "grants" => self.grant_packets = serde_json::from_str(rest).unwrap_or_default(),
+            "lookups" => {
+                self.lookups = Some(
+                    serde_json::from_str::<crate::dns_stub::Lookups>(rest)
+                        .map(crate::dns_stub::Lookups::sanitized)
+                        .map_err(|e| format!("bad lookup report at column {}", e.column())),
+                );
+            }
+            "lookupserr" => self.lookups = Some(Err(rest.to_owned())),
             _ => {}
         }
     }
@@ -1270,6 +1284,9 @@ fn parent(
             .drops
             .unwrap_or_else(|| Err("the drop counters were not reported".into())),
         grant_packets: st.grant_packets,
+        lookups: st
+            .lookups
+            .unwrap_or_else(|| Err("the names the command looked up were not reported".into())),
     })
 }
 
@@ -1592,7 +1609,7 @@ fn witness_loop(parent: Pid, ask: &OwnedFd, answers: &OwnedFd) -> Result<(), Str
 }
 
 /// Closes every descriptor of this process but `keep`.
-fn close_fds_except(keep: &[RawFd]) -> Result<(), String> {
+pub(crate) fn close_fds_except(keep: &[RawFd]) -> Result<(), String> {
     let entries =
         fs::read_dir("/proc/self/fd").map_err(|e| format!("cannot list /proc/self/fd: {e}"))?;
     let fds: Vec<RawFd> = entries
@@ -1601,10 +1618,10 @@ fn close_fds_except(keep: &[RawFd]) -> Result<(), String> {
         .filter(|fd| !keep.contains(fd))
         .collect();
     for fd in fds {
-        // SAFETY: only called in W, which never again uses, or drops, any
-        // of the objects it inherited that own these descriptors: it ends
-        // with `_exit`. The listing's own descriptor is closed already;
-        // closing its number again fails with EBADF.
+        // SAFETY: only called in W and in the DNS stub, which never again
+        // use, or drop, any of the objects they inherited that own these
+        // descriptors: both end with `_exit`. The listing's own descriptor
+        // is closed already; closing its number again fails with EBADF.
         unsafe { libc::close(fd) };
     }
     Ok(())
@@ -1612,7 +1629,7 @@ fn close_fds_except(keep: &[RawFd]) -> Result<(), String> {
 
 // ---------------------------------------------------------------- C ----
 
-fn die_with_parent(parent: Pid) -> Result<(), String> {
+pub(crate) fn die_with_parent(parent: Pid) -> Result<(), String> {
     prctl::set_pdeathsig(Signal::SIGKILL).map_err(|e| format!("PR_SET_PDEATHSIG: {e}"))?;
     if getppid() != parent {
         return Err("playpen exited during setup".into());
@@ -1679,9 +1696,13 @@ fn stage_c(
     // yet. From here on nothing running as the same user may ptrace it or
     // open its /proc entries, and every child inherits that.
     prctl::set_dumpable(false).map_err(|e| format!("PR_SET_DUMPABLE: {e}"))?;
+    // Before the command exists, while this process can bind port 53.
+    let stub = crate::dns_stub::Stub::start(&plan.hosts, plan.landlock)?;
 
     match fork_checked()? {
         ForkResult::Child => {
+            // Only C stops the stub; S keeps no handle on it.
+            drop(stub);
             let code = match stage_s(plan, files, up_w, down_r, job, private_fds, tty_streams) {
                 Ok(()) => 0,
                 Err(msg) => {
@@ -1695,6 +1716,7 @@ fn stage_c(
             let _ = waitpid(child, None);
         }
     }
+    stub.report(up_w);
     report_counters(&plan.nft, grant_counters, up_w);
     Ok(())
 }
@@ -2511,7 +2533,7 @@ struct CapData {
 
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
-fn clear_capabilities() -> Result<(), String> {
+pub(crate) fn clear_capabilities() -> Result<(), String> {
     let mut header = CapHeader {
         version: LINUX_CAPABILITY_VERSION_3,
         pid: 0,
@@ -2536,7 +2558,7 @@ fn clear_capabilities() -> Result<(), String> {
 
 /// Checks that this process has no capabilities left and cannot open raw
 /// sockets in the network namespace.
-fn verify_dropped(uid: Uid, gid: Gid) -> Result<(), String> {
+pub(crate) fn verify_dropped(uid: Uid, gid: Gid) -> Result<(), String> {
     let status = fs::read_to_string("/proc/self/status")
         .map_err(|e| format!("cannot read /proc/self/status: {e}"))?;
     for key in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:"] {
@@ -2886,6 +2908,7 @@ mod tests {
             ended_at: None,
             drops: None,
             grant_packets: Vec::new(),
+            lookups: None,
             ready: false,
             eof: false,
             own: Vec::new(),
@@ -2921,6 +2944,18 @@ mod tests {
         assert!(matches!(st.drops, Some(Ok(DropSummary { packets: 2, .. }))));
         st.handle_line("signal 15");
         assert_eq!(st.status, Some(CommandStatus::Signaled(15)));
+        st.handle_line(
+            r#"lookups {"names":[{"name":"a.test","count":2,"mapped":false},{"name":"\u001b[2J","count":1,"mapped":false}],"truncated":false}"#,
+        );
+        let lookups = st.lookups.take().and_then(Result::ok).unwrap_or_default();
+        assert_eq!(lookups.names.len(), 1);
+        assert_eq!(lookups.names[0].name, "a.test");
+        assert!(
+            lookups.truncated,
+            "an unusable entry makes the list incomplete"
+        );
+        st.handle_line("lookupserr the DNS stub ended before the end of the run");
+        assert!(matches!(st.lookups, Some(Err(_))));
     }
 
     #[test]

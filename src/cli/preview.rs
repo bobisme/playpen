@@ -46,6 +46,7 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
         "hosts": checked.host_texts(),
         "until": checked.approval.ends_at.map(EndsAt::to_rfc3339),
         "network": if args.no_network { "none" } else { "pasta" },
+        "dns_stub": format!("{}:{}", crate::dns_stub::ADDRESS, crate::dns_stub::PORT),
         "loopback_addresses": checked.lo_addrs,
         "hide": paths(&args.hide), "expose": paths(&checked.exposed),
         "display": args.display, "display_paths": paths(&checked.display),

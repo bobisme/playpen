@@ -136,6 +136,13 @@ enum ProbeCmd {
     },
     /// Resolve a name with the system resolver.
     Resolve { name: String },
+    /// Send one DNS message, given in hex, to the stub at 127.0.0.1 port
+    /// 53 and describe the reply.
+    Dns {
+        #[arg(long)]
+        tcp: bool,
+        message: String,
+    },
     /// Listen on Unix sockets, then connect to Unix sockets (@NAME:
     /// abstract) and close at once.
     Unix {
@@ -420,6 +427,10 @@ fn probe(what: ProbeCmd) -> i32 {
         }
         ProbeCmd::Resolve { name } => {
             println!("{}", crate::probe::resolve(&name));
+            0
+        }
+        ProbeCmd::Dns { tcp, message } => {
+            println!("{}", crate::probe::dns(&message, tcp));
             0
         }
         ProbeCmd::Unix { listen, tries } => print_probe_lines(crate::probe::unix(&listen, &tries)),
@@ -913,6 +924,7 @@ fn start_line_net(c: &Checked, network: bool) -> String {
     for r in c.pass_hosts.iter().flat_map(|p| &p.replaced) {
         let _ = write!(names, "; --host {} replaces {r}", r.entry.name);
     }
+    names.push_str("; lookups recorded");
     if network {
         let list: Vec<String> = c.approval.rules().iter().map(ToString::to_string).collect();
         let (under, hint) = c.from_pass.as_ref().map_or_else(Default::default, |p| {
@@ -971,6 +983,8 @@ fn base_report(args: &RunArgs) -> Report {
         grant_use: None,
         drop_assertion: None,
         dropped_error: None,
+        lookups: None,
+        lookups_error: None,
         socket_guard: if args.without_landlock {
             "mounts_only"
         } else {
@@ -1286,6 +1300,10 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     match result.drops {
         Ok(d) => report.dropped = Some(d),
         Err(e) => report.dropped_error = Some(e),
+    }
+    match result.lookups {
+        Ok(l) => report.lookups = Some(l),
+        Err(e) => report.lookups_error = Some(e),
     }
     let code = apply_drop_assertion(&mut report, code, args.fail_on_drop);
     report.playpen_exit_status = code;

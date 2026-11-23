@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
+use crate::dns_stub::{self, Lookups};
 use crate::ruleset::DropSummary;
 
 /// What happened, in one word. Stable field values.
@@ -105,6 +106,11 @@ pub struct Report {
     pub drop_assertion: Option<DropAssertion>,
     /// Why the drop counters could not be read.
     pub dropped_error: Option<String>,
+    /// The names the command looked up through the DNS stub, when they
+    /// could be read. Never in the shareable report.
+    pub lookups: Option<Lookups>,
+    /// Why the looked-up names could not be read.
+    pub lookups_error: Option<String>,
     /// How host Unix sockets are kept from the command: `"landlock"`
     /// (refused wherever they are, plus the mount layer) or `"mounts_only"`
     /// (`--without-landlock`: hidden under `/run`, `/tmp`, `/var/tmp` and
@@ -275,12 +281,58 @@ pub fn text_summary(r: &Report) -> String {
             c.file, c.bytes, c.sha256
         );
     }
+    lookups_summary(&mut out, r);
     out
+}
+
+/// The text block for names looked up without a `--host` mapping.
+fn lookups_summary(out: &mut String, r: &Report) {
+    match (&r.lookups, &r.lookups_error) {
+        (Some(l), _) => {
+            let unmapped: Vec<_> = l.unmapped().collect();
+            if !unmapped.is_empty() {
+                out.push_str("playpen: The command looked up names that have no --host mapping:\n");
+                for n in unmapped {
+                    // Shown names are escaped already; anything else is
+                    // not printed.
+                    let name = if dns_stub::is_shown(&n.name) {
+                        n.name.as_str()
+                    } else {
+                        "(a name playpen cannot show)"
+                    };
+                    let _ = writeln!(out, "playpen:   {name}: {} lookup(s)", n.count);
+                }
+                if l.truncated {
+                    let _ = writeln!(
+                        out,
+                        "playpen:   (the list is incomplete: playpen keeps {} names)",
+                        dns_stub::LIMIT
+                    );
+                }
+                out.push_str("playpen: Each was answered \"no such name\". If the command needs one, map it with --host NAME=ADDR (ADDR must be approved).\n");
+            } else if l.truncated {
+                let _ = writeln!(
+                    out,
+                    "playpen: the command looked up more than {} names; the report lists the first {}",
+                    dns_stub::LIMIT,
+                    dns_stub::LIMIT
+                );
+            }
+        }
+        (None, Some(e)) => {
+            let _ = writeln!(
+                out,
+                "playpen: could not read the names the command looked up: {e}"
+            );
+        }
+        (None, None) => {}
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns_stub::LookedUp;
     use crate::ruleset::DroppedDest;
 
     fn base() -> Report {
@@ -309,6 +361,8 @@ mod tests {
             grant_use: None,
             drop_assertion: None,
             dropped_error: None,
+            lookups: Some(Lookups::default()),
+            lookups_error: None,
             socket_guard: "landlock",
             exposed: vec![],
             display: false,
@@ -325,6 +379,15 @@ mod tests {
         r.message = Some("private-message".into());
         r.exposed = vec!["private-path".into()];
         r.allowed = vec!["private-destination".into()];
+        r.lookups = Some(Lookups {
+            names: vec![LookedUp {
+                name: "private-lookup".into(),
+                count: 1,
+                mapped: false,
+            }],
+            truncated: true,
+        });
+        r.lookups_error = Some("private-lookup-error".into());
         r.pass = Some(PassReport {
             file: "private-pass".into(),
             id: None,
@@ -478,5 +541,55 @@ mod tests {
         let json = serde_json::to_value(&r).unwrap_or_default();
         assert_eq!(json["outcome"], "ran");
         assert_eq!(json["dropped"]["destinations"][0]["port"], 80);
+    }
+
+    #[test]
+    fn unmapped_lookups_are_listed_with_the_advice_and_mapped_ones_are_not() {
+        let mut r = base();
+        assert!(!text_summary(&r).contains("looked up"));
+        let entry = |name: &str, count, mapped| LookedUp {
+            name: name.into(),
+            count,
+            mapped,
+        };
+        r.lookups = Some(Lookups {
+            names: vec![
+                entry("svc.example.test", 4, true),
+                entry("unmapped.example", 2, false),
+                // An escape sequence, as the stub writes it, and one that
+                // reached the report raw (it cannot from the stub).
+                entry("\\027\\0930\\059x\\007.test", 1, false),
+                entry("\x1b[2J", 1, false),
+            ],
+            truncated: true,
+        });
+        let t = text_summary(&r);
+        assert!(
+            t.contains("playpen: The command looked up names that have no --host mapping:\n"),
+            "{t}"
+        );
+        assert!(
+            t.contains("playpen:   unmapped.example: 2 lookup(s)\n"),
+            "{t}"
+        );
+        assert!(
+            t.contains("playpen:   \\027\\0930\\059x\\007.test: 1 lookup(s)\n"),
+            "{t}"
+        );
+        assert!(t.contains("(a name playpen cannot show)"), "{t}");
+        assert!(!t.contains('\x1b'), "{t}");
+        assert!(!t.contains("svc.example.test"), "{t}");
+        assert!(t.contains("playpen keeps 256 names"), "{t}");
+        assert!(t.contains("map it with --host NAME=ADDR"), "{t}");
+        let json = serde_json::to_value(&r).unwrap_or_default();
+        assert_eq!(json["lookups"]["names"][1]["name"], "unmapped.example");
+        assert_eq!(json["lookups"]["names"][1]["count"], 2);
+        assert_eq!(json["lookups"]["names"][0]["mapped"], true);
+        assert_eq!(json["lookups"]["truncated"], true);
+        r.lookups = None;
+        r.lookups_error = Some("the DNS stub ended before the end of the run".into());
+        assert!(text_summary(&r).contains(
+            "could not read the names the command looked up: the DNS stub ended before the end of the run"
+        ));
     }
 }

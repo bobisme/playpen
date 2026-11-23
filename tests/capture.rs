@@ -667,6 +667,7 @@ fn compare_ignores_the_times_and_the_capture() {
         "allowed":["192.0.2.1:80/tcp"], "network":"pasta", "hosts":[], "exposed":[],
         "socket_guard":"landlock", "display":false,
         "dropped":{"packets":0,"destinations_truncated":false,"destinations":[]},
+        "lookups":{"names":[],"truncated":false},
         "started_at":"2026-11-22T10:00:00Z", "ended_at":"2026-11-22T10:00:02Z",
         "capture":{"file":"/w/a.pcap","bytes":24,"sha256":"00"}});
     std::fs::write(&a, report.to_string()).unwrap_or_else(|e| panic!("{e}"));

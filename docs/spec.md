@@ -46,7 +46,10 @@ Non-goals:
 
 - limiting how much is sent or inspecting what is sent;
 - confining anything except network egress (files, other processes, CPU);
-- resolving names: there is no DNS inside the sandbox;
+- resolving names: there is no DNS inside the sandbox. A stub on the
+  sandbox's loopback answers the `--host` names, says every other name
+  does not exist, and forwards nothing ("Name lookups", section 4.1). DNS
+  over HTTPS or TLS is traffic like any other;
 - protecting against kernel bugs, processes started outside playpen, or an
   approved destination that forwards traffic onwards.
 
@@ -270,7 +273,8 @@ With none of `--pass`, `--allow` and `--no-network`, playpen refuses: an
 empty allow list is almost always a mistake.
 
 **`--host NAME=ADDR`** (repeatable). Inside the sandbox, `NAME` resolves to
-`ADDR` through the generated `/etc/hosts`. `NAME` is a host name (labels of
+`ADDR` through the generated `/etc/hosts` and through the DNS stub ("Name
+lookups" below). `NAME` is a host name (labels of
 letters, digits and `-`, not starting or ending with `-`, at most 63
 characters per label and 253 in all, not all digits); it is lower-cased.
 `ADDR` is a literal address, as strict as in `--allow`, with or without
@@ -468,7 +472,8 @@ report in every format. Keep stdout and stderr separate when parsing JSON.
 The supervisor’s human-readable diagnostics on stderr include the following messages.
 
 - just before the command starts, one line: `allowing only SPECS until TIME
-  (no DNS[, names NAME=ADDR, ...]); everything else is dropped`, with
+  (no DNS[, names NAME=ADDR, ...]; lookups recorded); everything else is
+  dropped`, with
   `with no time limit` when there is no `--until`; with `--no-network`:
   `no network, loopback only, ...`. With `--pass` the line starts `under
   pass ID ("NAME", owner "OWNER", sha256:DIGEST, window ends TIME,
@@ -499,6 +504,13 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   asterisks starting `WARNING: N packet(s) to UNAPPROVED destinations were
   dropped.` listing each destination with protocol, port and packet count;
   then, with `--capture`, `packet capture PATH: N bytes, sha256 HEX`.
+- then, when the command looked up names that no `--host` maps: `The
+  command looked up names that have no --host mapping:`, one line `NAME: N
+  lookup(s)` per name (as shown in "Name lookups"), `(the list is
+  incomplete: playpen keeps 256 names)` when names were left out, and
+  `Each was answered "no such name". If the command needs one, map it
+  with --host NAME=ADDR (ADDR must be approved).` When the record could
+  not be read: `could not read the names the command looked up: WHY`.
 
 ### 4.2 Exit status of `run`
 
@@ -533,6 +545,39 @@ process under namespace init and ends with that namespace. If the helper
 dies mid-run, the client sees the ordinary local connection failure.
 Preview and pin include the fixture contents. See the README for a curl example.
 
+### Name lookups
+
+A DNS stub listens on 127.0.0.1 port 53, UDP and TCP, in the sandbox's
+network namespace, from before the command starts until it has ended. It
+is the only nameserver in the generated `/etc/resolv.conf`, and the
+generated `/etc/nsswitch.conf` has `hosts: files dns`, so the system
+resolver asks it after `/etc/hosts` (section 7). It reads the question of
+each query and nothing else:
+
+- a `--host` name: `NOERROR`, with the name's IPv4 addresses for type A,
+  its IPv6 addresses for type AAAA, both for type ANY, and no records for
+  any other type or for a class other than IN and ANY. Records have TTL 0.
+  A UDP reply that would exceed 512 bytes has no records and the TC flag,
+  so the client asks again over TCP;
+- every other name: `NXDOMAIN` ("no such name");
+- a message that is not one query with one question (an uncompressed name
+  of at most 255 bytes): `FORMERR`; another opcode: `NOTIMP`; a response:
+  no reply. None of these is recorded.
+
+The stub forwards nothing, keeps no cache, and sends nothing but replies to
+the sandbox's loopback. It keeps at most 16 TCP connections and closes one
+that is idle for 5 seconds.
+
+It records up to 256 distinct names, each with the number of queries for
+it and whether `--host` maps it. A name after the 256th is not kept and
+sets `truncated`. A name is shown lower-cased, its labels joined by `.`;
+a byte in a label other than a letter, digit, `-` or `_` (a `.` in a label
+too) is written `\DDD` in decimal (`\027` for ESC); the root is `.`. If
+the result is longer than 253 bytes, it is cut to at most 250 bytes, never
+inside a `\DDD`, and ends in `...`. So a name never holds a control byte.
+At teardown the stub sends the record to C, which sends it to P (section
+5). P checks each name again and drops any entry it would not show.
+
 ### Supervisor lifecycle events
 
 `run --events-fd N` accepts an inherited pipe writer above stderr. Close the
@@ -559,7 +604,9 @@ can disappear without delaying supervision.
 
 `playpen plan --no-network -- printf hello` describes the command and its
 effective settings. Use `--format json` for the versioned `plan` object.
-For example, its `network` field is `"none"` for this invocation. Preview
+For example, its `network` field is `"none"` for this invocation, and its
+`dns_stub` field, `"127.0.0.1:53"`, is where the DNS stub listens ("Name
+lookups", 4.1). Preview
 uses the same validation as run, reads the current pass and resolves socket
 exposures. It leaves the report path untouched. With `--capture FILE` the
 plan has a `capture` field, the path as given; plan neither creates nor
@@ -749,6 +796,8 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `dropped` | object or null | `{"packets": N, "destinations": [{"address", "protocol", "port", "packets"}], "destinations_truncated": bool}`; `port` is null for protocols other than TCP and UDP; destinations are sorted by packet count, largest first |
 | `drop_assertion` | `"pass"`, `"violated"`, or `"unknown"` | present only with `--fail-on-drop` |
 | `dropped_error` | string or null | why the counters could not be read |
+| `lookups` | object or null | the names the command looked up: `{"names": [{"name", "count", "mapped"}], "truncated": bool}`, in the order first asked, as shown in "Name lookups" (4.1); `mapped` is true for a `--host` name; null when the command did not run or the record could not be read |
+| `lookups_error` | string or null | why the record of names could not be read |
 | `socket_guard` | `"landlock"` or `"mounts_only"` | how host Unix sockets were kept from the command; `"mounts_only"` with `--without-landlock` |
 | `exposed` | array of strings | every exposed path (`--expose` and `--display`), canonical once checked; the `--expose` values as typed when refused |
 | `private_tty` | bool | whether the caller requested a private controlling terminal |
@@ -766,8 +815,9 @@ and `unknown` when counters are unavailable or the command did not start.
 For a child exit of zero, violated or unknown makes playpen exit 1. A nonzero
 child status is retained; signals retain their normal status, and a stop by
 expiry or pass revocation cannot become success. Refusal and setup failures
-retain their existing statuses. This counts dropped IP packets, not DNS
-misses, Unix sockets, or packets that never reached the ruleset. Without the
+retain their existing statuses. This counts dropped IP packets, not names
+the stub answered "no such name", Unix sockets, or packets that never
+reached the ruleset. Without the
 option, the existing exit contract and JSON shape are unchanged.
 
 ### Grant use in private reports
@@ -808,7 +858,8 @@ JSON object directly. Its only fields are `advice` (always an empty array), `sch
 `stopped_by_pass`, `dropped_packets`, `destinations_truncated`, and
 `drop_assertion`. The two drop fields are null when unavailable; zero is a
 known zero. The stop booleans classify expiry and pass stops without copying
-free-text reasons. The normal full report remains the default and retains its
+free-text reasons. It has no host names: not the `--host` mappings and not
+the names the command looked up. The normal full report remains the default and retains its
 existing compatibility contract. Future shareable fields require an explicit
 allowlist addition and a schema compatibility decision.
 
@@ -841,11 +892,22 @@ observations. A newly observed tuple
 requires a complete baseline; a no-longer-observed tuple requires a complete
 later report and does not mean it is allowed or fixed. Missing or partial
 counters, malformed detail, unstarted runs and unsupported/reduced schemas
-cannot establish equality. Exit 0 means comparable policy and complete
-observations with no new denials; 1 means new denials were observed; 2 means
-comparison is indeterminate, policy differs without a new denial, or input
-is invalid. When new denials and a policy change coexist, exit 1 reports the
-new denial and the output still marks the policy change.
+cannot establish equality.
+
+Names looked up without a `--host` mapping are observations too, compared
+the same way: `new_unmapped_lookups` needs a complete `lookups` record in
+the baseline, and `unmapped_lookups_no_longer_observed` a complete one in
+the later report. A record is complete when it is present, not truncated,
+from a run that ran, and every entry has a name playpen would show, a
+positive count and a `mapped` flag, with no name twice. Lookup counts, and
+names that `--host` maps, do not count as changes. Evidence is `complete`
+only when both the drop counters and the lookup records of both reports are.
+
+Exit 0 means comparable policy and complete observations with nothing new;
+1 means new denials or new unmapped lookups were observed; 2 means
+comparison is indeterminate, policy differs without a new observation, or
+input is invalid. When new observations and a policy change coexist, exit
+1 reports them and the output still marks the policy change.
 
 ### Pass enforcement coverage
 
@@ -896,10 +958,11 @@ Not part of the stable interface, hidden from `--help`:
 - `run --lo-addr ADDR` adds `ADDR` to the sandbox's `lo` before the
   ruleset is loaded. Used by tests and `doctor` to have destinations that
   exist only inside the sandbox.
-- `playpen probe reach|privs|resolve|unix|unix-send|unix-recv-fd|stdout-reconnect|fds|tty|signals|listen` are the checks
+- `playpen probe reach|privs|resolve|dns|unix|unix-send|unix-recv-fd|stdout-reconnect|fds|tty|signals|listen` are the checks
   run inside the sandbox by `doctor` and the tests (`unix` connects to Unix
   sockets and closes at once, writing nothing; `listen` reports
-  connections to a TCP listener).
+  connections to a TCP listener; `dns [--tcp] HEX` sends one DNS message
+  to the stub and describes the reply).
 - `run --pass-recheck-ms MS` re-reads the pass every `MS` milliseconds
   instead of every 2 seconds. Clamped to 50 ms .. 2 s, so it can only make
   the re-read more frequent. Used by the tests.
@@ -945,7 +1008,14 @@ Each step either succeeds or stops the run with a message that ends
    `--pass`, re-reads the pass
    once, prints the start line, and tells C to go. That moment is the
    report's `started_at`. (Steps 4 to 6 must finish within 30 seconds.)
-8. **C makes itself non-dumpable**, then forks S, which unshares a PID
+8. **C makes itself non-dumpable and starts the DNS stub D.** D sets
+   "die with parent", makes itself non-dumpable, binds 127.0.0.1 port 53
+   for UDP and TCP (C's root in the user namespace may bind ports below
+   1024), then clears every capability set, sets `no_new_privs`, checks
+   that raw sockets and a netlink link change are refused, closes every
+   other descriptor, and reports "ready". D stays in C's PID namespace:
+   the command cannot see it in `/proc` or signal it. Then C forks S,
+   which keeps no handle on D and unshares a PID
    namespace and forks I, its PID 1. I unshares a mount and an IPC
    namespace, makes all mounts private, and mounts a fresh `/proc`. Then,
    in this order (each failure stops the run): it opens every exposed path
@@ -1011,8 +1081,10 @@ sysctl set to 0).
 
 **Teardown.** When the command exits, I reports its status and exits; the
 kernel kills every process left in the PID namespace. The moment P reads
-that status is the report's `ended_at`. C then lists the
-table again to read the counters, reports them, and exits. P stops pasta
+that status is the report's `ended_at`. C then closes D's
+control pipe; D stops and sends its record of names (within 2 seconds, or
+C kills it and reports why). C reports the record, lists the table again to
+read the counters, reports them, and exits. P stops pasta
 if it is still running (pasta also exits when the namespace's process is
 gone; it looks once a second), removes pasta's PID file and its private
 directory, prints the summary, writes the report, and exits. With
@@ -1075,7 +1147,7 @@ So by default:
 |---|---|
 | IPv4 and IPv6 to unapproved destinations | dropped and counted (TCP connect fails with "No route to host" over IPv4 and "Permission denied" over IPv6, UDP send with "Operation not permitted") |
 | ICMP and ICMPv6 (ping and others) | dropped and counted; cannot be approved |
-| DNS | none: no nameserver configured, `hosts: files` only, port 53 not approved unless you approve it |
+| DNS | no DNS: the only nameserver is the stub on the sandbox loopback (127.0.0.1 port 53), which answers `--host` names, says every other name does not exist, and forwards nothing; port 53 elsewhere is not approved unless you approve it |
 | the host's loopback | unreachable: pasta maps nothing to it and forwards no loopback ports |
 | the sandbox's own loopback (`127.0.0.0/8`, `::1`) | allowed |
 | the sandbox's own non-loopback addresses (copied by pasta from the host) | treated like any other destination: only if approved; such traffic stays inside the sandbox anyway |
@@ -1102,10 +1174,15 @@ directory, reached through the descriptor playpen holds for it.
 - `/etc/hosts`: `127.0.0.1` and `::1` as `localhost` (plus the machine's
   host name if it is a valid host name), then one line per `--host`, then
   one line per entry from `--pass-hosts`.
-- `/etc/resolv.conf`: comments and `options timeout:1 attempts:1`, no
-  nameserver. (Not bound if the host has none.)
+- `/etc/resolv.conf`: comments, `nameserver 127.0.0.1` (the stub),
+  `search .` (no search list, so a name is not also asked for with the
+  machine's own domain appended) and `options timeout:1 attempts:1`. (Not
+  bound if the host has none; glibc then asks 127.0.0.1 all the same.)
 - `/etc/nsswitch.conf`: the host's file with its `hosts:` line replaced by
-  `hosts: files`. (Not bound if the host has none.)
+  `hosts: files dns`: the generated `/etc/hosts`, then the stub. The host's
+  other sources (`resolve`, `mdns`, `myhostname`, `mymachines` and the
+  like) are left out. (Not bound if the host has none; glibc's default
+  then asks the stub first.)
 - `/proc`: the sandbox's own PID namespace.
 - Replaced by fresh, empty, writable private directories (tmpfs) with the
   host directory's mode, if present; what the command writes there is gone
