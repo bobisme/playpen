@@ -955,6 +955,11 @@ fn strict_pass_reports_external_terms_and_respects_selection() {
         "true",
     ]);
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("(name restrictions on destinations: web)"),
+        "{}",
+        text(&out.stderr)
+    );
     let json = report(&rep);
     assert_eq!(
         json["enforcement_coverage"]["external_names"],
@@ -995,6 +1000,11 @@ fn strict_pass_reports_external_terms_and_respects_selection() {
         "true",
     ]);
     assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr).contains("(application ceilings: calls)"),
+        "{}",
+        text(&out.stderr)
+    );
     assert_eq!(
         report(&rep)["enforcement_coverage"]["external_ceilings"],
         serde_json::json!(["calls"])

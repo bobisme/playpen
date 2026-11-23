@@ -84,12 +84,34 @@ fn digest(value: &Value) -> hallpass::Digest {
     hallpass::Digest::of(value.to_string().as_bytes())
 }
 
+/// The current plan's fields as one line, for comparing with the reviewed
+/// plan. Long values are cut.
+fn summary(plan: &Value) -> String {
+    plan.as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(_, v)| !v.is_null())
+        .map(|(k, v)| {
+            let text = v.to_string();
+            if text.chars().count() > 160 {
+                let cut: String = text.chars().take(160).collect();
+                format!("{k}={cut}...")
+            } else {
+                format!("{k}={text}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 pub(super) fn match_pin(args: &RunArgs, checked: &Checked) -> Result<(), String> {
     if let Some(expected) = args.expect_plan {
         let actual = digest(&scope(args, checked)?);
         if actual != expected {
             return Err(format!(
-                "reviewed plan {expected} differs from current scope {actual}; review a new plan"
+                "reviewed plan {expected} differs from current scope {actual}; review a new plan. \
+                 The digest does not say which field differs. The current plan is: {}",
+                summary(&scope(args, checked)?)
             ));
         }
     }

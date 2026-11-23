@@ -67,6 +67,7 @@ other name to an address of the pass with `--host NAME=ADDR`.
 Pass restrictions on destination names and application ceilings need a separate
 application-level enforcer. Use `--require-enforced` to refuse a pass with
 such applicable terms when playpen must enforce every restriction itself.
+The refusal names the destination labels and the ceilings.
 
 ### How a pass-backed run ends
 
@@ -221,7 +222,8 @@ playpen run --expect-plan "$digest" --no-network -- printf hello
 
 The digest binds the reviewed arguments and effective settings, including
 the pass bytes when present. The command reads executable and file contents
-at run time.
+at run time. If the digest differs, `run` prints the current plan's fields.
+It cannot say which one differs, because only the digest was reviewed.
 
 ### Check dropped traffic in CI
 

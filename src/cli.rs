@@ -884,15 +884,30 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
 }
 
 fn enforce_coverage(args: &RunArgs, checked: &Checked) -> Result<(), String> {
-    if args.require_enforced
-        && checked
-            .from_pass
-            .as_ref()
-            .is_some_and(|p| !p.coverage.fully_enforced())
-    {
-        return Err("--require-enforced: selected names or application ceilings require an external enforcer".into());
+    let Some(pass) = checked.from_pass.as_ref().filter(|_| args.require_enforced) else {
+        return Ok(());
+    };
+    let c = &pass.coverage;
+    if c.fully_enforced() {
+        return Ok(());
     }
-    Ok(())
+    let mut what = Vec::new();
+    if !c.external_names.is_empty() {
+        what.push(format!(
+            "name restrictions on destinations: {}",
+            c.external_names.join(", ")
+        ));
+    }
+    if !c.external_ceilings.is_empty() {
+        what.push(format!(
+            "application ceilings: {}",
+            c.external_ceilings.join(", ")
+        ));
+    }
+    Err(format!(
+        "--require-enforced: selected names or application ceilings require an external enforcer ({})",
+        what.join("; ")
+    ))
 }
 
 struct StderrEvents<'a> {

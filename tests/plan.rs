@@ -65,7 +65,11 @@ fn pin_is_bound_to_command_and_grants_before_start() {
             .output()
             .expect("pinned run");
         assert_eq!(result.status.code(), Some(2));
-        assert!(String::from_utf8_lossy(&result.stderr).contains("differs from current scope"));
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains("differs from current scope"));
+        // The refusal prints the current plan's fields.
+        assert!(stderr.contains("The current plan is: allowed="), "{stderr}");
+        assert!(stderr.contains("command=[\""), "{stderr}");
     }
 }
 

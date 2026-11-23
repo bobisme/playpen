@@ -13,8 +13,20 @@ struct Endpoint {
     protocol: String,
     port: Option<u16>,
 }
+/// One policy field that differs between the two reports.
+struct PolicyChange {
+    /// The report field: `allowed`, `hosts`, `exposed`, `network`, ...
+    field: &'static str,
+    /// Items only in the later report; empty for a single value.
+    added: Vec<String>,
+    /// Items only in the earlier report; empty for a single value.
+    removed: Vec<String>,
+    /// For a single value, its text in the earlier and later report.
+    values: Option<(String, String)>,
+}
 struct Comparison {
     policy: &'static str,
+    policy_changes: Vec<PolicyChange>,
     evidence: &'static str,
     new_denials: Vec<Endpoint>,
     no_longer_observed: Vec<Endpoint>,
@@ -22,7 +34,7 @@ struct Comparison {
     unmapped_lookups_no_longer_observed: Vec<String>,
 }
 struct Input {
-    policy: Vec<Value>,
+    policy: Vec<(&'static str, Value)>,
     endpoints: BTreeSet<Endpoint>,
     complete: bool,
     /// Names looked up without a `--host` mapping.
@@ -192,7 +204,7 @@ fn read(path: &Path) -> Result<Input, String> {
         } else if let Some(items) = field.as_array_mut() {
             items.sort_by_key(Value::to_string);
         }
-        policy.push(field);
+        policy.push((key, field));
     }
     let (endpoints, complete) = dropped_endpoints(&v);
     let (unmapped, lookups_complete) = unmapped_lookups(&v["lookups"]);
@@ -203,6 +215,72 @@ fn read(path: &Path) -> Result<Input, String> {
         unmapped,
         lookups_complete: lookups_complete && v["outcome"] == "ran",
     })
+}
+
+/// The items of a policy field as text. A `hosts` map becomes `name=address`.
+fn items(field: &Value) -> Vec<String> {
+    if let Some(map) = field.as_object() {
+        return map
+            .iter()
+            .flat_map(|(name, addrs)| {
+                addrs
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(move |a| format!("{name}={}", a.as_str().unwrap_or_default()))
+            })
+            .collect();
+    }
+    field.as_array().map_or_else(Vec::new, |a| {
+        a.iter()
+            .map(|v| v.as_str().unwrap_or_default().to_owned())
+            .collect()
+    })
+}
+
+/// The items in `from` that `other` lacks, counting repeats.
+fn missing_from(from: &[String], other: &[String]) -> Vec<String> {
+    let mut rest = other.to_vec();
+    let mut out: Vec<String> = from
+        .iter()
+        .filter(|item| {
+            rest.iter()
+                .position(|r| r == *item)
+                .map(|i| rest.swap_remove(i))
+                .is_none()
+        })
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
+/// Each policy field that differs, with the items added and removed.
+fn policy_changes(a: &[(&'static str, Value)], b: &[(&'static str, Value)]) -> Vec<PolicyChange> {
+    let mut out = Vec::new();
+    for ((field, before), (_, after)) in a.iter().zip(b) {
+        if before == after {
+            continue;
+        }
+        if before.is_array() || before.is_object() {
+            let (x, y) = (items(before), items(after));
+            out.push(PolicyChange {
+                field,
+                added: missing_from(&y, &x),
+                removed: missing_from(&x, &y),
+                values: None,
+            });
+        } else {
+            let text = |v: &Value| v.as_str().map_or_else(|| v.to_string(), str::to_owned);
+            out.push(PolicyChange {
+                field,
+                added: vec![],
+                removed: vec![],
+                values: Some((text(before), text(after))),
+            });
+        }
+    }
+    out
 }
 
 pub fn run_formatted(before: &Path, after: &Path, format: Format) -> i32 {
@@ -224,6 +302,7 @@ pub fn run_formatted(before: &Path, after: &Path, format: Format) -> i32 {
             );
         }
     };
+    let policy_changes = policy_changes(&a.policy, &b.policy);
     let policy = if a.policy == b.policy {
         "same"
     } else {
@@ -256,6 +335,7 @@ pub fn run_formatted(before: &Path, after: &Path, format: Format) -> i32 {
     };
     let result = Comparison {
         policy,
+        policy_changes,
         evidence,
         new_denials,
         no_longer_observed,
@@ -272,6 +352,42 @@ pub fn run_formatted(before: &Path, after: &Path, format: Format) -> i32 {
     }
 }
 
+/// The changes as JSON: one object per changed field, keyed by its name.
+fn changes_json(changes: &[PolicyChange]) -> Value {
+    let mut map = serde_json::Map::new();
+    for c in changes {
+        let v = c.values.as_ref().map_or_else(
+            || serde_json::json!({"added": c.added, "removed": c.removed}),
+            |(before, after)| serde_json::json!({"before": before, "after": after}),
+        );
+        map.insert(c.field.to_owned(), v);
+    }
+    Value::Object(map)
+}
+
+/// One line per change, `sep` between the words. A field that changed
+/// only in the order of its addresses has no added or removed item.
+fn change_lines(changes: &[PolicyChange], sep: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for c in changes {
+        if let Some((before, after)) = &c.values {
+            lines.push(format!(
+                "changed{sep}{}{sep}{before}{sep}->{sep}{after}",
+                c.field
+            ));
+        } else if c.added.is_empty() && c.removed.is_empty() {
+            lines.push(format!("changed{sep}{}{sep}order", c.field));
+        }
+        for item in &c.added {
+            lines.push(format!("added{sep}{}{sep}{item}", c.field));
+        }
+        for item in &c.removed {
+            lines.push(format!("removed{sep}{}{sep}{item}", c.field));
+        }
+    }
+    lines
+}
+
 /// Prints the comparison in `format`. Names are shown names: they hold no
 /// terminal control bytes.
 fn print(result: &Comparison, format: Format) {
@@ -285,6 +401,7 @@ fn print(result: &Comparison, format: Format) {
             "{}",
             serde_json::json!({
                 "policy": result.policy,
+                "policy_changes": changes_json(&result.policy_changes),
                 "evidence": result.evidence,
                 "new_denials": result.new_denials,
                 "no_longer_observed": result.no_longer_observed,
@@ -295,6 +412,9 @@ fn print(result: &Comparison, format: Format) {
         );
     } else if format == Format::Text {
         println!("policy  {}\nevidence  {}", result.policy, result.evidence);
+        for line in change_lines(&result.policy_changes, "  ") {
+            println!("policy-change  {line}");
+        }
         for (kind, endpoints) in [
             ("new", &result.new_denials),
             ("no-longer-observed", &result.no_longer_observed),
@@ -321,6 +441,9 @@ fn print(result: &Comparison, format: Format) {
         }
     } else {
         println!("policy: {}; evidence: {}", result.policy, result.evidence);
+        for line in change_lines(&result.policy_changes, " ") {
+            println!("policy change: {line}");
+        }
         for e in &result.new_denials {
             println!("new: {} {} {:?}", e.address, e.protocol, e.port);
         }

@@ -867,7 +867,10 @@ plan (object keys in lexical order). Give it to `run --expect-plan DIGEST`
 to require the same effective settings, working directory, argument bytes,
 and original pass bytes. Playpen compares at validation and again before it
 releases the workload. Normal expiry and revocation checks apply throughout.
-The digest describes configuration. Program and filesystem contents, the
+If the digest differs, the refusal says so and prints the current plan's
+fields on one line, each value cut at 160 characters. The digest is all that
+was reviewed, so playpen cannot say which field differs; compare that line,
+or `playpen plan --format json`, with the reviewed plan. The digest describes configuration. Program and filesystem contents, the
 environment inherited by the child, and later pass edits have their own
 lifetimes.
 
@@ -1215,6 +1218,12 @@ inert data (at most 1 MiB each). It compares effective grants, network, host
 mappings (an entry from `--pass-hosts` counts as its `NAME=ADDR`), exposed
 sockets, display and socket guard independently of observed
 blocked endpoint tuples. Packet counts do not themselves trigger changes.
+When policy differs, `policy_changes` in JSON and `policy-change` lines in
+text name each field that differs. A list field (`allowed`, `hosts`,
+`exposed`) has `added` and `removed` items; a `hosts` item is `NAME=ADDR`.
+`network`, `socket_guard` and `display` have `before` and `after`. A field
+that is the same is absent. If only the order of a field's items changed,
+`added` and `removed` are empty.
 `started_at`, `ended_at` and `capture` are ignored: two runs of the same
 policy differ in them by nature. `contacted` and `contacted_error` are
 ignored too. Policy differences are shown before the
@@ -1312,7 +1321,8 @@ admitted by `allowed`, or when `allowed` or `hosts` does not parse.
 destination restricts names or any pass-wide application ceiling is present.
 The full report's `enforcement_coverage` identifies packet and time filtering
 and lists selected labels and ceiling names requiring external enforcement,
-including on this refusal. Informational `hostname` is not a restriction;
+including on this refusal. The refusal message names them too: the labels
+with name restrictions and the ceiling names. Informational `hostname` is not a restriction;
 `--host` and `--pass-hosts` do not enforce request names. A strict run
 rechecks the pass and stops using the existing grace period if unsupported
 terms become applicable.
