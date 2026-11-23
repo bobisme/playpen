@@ -1043,6 +1043,152 @@ released, the file holds at most pasta's header and address resolution,
 and it would make a second run with the same name fail. playpen removes
 it, but only when the name still leads to the file it created.
 
+## Drops while the command runs
+
+Before this, a refused destination was known only from the summary at
+the end. A long command (a build, a test suite, an agent) that hangs on a
+refused connection told its owner nothing until it ended. Now, with
+`--events-fd` or `--live-drops`, each new dropped destination is reported
+within about 2 seconds, while the command runs.
+
+**C reads, not P.** The counters live in the sandbox's network namespace,
+and only a process with `CAP_NET_ADMIN` over it can list them. P has no
+such right, and the command must not have it. C already holds it and waits
+in one `poll` loop for S and for P's cut request ("Ending egress in the
+firewall"). The reading is one more duty in that loop: the poll timeout
+runs to the next reading. The code is apart from the teardown readback
+(`report_counters`) and from the ruleset text: `src/live_drops.rs` has the
+state and the parsing, and `read_drops_live` in `sandbox.rs` runs `nft`.
+
+**Every 2 seconds, on a fixed schedule.** The interval is the one of the
+pass re-read (`pass::RECHECK_INTERVAL`), so the owner learns of a drop on
+the scale at which a revoked pass takes effect. The schedule starts when C
+has forked S, and the next reading is due one interval after the last
+was due, not after it ended, so the readings do not drift. When C falls a
+whole interval behind (a stopped machine), the next reading is one
+interval from now and the ones missed are not made up.
+
+**Two steps: the counter, then the sets.** A reading first lists only the
+`dropped` counter. Only when its value differs from the value at the last
+listing of the table does C list the table and look at the drop sets.
+Most readings of a run without drops, or with only known destinations
+that are quiet, are the small step. The value C keeps is the counter as it
+read it before the listing, so a packet counted between the two steps
+makes the next reading list again. Nothing is missed; at worst one listing
+too many.
+
+**What it costs.** Measured on nftables 1.1.7, Linux 7.2.8, an AMD
+Threadripper 9970X. Method: in a throwaway `unshare --user
+--map-root-user --net` namespace, playpen's own ruleset (as `playpen
+rules` prints it, with an end time) is loaded, and addresses 192.0.2.2 and
+2001:db8::2 are put on `lo`. UDP datagrams to 1,100 ports of each address
+fill both drop sets to their 1,024 elements from the packet path (the
+counter at 2,200). Each command runs 200 times in a loop under bash's
+`time`; the figures are per run, the mean wall time and the user plus
+system CPU time.
+
+| Read | Sets empty | Sets full (2 × 1,024) |
+| --- | --- | --- |
+| `nft --json list counter inet playpen dropped` | 1.0 ms wall, 1.0 ms CPU, 230 bytes | 1.2 ms wall, 1.2 ms CPU, 237 bytes |
+| `nft --json list set inet playpen drop4` | 1.1 ms, 1.1 ms | 15 ms, 15 ms, 100 KB |
+| `nft --json list table inet playpen` (`TZ=UTC0`) | 1.9 ms, 1.9 ms, 6.7 KB | 31 ms, 31 ms, 209 KB (37 ms in an earlier run) |
+| `NFT_MSG_GETOBJ` for `dropped` over `NETLINK_NETFILTER`, in-process | 4 µs | 4 µs (6 µs with a new socket each time) |
+
+So the step taken every 2 seconds costs about 1.2 ms of CPU: 0.06% of one
+CPU. A run that keeps sending to known destinations moves the counter at
+every reading and has C list the table each time: with both sets full,
+about 31 to 37 ms per 2 seconds, under 2% of one CPU, and with a handful
+of destinations about 2 ms. The figures are for `nft` alone; C's parse of
+the listing is not in them. The readings run only with `--events-fd` or
+`--live-drops`. Without them the counter is read once, at teardown, as
+before.
+
+**nft, not netlink.** A netlink request would be 300 times cheaper, but
+1.2 ms per 2 seconds does not need it. It would also be raw nfnetlink
+message code in playpen beside the `nft` that loads and verifies the
+ruleset, bypass the configured `nft` (`PLAYPEN_NFT`, which the tests
+replace with fakes), and need its own parser of the sets' attributes for
+the second step, where the cost is. If a later need (a shorter interval,
+many runs on one machine) makes the cost matter, the counter step alone
+can move to netlink. The measurement used a short script (not in the
+repository) that sends `NFT_MSG_GETOBJ` with `NFTA_OBJ_TABLE`,
+`NFTA_OBJ_NAME` and `NFTA_OBJ_TYPE` (counter) and reads
+`NFTA_COUNTER_PACKETS` from the answer.
+
+**Each destination once, kept in C.** `LiveDrops` in C keeps the set of
+destinations (address, protocol, port) it has sent. A destination's
+packet count grows, but it is sent once, with the count at the reading
+that found it. Keeping the set in C means a destination that is dropped
+the whole run costs one line on the pipe, not one per reading. The set
+holds at most the 2,048 elements of the drop sets. nft prints a protocol
+by name when it knows it, else as a number ("6", "17"); both are
+normalized to the name before the comparison, as at teardown, so a
+destination is not sent twice under two names.
+
+**Wire format.** C writes `denied JSON` on the pipe it reports on, one
+line per destination, with the fields of the report's `dropped`
+destinations (`address`, `protocol`, `port`, `packets`), well under
+`PIPE_BUF`, so a line is never mixed with one from S or I. P parses it
+with the teardown readback's own types, and the record on `--events-fd`
+is the same object. A failed reading sends `deniederr WHY` once (cut to
+512 characters); C tries again at every interval and sends nothing more
+for later failures. P reports both from its main loop, and once more
+after the command has ended, for lines that came with the exit.
+
+**Few lines on stderr.** stderr is the command's too, so a run that
+probes many places must not bury the command's own output. `--live-drops`
+prints the first 8 destinations and then one line that says there are
+more and where to find them. The events stream, read by a program, gets
+every one.
+
+**Events always, stderr only when asked.** It was an open question
+whether the lines come by default on a terminal. Decision: no. The `denied`
+records come whenever `--events-fd` is given, and the lines only with
+`--live-drops`, whatever stderr is. Reasons: the lines appear in the
+middle of the command's own output on the caller's terminal, which an
+attached or `--private-tty` command shares; scripts and logs that read
+stderr get the lines they got before; and a program that wants to know
+already reads `--events-fd`. `--live-drops` is in the plan and its digest
+(only when given, so older digests stay valid) because it changes what the
+run prints, as `--capture` does.
+
+**After the end of egress.** The time rule and the cut come before the
+drop rule in the output chain, so from the end second, or once the cut is
+in place, a refused packet is counted in `late` or `cut` and never reaches
+`@drop4`, `@drop6` or `dropped`. The command's attempts during its grace
+make no `denied` record. The report counts them in `refused_after_end`.
+
+**What a reading does not see.** A destination first dropped after the
+last reading and before the command ends has no record: C does not make a
+reading at teardown for this. Its readback for the report comes at once,
+and P has the complete list there. A destination beyond 1,024 in its
+family's set moves `dropped` but is in no set, so it has no record either.
+The report's `destinations_truncated` says so.
+
+**A cut request during a reading.** C answers P's `CUT` after the reading
+in flight: at most the time of one listing, about 40 ms with full sets,
+well inside P's 2-second limit.
+
+**The hook for `--on-drop stop`.** A planned option, `--on-drop
+cut|stop`, would have the kernel close egress by itself on the first
+drop (`add @cut { meta mark }` on the refusal path, before the drop
+counter). Then C must learn that it happened, and, for `stop`, P must
+stop the command. `read_drops_live` is the place: the packet that trips
+the cut goes on to the drop counter, so the next reading sees `dropped`
+move and lists the table, and that listing has the `cut` set (and the
+tripping destination in the drop sets). When the set holds the element
+and C did not add it, C sends one more line (for example `tripped`) to
+P, which stops the command as on an expiry. No new read is needed, and
+the delay is the same one interval. Such a run needs the readings
+whatever `--events-fd` and `--live-drops` say, so `Plan::watch_drops`
+would also be true for it.
+
+**Later: NFLOG.** A `log group N` rule beside the drop rule would hand
+each refused packet to a netlink listener at once, without polling, and
+with more than the destination (the source port, the first bytes). It
+needs a listener in C with its own netlink code and rate limits, and it
+duplicates what the sets already count. Not done.
+
 ## Leaks considered
 
 | Leak | How it is closed | Tested |

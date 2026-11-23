@@ -65,6 +65,10 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
     if let Some(path) = &args.capture {
         scope["capture"] = unix_string(path.as_os_str());
     }
+    // And for runs without live drop lines.
+    if args.live_drops {
+        scope["live_drops"] = json!(true);
+    }
     Ok(scope)
 }
 

@@ -1249,3 +1249,50 @@ fn private_tty_keeps_piped_stdin_separate_from_dev_tty_keyboard_input() {
     t.expect("$ ");
     assert_eq!(t.status(), "0");
 }
+
+/// A command that sends to a denied address and sleeps past a reading of
+/// the drop counter, run at the terminal with `--events-fd` (so the counter
+/// is read while it runs) and `mode`. Without `--live-drops` the terminal
+/// shows no new line, while the events stream gets the `denied` record;
+/// with it, the line is shown before the command ends.
+fn live_lines_only_when_asked(t: &mut Pty, mode: &str) {
+    t.send("events=$(mktemp)\n");
+    t.expect("$ ");
+    for live in [false, true] {
+        let flag = if live { " --live-drops" } else { "" };
+        t.send(&format!(
+            "$P run --no-network --lo-addr 192.0.2.2 --events-fd 3{mode}{flag} -- sh -c '\"$P\" probe reach --try 192.0.2.2:9602/udp >/dev/null; sleep 3; echo fin\"\"ished' 3> >(cat >\"$events\")\n"
+        ));
+        let during = t.expect("finished");
+        let at_end = t.expect("$ ");
+        let case = format!("{mode}{flag}: {during:?} {at_end:?}");
+        assert_eq!(
+            during.contains("playpen: dropped: 192.0.2.2 udp port 9602 (not approved)"),
+            live,
+            "{case}"
+        );
+        assert_eq!(during.contains("playpen: dropped:"), live, "{case}");
+        assert!(!at_end.contains("playpen: dropped:"), "{case}");
+        assert!(at_end.contains("WARNING: 1 packet(s)"), "{case}");
+        assert_eq!(t.status(), "0", "{case}");
+        t.expect("$ ");
+        t.send("sleep 0.3; echo \"den\"\"ied=$(grep -c '\"event\":\"denied\"' \"$events\")\"\n");
+        t.expect("denied=");
+        assert_eq!(t.expect("\n").trim(), "1", "{case}");
+        t.expect("$ ");
+    }
+    t.send("rm -f \"$events\"\n");
+    t.expect("$ ");
+}
+
+#[test]
+fn without_live_drops_an_attached_terminal_sees_no_new_lines() {
+    require_pty!(t);
+    live_lines_only_when_asked(&mut t, "");
+}
+
+#[test]
+fn without_live_drops_a_private_terminal_sees_no_new_lines() {
+    require_pty!(t);
+    live_lines_only_when_asked(&mut t, " --private-tty");
+}

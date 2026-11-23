@@ -59,8 +59,9 @@ impl EventPipe {
         self.sequence.set(seq);
         let mut record = json!({"version":1,"seq":seq,"event":event,"details":details}).to_string();
         record.push('\n');
-        // All fields are internal enums or small integers. One write <= PIPE_BUF
-        // is atomic, and the writer can never wait for an unresponsive reader.
+        // All fields are internal enums, small integers, or (`denied`) a parsed
+        // address and a protocol name. One write <= PIPE_BUF is atomic, and the
+        // writer can never wait for an unresponsive reader.
         if record.len() > libc::PIPE_BUF || file.write(record.as_bytes()).ok() != Some(record.len())
         {
             slot.take();

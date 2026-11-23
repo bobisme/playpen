@@ -69,6 +69,57 @@ fn pin_is_bound_to_command_and_grants_before_start() {
     }
 }
 
+/// `--live-drops` is in the plan and its digest only when given, so the
+/// digest of a plan without it is the one it had before the option
+/// existed, and a run that adds it to a reviewed plan is refused.
+#[test]
+fn live_drops_is_in_the_plan_only_when_given() {
+    let plan = |flags: &[&str]| {
+        let out = Command::new(BIN)
+            .args(["plan", "--format", "json", "--allow", "192.0.2.1:443/tcp"])
+            .args(flags)
+            .args(["--", "true"])
+            .output()
+            .expect("plan");
+        assert!(out.status.success());
+        serde_json::from_slice::<Value>(&out.stdout).expect("plan JSON")
+    };
+    let without = plan(&[]);
+    let with = plan(&["--live-drops"]);
+    assert!(without["plan"].get("live_drops").is_none(), "{without}");
+    assert_eq!(with["plan"]["live_drops"], true);
+    assert_ne!(with["digest"], without["digest"]);
+    let mut stripped = with["plan"].clone();
+    stripped
+        .as_object_mut()
+        .expect("plan object")
+        .remove("live_drops");
+    assert_eq!(stripped, without["plan"]);
+    let text = Command::new(BIN)
+        .args([
+            "plan",
+            "--allow",
+            "192.0.2.1:443/tcp",
+            "--live-drops",
+            "--",
+            "true",
+        ])
+        .output()
+        .expect("text plan");
+    assert!(String::from_utf8_lossy(&text.stdout).contains("live_drops  true"));
+    let refused = Command::new(BIN)
+        .args([
+            "run",
+            "--expect-plan",
+            without["digest"].as_str().expect("digest"),
+        ])
+        .args(["--allow", "192.0.2.1:443/tcp", "--live-drops", "--", "true"])
+        .output()
+        .expect("pinned run");
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("differs from current scope"));
+}
+
 #[test]
 fn private_tty_changes_the_reviewed_scope_and_conflicts_with_detachment() {
     let inspect = |flags: &[&str]| {

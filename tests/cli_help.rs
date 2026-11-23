@@ -164,6 +164,42 @@ fn run_help_lists_the_packet_capture() {
 }
 
 #[test]
+fn run_and_plan_help_list_live_drops() {
+    for name in ["run", "plan"] {
+        let help = json(&invoke(&["help", name, "--format", "json"], None).stdout);
+        let arg = help["arguments"]
+            .as_array()
+            .expect("arguments")
+            .iter()
+            .find(|a| a["long"] == "live-drops")
+            .cloned()
+            .unwrap_or_else(|| panic!("{name}: no --live-drops in {help}"));
+        assert_eq!(arg["takes_value"], false, "{name}");
+        let said = arg["help"].as_str().unwrap_or("");
+        assert!(
+            said.contains("while the command runs") && said.contains("--events-fd"),
+            "{name}: {said}"
+        );
+    }
+    let help = json(&invoke(&["help", "run", "--format", "json"], None).stdout);
+    assert!(
+        help["examples"]
+            .as_array()
+            .expect("examples")
+            .iter()
+            .any(|e| e.as_str().is_some_and(|e| e.contains("--live-drops"))),
+        "{help}"
+    );
+    let workflow = help["workflow"].as_str().unwrap_or("");
+    assert!(
+        workflow.contains("denied record") && workflow.contains("--live-drops"),
+        "{workflow}"
+    );
+    let text = String::from_utf8(invoke(&["run", "--help"], None).stdout).expect("help");
+    assert!(text.contains("--live-drops"), "{text}");
+}
+
+#[test]
 fn json_run_refusal_is_a_report_even_without_a_file() {
     let out = invoke(
         &["run", "--allow", "invalid", "--json", "--", "false"],

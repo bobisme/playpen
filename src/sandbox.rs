@@ -47,6 +47,11 @@
 //! report pipe. Only then does P print the notice and send SIGTERM (see
 //! [`Cut`]). From the approval's end time the ruleset refuses the same
 //! traffic by itself, whatever P does.
+//!
+//! With [`Plan::watch_drops`], C also reads the drop counter every
+//! [`live_drops::INTERVAL`] while the command runs and sends each new
+//! dropped destination on the report pipe as `denied JSON`; P passes it on
+//! ([`Events::denied`]).
 
 use std::ffi::OsString;
 use std::fs;
@@ -76,6 +81,7 @@ use nix::unistd::{
 };
 
 use crate::approval::Approval;
+use crate::live_drops::{self, LiveDrops};
 use crate::pass::{PassWatch, Recheck};
 use crate::resolver::{self, HostEntry};
 use crate::ruleset::{self, DropSummary};
@@ -113,6 +119,10 @@ const SYNC_LIMIT: Duration = Duration::from_secs(1);
 
 /// Everything the sandbox needs to know. Built and checked by the CLI.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent settings of one run, each from its own option"
+)]
 pub struct Plan {
     /// Optional private loopback HTTP response for offline runs.
     pub fixture: Option<crate::fixture::Fixture>,
@@ -151,6 +161,10 @@ pub struct Plan {
     /// With `--pass`: the pass file to re-read while the command runs. A
     /// re-read can stop the run, never change the rules.
     pub watch: Option<PassWatch>,
+    /// With `--events-fd` or `--live-drops`: C reads the drop counter every
+    /// [`crate::live_drops::INTERVAL`] while the command runs, and P reports
+    /// each new dropped destination ([`Events::denied`]).
+    pub watch_drops: bool,
 }
 
 impl Plan {
@@ -251,6 +265,14 @@ pub trait Events {
     /// A re-read of the pass withdrew the approval; egress is closed as
     /// `cut` says, and the command is being stopped for this reason.
     fn pass_withdrawn(&mut self, reason: &str, cut: &Cut);
+    /// With [`Plan::watch_drops`]: a reading while the command ran found
+    /// packets dropped to `dest`, a destination not reported before.
+    /// `packets` is the count at that reading.
+    fn denied(&mut self, _dest: &ruleset::DroppedDest) {}
+    /// With [`Plan::watch_drops`]: the drop counter could not be read while
+    /// the command ran, for the reason given. Said once; later readings are
+    /// still tried.
+    fn denied_unreadable(&mut self, _why: &str) {}
 }
 
 /// Number of threads in this process, from `/proc/self/status`.
@@ -907,6 +929,12 @@ struct ParentState {
     cut: Option<Result<(), String>>,
     /// Packets refused after the approval ended, from C's last reading.
     refused_after_end: Option<u64>,
+    /// New dropped destinations from C's readings while the command runs,
+    /// not yet reported.
+    denied: Vec<ruleset::DroppedDest>,
+    /// Why C could not read the drop counter while the command ran, not yet
+    /// reported.
+    denied_error: Option<String>,
 }
 
 impl ParentState {
@@ -914,6 +942,12 @@ impl ParentState {
         let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
         match word {
             "ready" => self.ready = true,
+            "denied" => {
+                if let Ok(d) = serde_json::from_str::<DroppedWire>(rest) {
+                    self.denied.push(d.into_dest());
+                }
+            }
+            "deniederr" => self.denied_error = Some(rest.to_owned()),
             "cut" => self.cut = Some(Ok(())),
             "cuterr" => self.cut = Some(Err(rest.to_owned())),
             "afterend" => self.refused_after_end = rest.parse().ok(),
@@ -992,6 +1026,17 @@ impl ParentState {
             Err(_) => self.eof = true,
         }
     }
+
+    /// Passes on what C's readings found while the command ran: each new
+    /// dropped destination, and the first failure.
+    fn report_denied(&mut self, events: &mut dyn Events) {
+        for dest in std::mem::take(&mut self.denied) {
+            events.denied(&dest);
+        }
+        if let Some(why) = self.denied_error.take() {
+            events.denied_unreadable(&why);
+        }
+    }
 }
 
 /// The JSON form of [`DropSummary`] passed from C to P.
@@ -1018,13 +1063,19 @@ impl DropSummaryWire {
             destinations: self
                 .destinations
                 .into_iter()
-                .map(|d| ruleset::DroppedDest {
-                    address: d.address,
-                    protocol: d.protocol,
-                    port: d.port,
-                    packets: d.packets,
-                })
+                .map(DroppedWire::into_dest)
                 .collect(),
+        }
+    }
+}
+
+impl DroppedWire {
+    fn into_dest(self) -> ruleset::DroppedDest {
+        ruleset::DroppedDest {
+            address: self.address,
+            protocol: self.protocol,
+            port: self.port,
+            packets: self.packets,
         }
     }
 }
@@ -1279,6 +1330,7 @@ fn parent(
         if !st.own.is_empty() {
             events.own_addresses(&std::mem::take(&mut st.own));
         }
+        st.report_denied(events);
         // W's reports are read before P's own signals. A signal for the
         // whole group is pending here by the time W can have reported it,
         // so a report with no signal of P's own beside it is not a group's.
@@ -1366,6 +1418,7 @@ fn parent(
     }
     drop(down_w);
     drop(witness);
+    st.report_denied(events);
     events.ended(st.ended_at.unwrap_or_else(time::OffsetDateTime::now_utc));
     let _ = waitpid(child, None);
     if let Some(tty) = private_tty.take()
@@ -1839,7 +1892,7 @@ fn stage_c(
             exit_now(code);
         }
         ForkResult::Parent { child } => {
-            watch_sandbox(&plan.nft, child, &control_r, &chld, up_w);
+            watch_sandbox(&plan.nft, plan.watch_drops, child, &control_r, &chld, up_w);
         }
     }
     // S has ended, and with it the command: nothing can look up a name now.
@@ -1853,24 +1906,52 @@ fn stage_c(
     Ok(())
 }
 
-/// C's work while the command runs: wait for S to end, and close all
-/// egress in the firewall when P asks ([`CUT`]).
+/// C's work while the command runs: wait for S to end, close all egress in
+/// the firewall when P asks ([`CUT`]), and, with `watch_drops`, read the
+/// drop counter every [`live_drops::INTERVAL`] ([`read_drops_live`]).
 ///
-/// One `poll` over P's control pipe and C's SIGCHLD; another duty for C
-/// while the command runs is one more descriptor here. C answers every
-/// [`CUT`], so P never waits for an answer that will not come; the element
-/// is added once.
-fn watch_sandbox(nft: &Path, s: Pid, control_r: &OwnedFd, chld: &SignalFd, up_w: &OwnedFd) {
+/// One `poll` over P's control pipe and C's SIGCHLD, with the next reading
+/// as its timeout; another duty for C while the command runs is one more
+/// descriptor here. C answers every [`CUT`], so P never waits for an
+/// answer that will not come; the element is added once. A reading waits
+/// for `nft` (about 1 ms, about 40 ms when it lists the table with both
+/// drop sets full), and a [`CUT`] that comes meanwhile is answered right
+/// after it.
+fn watch_sandbox(
+    nft: &Path,
+    watch_drops: bool,
+    s: Pid,
+    control_r: &OwnedFd,
+    chld: &SignalFd,
+    up_w: &OwnedFd,
+) {
     // False once P has closed its end: P is gone, and PR_SET_PDEATHSIG
     // ends C as well.
     let mut listening = true;
     let mut cut: Option<Result<(), String>> = None;
+    let mut live = watch_drops.then(LiveDrops::default);
+    let mut next_reading = Instant::now() + live_drops::INTERVAL;
     loop {
+        let timeout = live.as_mut().map_or(PollTimeout::NONE, |live| {
+            if Instant::now() >= next_reading {
+                read_drops_live(nft, live, up_w);
+                // A fixed schedule, unless C fell a whole interval behind.
+                let now = Instant::now();
+                next_reading += live_drops::INTERVAL;
+                if next_reading <= now {
+                    next_reading = now + live_drops::INTERVAL;
+                }
+            }
+            let left = next_reading.saturating_duration_since(Instant::now());
+            // Rounded up, so poll does not return just before the reading
+            // is due.
+            PollTimeout::from(u16::try_from(left.as_millis().saturating_add(1)).unwrap_or(u16::MAX))
+        });
         let mut fds = vec![PollFd::new(chld.as_fd(), PollFlags::POLLIN)];
         if listening {
             fds.push(PollFd::new(control_r.as_fd(), PollFlags::POLLIN));
         }
-        match poll(&mut fds, PollTimeout::NONE) {
+        match poll(&mut fds, timeout) {
             Ok(_) | Err(Errno::EINTR) => {}
             // Nothing to wait on any more but S itself.
             Err(_) => {
@@ -1898,14 +1979,79 @@ fn watch_sandbox(nft: &Path, s: Pid, control_r: &OwnedFd, chld: &SignalFd, up_w:
                 Err(_) => listening = false,
             }
         }
-        // SIGCHLD also comes from the nft run by `close_egress` and from the
-        // DNS stub, which `Stub::report` reaps.
+        // SIGCHLD also comes from the nft run by `close_egress` and
+        // `read_drops_live`, and from the DNS stub, which `Stub::report`
+        // reaps.
         while let Ok(Some(_)) = chld.read_signal() {}
         match waitpid(s, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) | Err(Errno::EINTR) => {}
             _ => return,
         }
     }
+}
+
+/// One reading for [`watch_sandbox`] (see [`crate::live_drops`]): the
+/// `dropped` counter, and the whole table when the counter has moved since
+/// the last listing. Sends each destination not sent before to P as
+/// `denied JSON`, and the first failure as `deniederr WHY`.
+///
+/// Packets refused by the cut or the time rule are counted in `cut` and
+/// `late`, not in `dropped`, so after the end of egress there is nothing
+/// new to send. A later change that has the ruleset close egress by itself
+/// learns of it here, on the same interval: the packet that does it moves
+/// `dropped`, and the listing of the table has the `cut` set (docs/DESIGN.md,
+/// "Drops while the command runs").
+fn read_drops_live(nft: &Path, live: &mut LiveDrops, up_w: &OwnedFd) {
+    let fresh = list_dropped_counter(nft)
+        .and_then(|json| live_drops::parse_dropped(&json))
+        .and_then(|packets| {
+            if live.moved(packets) {
+                list_table(nft).and_then(|table| live.fresh(packets, &table))
+            } else {
+                Ok(Vec::new())
+            }
+        });
+    match fresh {
+        Ok(list) => {
+            for dest in list {
+                if let Ok(json) = serde_json::to_string(&dest) {
+                    write_line(up_w, &format!("denied {json}"));
+                }
+            }
+        }
+        Err(why) => {
+            if live.first_failure() {
+                // Short enough to stay one write, and so one line, on the
+                // pipe S and I write to as well.
+                let why: String = why.chars().take(512).collect();
+                write_line(up_w, &format!("deniederr {why}"));
+            }
+        }
+    }
+}
+
+/// `nft --json list counter inet playpen dropped`.
+fn list_dropped_counter(nft: &Path) -> Result<String, String> {
+    let out = nft_command(nft)
+        .stdin(Stdio::null())
+        .args([
+            "--json",
+            "list",
+            "counter",
+            "inet",
+            ruleset::TABLE,
+            "dropped",
+        ])
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", nft.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "nft could not list the drop counter ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|_| "nft printed non-UTF-8 output".into())
 }
 
 /// Adds the element [`ruleset::CUT_MARK`] to the [`ruleset::CUT_SET`]:
@@ -3140,6 +3286,8 @@ mod tests {
             outside: [None; FORWARDED.len()],
             cut: None,
             refused_after_end: None,
+            denied: Vec::new(),
+            denied_error: None,
         };
         st.handle_line("cuterr nft could not close egress");
         assert_eq!(st.cut, Some(Err("nft could not close egress".into())));
@@ -3187,6 +3335,56 @@ mod tests {
         );
         st.handle_line("lookupserr the DNS stub ended before the end of the run");
         assert!(matches!(st.lookups, Some(Err(_))));
+    }
+
+    /// Records what P passes on from C's readings while the command runs.
+    #[derive(Default)]
+    struct Seen {
+        denied: Vec<ruleset::DroppedDest>,
+        unreadable: Vec<String>,
+    }
+
+    impl Events for Seen {
+        fn starting(&mut self) {}
+        fn until_reached(&mut self, _cut: &Cut) {}
+        fn pass_edited(&mut self, _message: &str) {}
+        fn pass_withdrawn(&mut self, _reason: &str, _cut: &Cut) {}
+        fn denied(&mut self, dest: &ruleset::DroppedDest) {
+            self.denied.push(dest.clone());
+        }
+        fn denied_unreadable(&mut self, why: &str) {
+            self.unreadable.push(why.to_owned());
+        }
+    }
+
+    #[test]
+    fn denied_lines_are_passed_on_once_each_in_order() {
+        let mut st = ParentState::default();
+        st.receive(
+            b"denied {\"address\":\"192.0.2.2\",\"protocol\":\"udp\",\"port\":9602,\"packets\":3}\n\
+              denied {\"address\":\"2001:db8::2\",\"protocol\":\"ipv6-icmp\",\"port\":null,\"packets\":1}\n\
+              denied not json\n\
+              deniederr nft could not list the drop counter\n",
+        );
+        let mut seen = Seen::default();
+        st.report_denied(&mut seen);
+        let got: Vec<_> = seen
+            .denied
+            .iter()
+            .map(|d| (d.address.as_str(), d.protocol.as_str(), d.port, d.packets))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("192.0.2.2", "udp", Some(9602), 3),
+                ("2001:db8::2", "ipv6-icmp", None, 1)
+            ]
+        );
+        assert_eq!(seen.unreadable, ["nft could not list the drop counter"]);
+        // Passed on once: nothing is left for the next call.
+        st.report_denied(&mut seen);
+        assert_eq!(seen.denied.len(), 2);
+        assert_eq!(seen.unreadable.len(), 1);
     }
 
     #[test]

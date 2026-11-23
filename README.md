@@ -234,6 +234,31 @@ playpen run --allow 192.0.2.1:443/tcp --fail-on-drop --report report.json -- ./c
 Unavailable counters also fail the assertion. The report keeps the child
 status separately from playpen's exit status.
 
+### Learn of a refused destination while the command runs
+
+The summary at the end lists every dropped destination. A long command
+that hangs on a refused connection can tell you sooner:
+
+```sh
+playpen run --allow 192.0.2.10:443/tcp --live-drops --events-fd 3 -- ./scan 3> >(jq -c .)
+```
+
+While the command runs, playpen reads the drop counter every 2 seconds.
+With `--events-fd`, each new dropped destination gets one `denied` record
+(`address`, `protocol`, `port`, `packets`) within about 2 seconds of its
+first packet. With `--live-drops`, stderr also gets a line for each of the
+first 8:
+
+```text
+playpen: dropped: 198.51.100.7 tcp port 80 (not approved)
+```
+
+Without `--live-drops` stderr is as before, on a terminal too. A
+destination first dropped in the last 2 seconds of the run can get no
+record or line. Packets refused after the end of the approval are counted
+apart (`refused_after_end`) and get none. The summary and the report's
+`dropped` are read at the end and are the complete list.
+
 ### Keep a record of what was sent
 
 `--capture FILE` writes a pcap of every packet that crossed the sandbox's

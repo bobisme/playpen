@@ -42,6 +42,12 @@ If you used v0.1, these will be different:
   new field `refused_after_end` and on their own summary line. The
   ruleset has two more rules in each chain with an end time, and one
   without (section 6). `playpen rules` takes `--until`.
+- **Drops are reported while the command runs.** With `--events-fd`,
+  each new dropped destination gets a `denied` record within about 2
+  seconds, while the command is alive; `--live-drops` also prints it on
+  stderr (section 4.1). The report has the new field `live_drops`, and
+  the plan has `live_drops` when the option is given. The report's
+  `dropped` is read at the end, as before.
 
 ## 1. Purpose and non-goals
 
@@ -151,10 +157,11 @@ and exits 2.
 playpen run --pass FILE [--only LABEL]... [--pass-hosts]
             [--host NAME=ADDR]... [--until RFC3339] [SOCKETS]
             [--format text|pretty|json] [--report FILE] [--capture FILE]
-            -- COMMAND [ARGS...]
+            [--live-drops] -- COMMAND [ARGS...]
 playpen run [--allow SPEC]... [--host NAME=ADDR]... [--until RFC3339]
             [--no-network] [SOCKETS] [--format text|pretty|json]
-            [--report FILE] [--capture FILE] -- COMMAND [ARGS...]
+            [--report FILE] [--capture FILE] [--live-drops]
+            -- COMMAND [ARGS...]
 
 SOCKETS = [--expose PATH]... [--display] [--hide PATH]...
           [--without-landlock] [--new-session | --private-tty]
@@ -493,6 +500,59 @@ does not cross the interface either.
   2 seconds for pasta to exit by itself (it looks once a second whether
   the sandbox is gone) and sends it SIGTERM only after that.
 
+**Drops while the command runs.** With `--events-fd` or `--live-drops`,
+the sandbox's setup process reads the ruleset's `dropped` counter every 2
+seconds while the command runs (`live_drops::INTERVAL`, the cadence of
+the pass re-read), from 2 seconds after it starts the sandbox's init. When
+the count differs from the one at its last listing, it lists the table and
+reports each destination (address, protocol and port) it has not
+reported before, with the packet count at that reading. So each
+destination is reported once, within one interval of its first dropped
+packet plus the time of the reading, while the command is still alive.
+`--events-fd` gets one `denied` record for each ("Supervisor lifecycle
+events" below); `--live-drops` prints a line. Without either option the
+counter is read only at teardown, as before.
+
+- Only destinations in the drop sets are reported: at most 1024 per
+  address family (section 6.1). A packet to a destination beyond that is
+  counted in `dropped`, but gets no record or line; the report then has
+  `destinations_truncated`.
+- After the approval ended, and once the cut is in place (section 6.1),
+  every packet but loopback is refused by the time rule or the cut and
+  counted in `refused_after_end`, not in `dropped`. It makes no `denied`
+  record and no line.
+- A destination first dropped in the last interval before the command
+  ends can have no record or line. The report lists it.
+- A reading that fails is tried again at the next interval. Nothing is
+  sent on `--events-fd` for it.
+- The report's `dropped` comes from the readback at teardown, with or
+  without these readings, and is the complete record.
+
+**`--live-drops`**. Print each new dropped destination on stderr while
+the command runs, as the readings above find it:
+
+```text
+playpen: dropped: 198.51.100.7 tcp port 80 (not approved)
+```
+
+`port N` is there for TCP and UDP only. The first 8 destinations get a
+line each (`live_drops::SHOWN`). The 9th gets `playpen: dropped: more
+than 8 destinations; see the summary at the end`, and later ones get
+nothing; the summary at the end and the report list them. The first
+failed reading prints `playpen: could not read the drop counter while
+the command runs: WHY; playpen tries again every 2 s, and the summary at
+the end reports the drops as usual`, once. Without `--live-drops`, stderr
+gets none of these lines, whether it is the caller's terminal (attached
+or with `--private-tty`), a pipe or a file. The plan digest covers
+`--live-drops`.
+
+Decision: the lines are printed only with `--live-drops`, also when
+stderr is not a terminal; the `denied` records are sent whenever
+`--events-fd` is given. stderr carries the command's own output, and
+scripts and logs that read it get the lines they got before unless the
+caller asks for more. DESIGN.md ("Drops while the command runs") has the
+reasons.
+
 **`--format text|pretty|json`**. With JSON and no report path, stdout carries
 one final JSON report. The workload’s stdout and stderr both stream to
 Playpen’s stderr alongside supervisor diagnostics. With `--report FILE`,
@@ -516,7 +576,9 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   `hostname` hint above. With `--pass-hosts` the names include the entries
   from the pass (`NAME=ADDR (pass: LABEL)`) and any `; --host NAME replaces
   ...`. It says nothing about ceilings. Then, with `--capture`,
-  `; packet capture: PATH` (the absolute path). Then, always,
+  `; packet capture: PATH` (the absolute path). Then, with
+  `--live-drops`, `; dropped destinations printed while the command runs
+  (the first 8)`. Then, always,
   `; host Unix sockets: none reachable` (with `--without-landlock`: `;
   host Unix sockets: hidden under /run, /tmp, /var/tmp and the runtime
   directory only (--without-landlock); sockets elsewhere stay reachable`),
@@ -539,6 +601,12 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   `web`, which this run uses, changed`), then `; the firewall now refuses
   all traffic but loopback; sending SIGTERM to the command (SIGKILL in 3
   s)`, or the same SIGKILL-at-once ending as at the end time;
+- with `--live-drops`, while the command runs: `dropped: ADDR PROTO port
+  N (not approved)` (no `port N` for other protocols) for each of the
+  first 8 new dropped destinations, then once `dropped: more than 8
+  destinations; see the summary at the end`, and once at most `could not
+  read the drop counter while the command runs: ...` (see
+  `--live-drops`);
 - at the end: how the command ended; then either `no packets to
   unapproved destinations were dropped`, or a block between lines of
   asterisks starting `WARNING: N packet(s) to UNAPPROVED destinations were
@@ -637,11 +705,23 @@ A validated request emits `validated`; `starting` is immediately before the
 supervisor releases the workload. `stopping` carries `reason` of `expiry` or
 `pass_withdrawn`, and `egress_closed`: true when the firewall confirmed the
 cut before SIGTERM, false when the command is killed at once because it
-did not (section 4.1, `--until`). `terminal` carries the outcome, startup evidence, child
-exit/signal, wrapper exit and drop assertion. A policy refusal can emit just
-the terminal record. Pre-parse errors and an invalid descriptor have no stream.
-The supervisor sets the supplied pipe writer nonblocking and closes it on a
-write failure, including a full pipe. A missing terminal record, a sequence
+did not (section 4.1, `--until`). `denied` carries `address`, `protocol`,
+`port` (null for protocols other than TCP and UDP) and `packets` (the count
+at the reading that found it) of a destination the firewall dropped packets
+to: one record per destination, while the command runs, within about 2
+seconds of its first dropped packet ("Drops while the command runs", 4.1,
+says which destinations have none). A run has at most 2048 (the drop sets
+hold 1024 per address family). They come between `starting` and
+`terminal`, and a `stopping` record can come before some of them. The
+report's `dropped` remains the complete record. With `--events-fd` the
+drop counter is read while the command runs; the records are the same
+with or without `--live-drops`. `terminal` carries the outcome, startup
+evidence, child exit/signal, wrapper exit and drop assertion. A policy
+refusal can emit just the terminal record. Pre-parse errors and an invalid
+descriptor have no stream. The supervisor sets the supplied pipe writer
+nonblocking and closes it on a write failure, including a full pipe. A
+burst of `denied` records (about 100 bytes each) can fill a pipe whose
+reader does not keep up, and the stream then ends there. A missing terminal record, a sequence
 gap or a partial final line means the stream is incomplete. An event reader
 can disappear without delaying supervision.
 
@@ -663,7 +743,8 @@ Command arguments and paths use JSON strings for UTF-8 and an object with a
 mapping and argument order are preserved. With `--pass-hosts` the plan has
 `"pass_hosts": true`, and `hosts` lists the entries from the pass after the
 `--host` ones. Without it the field is absent, so plans without the option
-keep their digest.
+keep their digest. The same holds for `--live-drops` and `"live_drops":
+true`.
 
 The top-level `digest` is SHA-256 of the compact JSON encoding of the v1
 plan (object keys in lexical order). Give it to `run --expect-plan DIGEST`
@@ -851,6 +932,7 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `socket_guard` | `"landlock"` or `"mounts_only"` | how host Unix sockets were kept from the command; `"mounts_only"` with `--without-landlock` |
 | `exposed` | array of strings | every exposed path (`--expose` and `--display`), canonical once checked; the `--expose` values as typed when refused |
 | `private_tty` | bool | whether the caller requested a private controlling terminal |
+| `live_drops` | bool | `--live-drops` was given: new dropped destinations were printed on stderr while the command ran. `dropped` is read at teardown either way |
 | `display` | bool | `--display` was given |
 | `new_session` | bool | the command ran (or would have run) in its own session without a controlling terminal |
 
@@ -1145,6 +1227,18 @@ reports on. P prints the notice and sends SIGTERM only after `cut`. On
 closed and sends SIGKILL to I at once. If the sandbox has ended before it
 answers, there is nothing left to cut.
 
+With `--events-fd` or `--live-drops`, C also reads the `dropped` counter
+every 2 seconds on a fixed schedule from the moment it has forked S
+(`nft --json list counter inet playpen dropped`). When the count moved
+since its last listing, it lists the table and sends each destination it
+has not sent before on the pipe it reports on, as `denied JSON` (address,
+protocol, port and packets). A reading that fails sends `deniederr WHY`
+once, and C tries again at the next interval. P passes each new
+destination on as a `denied` record and, with `--live-drops`, a line
+(4.1, "Drops while the command runs"). A `CUT` byte that comes during a
+reading is answered when the reading ends: up to about 40 ms with full
+drop sets, well inside P's 2 seconds.
+
 If any step before the command starts fails and
 `kernel.apparmor_restrict_unprivileged_userns` is 1, the message adds that
 AppArmor's restriction is the likely cause and what an administrator can do
@@ -1366,6 +1460,12 @@ Not guarded against, or known limits:
   messages; its atomic generation guarantee concerns ruleset updates. It
   does not specify an atomic cross-counter snapshot or a version range for
   one, so no supported nft version is claimed to provide that guarantee;
+- drops reported while the command runs (`denied`, `--live-drops`) come
+  from readings every 2 seconds, not from each packet: a destination is
+  reported up to about 2 seconds after its first packet, one first dropped
+  in the last interval before the command ends can have no record, and a
+  destination beyond the 1024 of its family's set has none. The report's
+  `dropped` is the complete record;
 - an approval of this host's own address, on the interface pasta copies
   into the sandbox, does not reach the host: inside, that address is the
   sandbox's. playpen prints a NOTE at the start when a rule approves such

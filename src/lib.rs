@@ -12,6 +12,7 @@ pub mod doctor;
 pub mod fixture;
 mod grant_use;
 pub mod landlock;
+pub mod live_drops;
 pub mod netlink;
 mod nft_readback;
 pub mod pass;

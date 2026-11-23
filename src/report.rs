@@ -131,6 +131,10 @@ pub struct Report {
     pub new_session: bool,
     /// True when a private controlling terminal was requested.
     pub private_tty: bool,
+    /// True with `--live-drops`: new dropped destinations were printed on
+    /// stderr while the command ran. `dropped` is read at the end either
+    /// way.
+    pub live_drops: bool,
 }
 
 /// Explicit allowlist for reports intended to be shared.
@@ -382,6 +386,7 @@ mod tests {
             display: false,
             new_session: false,
             private_tty: false,
+            live_drops: false,
         }
     }
 

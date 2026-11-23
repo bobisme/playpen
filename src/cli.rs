@@ -273,6 +273,11 @@ struct RunArgs {
     /// Fail if any dropped packets were counted, or counters are unavailable.
     #[arg(help_heading = "Launch and reporting", long)]
     fail_on_drop: bool,
+    /// Print each new dropped destination on stderr while the command runs
+    /// (read every 2 s; the first 8, then one line that says there are more).
+    /// --events-fd gets a denied record for each, with or without this option.
+    #[arg(help_heading = "Launch and reporting", long)]
+    live_drops: bool,
     /// Include bounded first-match grant packet counts in the private report.
     #[arg(
         help_heading = "Launch and reporting",
@@ -842,6 +847,8 @@ struct StderrEvents<'a> {
     started_at: Option<OffsetDateTime>,
     /// When the supervisor learned that the command had ended.
     ended_at: Option<OffsetDateTime>,
+    /// With `--live-drops`: destinations printed so far.
+    live_shown: usize,
 }
 
 impl Events for StderrEvents<'_> {
@@ -900,6 +907,40 @@ impl Events for StderrEvents<'_> {
         );
         eprintln!("playpen: {reason}; {}", stopping(cut));
     }
+    fn denied(&mut self, dest: &crate::ruleset::DroppedDest) {
+        self.pipe.send(
+            "denied",
+            &serde_json::json!({"address": dest.address, "protocol": dest.protocol,
+                "port": dest.port, "packets": dest.packets}),
+        );
+        if !self.args.live_drops {
+            return;
+        }
+        self.live_shown += 1;
+        if self.live_shown <= crate::live_drops::SHOWN {
+            eprintln!("playpen: dropped: {} (not approved)", destination(dest));
+        } else if self.live_shown == crate::live_drops::SHOWN + 1 {
+            eprintln!(
+                "playpen: dropped: more than {} destinations; see the summary at the end",
+                crate::live_drops::SHOWN
+            );
+        }
+    }
+    fn denied_unreadable(&mut self, why: &str) {
+        if self.args.live_drops {
+            eprintln!(
+                "playpen: could not read the drop counter while the command runs: {why}; playpen tries again every {} s, and the summary at the end reports the drops as usual",
+                crate::live_drops::INTERVAL.as_secs()
+            );
+        }
+    }
+}
+
+/// A dropped destination as the live lines write it: `ADDR PROTO port N`,
+/// without the port for protocols other than TCP and UDP.
+fn destination(dest: &crate::ruleset::DroppedDest) -> String {
+    let port = dest.port.map_or_else(String::new, |p| format!(" port {p}"));
+    format!("{} {}{port}", dest.address, dest.protocol)
 }
 
 /// The rest of the notice that the command is being stopped.
@@ -948,18 +989,20 @@ fn sockets_clause(c: &Checked, landlock: bool) -> String {
     out
 }
 
-fn start_line(
-    c: &Checked,
-    network: bool,
-    landlock: bool,
-    private_tty: bool,
-    capture: Option<&Path>,
-) -> String {
-    let line = start_line_net(c, network);
+fn start_line(c: &Checked, args: &RunArgs, capture: Option<&Path>) -> String {
+    let line = start_line_net(c, !args.no_network);
     let capture = capture.map_or_else(String::new, |p| {
         format!("; packet capture: {}", p.display())
     });
-    let session = if private_tty {
+    let drops = if args.live_drops {
+        format!(
+            "; dropped destinations printed while the command runs (the first {})",
+            crate::live_drops::SHOWN
+        )
+    } else {
+        String::new()
+    };
+    let session = if args.private_tty {
         "; private controlling terminal"
     } else if c.new_session {
         "; the command runs in its own session, without a controlling terminal"
@@ -967,8 +1010,8 @@ fn start_line(
         ""
     };
     format!(
-        "{line}{capture}{}{session}{}",
-        sockets_clause(c, landlock),
+        "{line}{capture}{drops}{}{session}{}",
+        sockets_clause(c, !args.without_landlock),
         start_notes(c)
     )
 }
@@ -1098,6 +1141,7 @@ fn base_report(args: &RunArgs) -> Report {
         display: args.display,
         new_session: new_session(args),
         private_tty: args.private_tty,
+        live_drops: args.live_drops,
     }
 }
 
@@ -1289,16 +1333,11 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     let mut events = StderrEvents {
         pipe: &pipe,
         args,
-        start_line: start_line(
-            &checked,
-            !args.no_network,
-            !args.without_landlock,
-            args.private_tty,
-            capture.as_deref().map(Capture::path),
-        ),
+        start_line: start_line(&checked, args, capture.as_deref().map(Capture::path)),
         until: report.until.clone(),
         started_at: None,
         ended_at: None,
+        live_shown: 0,
     };
     let grant_labels = if args.report_grant_use {
         checked
@@ -1329,6 +1368,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         pasta,
         capture: capture.clone(),
         watch: checked.from_pass.map(|p| p.watch),
+        watch_drops: args.events_fd.is_some() || args.live_drops,
     };
     let outcome = sandbox::run_with_output(&plan, &mut events, stdout_report, args.private_tty);
     report.started_at = events.started_at.map(crate::report::stamp);

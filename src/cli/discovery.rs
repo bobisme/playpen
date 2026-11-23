@@ -22,11 +22,13 @@ pub(super) const RUN: &str = "Examples
   playpen run --allow 192.0.2.10:443/tcp --report run.json -- true
   playpen run --pass engagement.pass.toml --pass-hosts -- curl -sS https://app.example.test/
   playpen run --allow 192.0.2.10:443/tcp --capture run.pcap --report run.json -- true
+  playpen run --allow 192.0.2.10:443/tcp --live-drops --events-fd 3 -- ./scan 3> >(jq -c .)
 
 Agent workflow
   Choose --no-network, explicit --allow grants, or --pass FILE. Use plan with the same command and policy first, then pass its digest to --expect-plan.
   Nothing is resolved: there is no DNS inside. With --pass, --pass-hosts maps the hostname of each selected single-address destination to its address. --host NAME=ADDR maps any other name to an approved address.
   In JSON mode the final report goes to stdout and workload output streams to stderr. With --report FILE, the file gets the report and stdout belongs to the workload.
+  To learn of a refused destination while the command runs, read --events-fd: one denied record per new dropped destination, within about 2 s. --live-drops also prints the first 8 on stderr. The report's dropped field remains the complete record.
   --capture FILE keeps a pcap of what crossed the sandbox's outside interface, and the report gives its size and sha256. It holds payloads, credentials sent in clear included: keep it like the pass.
   Read startup_evidence before retrying a job with side effects. not_started permits a retry after fixing the cause. unknown requires investigation.
   A policy refusal exits 2, a setup error exits 1, and a launched command normally supplies its own exit status. --fail-on-drop can turn child success into exit 1.";
