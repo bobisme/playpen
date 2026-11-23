@@ -24,16 +24,18 @@ pub(super) const RUN: &str = "Examples
   playpen run --allow 192.0.2.10:443/tcp --capture run.pcap --report run.json -- true
   playpen run --allow 192.0.2.10:443/tcp --live-drops --events-fd 3 -- ./scan 3> >(jq -c .)
   playpen run --allow 192.0.2.0/24:8000-8099/tcp --report-contacts --report wide.json -- true
+  playpen run --allow 192.0.2.10:443/tcp --on-drop stop --report run.json -- ./scan
 
 Agent workflow
   Choose --no-network, explicit --allow grants, or --pass FILE. Use plan with the same command and policy first, then pass its digest to --expect-plan.
   Nothing is resolved: there is no DNS inside. With --pass, --pass-hosts maps the hostname of each selected single-address destination to its address. --host NAME=ADDR maps any other name to an approved address.
   In JSON mode the final report goes to stdout and workload output streams to stderr. With --report FILE, the file gets the report and stdout belongs to the workload.
   To learn of a refused destination while the command runs, read --events-fd: one denied record per new dropped destination, within about 2 s. --live-drops also prints the first 8 on stderr. The report's dropped field remains the complete record.
+  --on-drop cut makes the first dropped packet close all egress but loopback in the firewall itself; --on-drop stop also stops the command within about 2 s plus the 3 s grace and never exits 0. The report's egress_cut names the destination. mDNS, LLMNR, a client's own DNS server, a cloud metadata probe and IPv6 attempts trip it too, so try a run without it first.
   --capture FILE keeps a pcap of what crossed the sandbox's outside interface, and the report gives its size and sha256. It holds payloads, credentials sent in clear included: keep it like the pass.
   --report-contacts lists in the report each address, protocol and port the command reached through a grant. playpen suggest REPORT turns that list into the narrowest --allow and --host options.
   Read startup_evidence before retrying a job with side effects. not_started permits a retry after fixing the cause. unknown requires investigation.
-  A policy refusal exits 2, a setup error exits 1, and a launched command normally supplies its own exit status. --fail-on-drop can turn child success into exit 1.";
+  A policy refusal exits 2, a setup error exits 1, and a launched command normally supplies its own exit status. --fail-on-drop and --on-drop stop can turn child success into exit 1.";
 pub(super) const PLAN: &str = "Examples
   playpen plan --no-network -- printf hello
   playpen plan --format json --allow 192.0.2.10:443/tcp -- true
@@ -43,6 +45,7 @@ Agent workflow
 pub(super) const RULES: &str = "Examples
   playpen rules --allow 192.0.2.10:443/tcp
   playpen rules --allow 192.0.2.0/24:8000-8099/tcp --report-contacts
+  playpen rules --allow 192.0.2.10:443/tcp --on-drop cut
   playpen rules --format json
 
 Agent workflow

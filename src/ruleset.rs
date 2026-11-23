@@ -25,6 +25,12 @@ pub const CUT_SET: &str = "cut";
 /// needs a capability over the network namespace, which only the
 /// setup process has.
 pub const CUT_MARK: u32 = 0;
+/// With `--on-drop`, the declared size of [`CUT_SET`].
+///
+/// A rule adds to the set then, and nft gives such a set this size when
+/// none is declared. It is declared so that the readback does not depend
+/// on that default.
+pub const CUT_SET_SIZE: u32 = 65535;
 /// Counter of the packets the cut refused on their way out.
 pub const CUT_COUNTER: &str = "cut";
 /// Counter of the packets refused on their way out because the approval's
@@ -69,12 +75,26 @@ pub fn render(rules: &[AllowRule]) -> String {
 /// and its end time.
 #[must_use]
 pub fn render_approval(approval: &Approval) -> String {
-    render_instrumented(approval, 0, false)
+    render_instrumented(approval, Instrumentation::default())
+}
+
+/// What a ruleset holds beyond the approval. The default holds nothing
+/// more: the ruleset is then [`render_approval`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Instrumentation {
+    /// A counter on each of the first this many grants
+    /// (`--report-grant-use`).
+    pub grant_counters: usize,
+    /// The record of contacted destinations (`--report-contacts`).
+    pub record_contacts: bool,
+    /// The tripwire on the refusal path (`--on-drop`).
+    pub tripwire: bool,
 }
 
 /// The table's counters and sets. With `record_contacts`, also the counter
-/// and the sets of [`crate::contacts`].
-fn declarations(out: &mut String, timed: bool, grant_counters: usize, record_contacts: bool) {
+/// and the sets of [`crate::contacts`]. With `tripwire`, the cut set has a
+/// declared size.
+fn declarations(out: &mut String, timed: bool, with: Instrumentation) {
     let _ = writeln!(out, "\tcounter dropped {{");
     let _ = writeln!(out, "\t}}");
     if timed {
@@ -83,18 +103,18 @@ fn declarations(out: &mut String, timed: bool, grant_counters: usize, record_con
     }
     let _ = writeln!(out, "\tcounter {CUT_COUNTER} {{");
     let _ = writeln!(out, "\t}}");
-    for index in 0..grant_counters {
+    for index in 0..with.grant_counters {
         let _ = writeln!(
             out,
             "\tcounter {} {{}}",
             crate::grant_use::counter_name(index)
         );
     }
-    if record_contacts {
+    if with.record_contacts {
         let _ = writeln!(out, "\tcounter {} {{}}", contacts::COUNTER);
     }
     let mut sets = vec![("drop4", "ipv4_addr"), ("drop6", "ipv6_addr")];
-    if record_contacts {
+    if with.record_contacts {
         sets.extend([
             (contacts::SEEN4, "ipv4_addr"),
             (contacts::SEEN6, "ipv6_addr"),
@@ -111,30 +131,36 @@ fn declarations(out: &mut String, timed: bool, grant_counters: usize, record_con
     }
     let _ = writeln!(out, "\tset {CUT_SET} {{");
     let _ = writeln!(out, "\t\ttype mark");
+    if with.tripwire {
+        let _ = writeln!(out, "\t\tsize {CUT_SET_SIZE}");
+    }
     let _ = writeln!(out, "\t\tflags dynamic");
     let _ = writeln!(out, "\t}}");
 }
 
-/// The ruleset with the optional records. Without either it is
-/// [`render_approval`].
+/// The ruleset for `approval` with what `with` asks for.
 ///
-/// A counter on each of the first `grant_counters` grants
-/// (`--report-grant-use`), and with `record_contacts` the record of
-/// contacted destinations (`--report-contacts`): each grant then ends in
-/// `goto contacted` instead of `accept`.
+/// A counter on each of the first `grant_counters` grants. With
+/// `record_contacts` each grant ends in `goto contacted` instead of
+/// `accept` (see [`crate::contacts`]).
+///
+/// With `tripwire` (`--on-drop`), the refusal path adds [`CUT_MARK`] to
+/// [`CUT_SET`] after the drop sets and before the `dropped` counter, and
+/// drops the packet instead of rejecting it. The first packet refused
+/// there closes all egress, and every later one meets the cut rule first,
+/// so the drop sets keep the destination that tripped it. A reject would
+/// send its ICMP error to the command through the cut it has just closed:
+/// the cut would drop and count it, and the command would not see it
+/// either.
 #[must_use]
-pub fn render_instrumented(
-    approval: &Approval,
-    grant_counters: usize,
-    record_contacts: bool,
-) -> String {
+pub fn render_instrumented(approval: &Approval, with: Instrumentation) -> String {
     let end = end_second(approval);
     let mut out = String::new();
     // A table of our own; flush it first so a reload replaces it whole.
     let _ = writeln!(out, "table inet {TABLE} {{}}");
     let _ = writeln!(out, "delete table inet {TABLE}");
     let _ = writeln!(out, "table inet {TABLE} {{");
-    declarations(&mut out, end.is_some(), grant_counters, record_contacts);
+    declarations(&mut out, end.is_some(), with);
     let _ = writeln!(out, "\tchain output {{");
     let _ = writeln!(
         out,
@@ -161,14 +187,14 @@ pub fn render_instrumented(
     for (index, rule) in approval.rules().iter().enumerate() {
         let matches = match_expr(rule, &approval.exclusions(rule));
         let _ = write!(out, "\t\t{matches}");
-        if index < grant_counters {
+        if index < with.grant_counters {
             let _ = write!(
                 out,
                 " counter name {}",
                 crate::grant_use::counter_name(index)
             );
         }
-        if record_contacts {
+        if with.record_contacts {
             let _ = writeln!(out, " goto {}", contacts::CHAIN);
         } else {
             let _ = writeln!(out, " accept");
@@ -190,10 +216,21 @@ pub fn render_instrumented(
         out,
         "\t\tmeta nfproto ipv6 meta l4proto != {{ tcp, udp }} add @drop6 {{ ip6 daddr . meta l4proto . 0 }}"
     );
+    if with.tripwire {
+        let _ = writeln!(
+            out,
+            "\t\t# --on-drop: the first packet that gets here closes all egress, and is dropped."
+        );
+        let _ = writeln!(out, "\t\tadd @{CUT_SET} {{ {CUT_MARK} }}");
+    }
     let _ = writeln!(out, "\t\tcounter name \"dropped\"");
-    let _ = writeln!(out, "\t\treject with icmpx admin-prohibited");
+    if with.tripwire {
+        let _ = writeln!(out, "\t\tdrop");
+    } else {
+        let _ = writeln!(out, "\t\treject with icmpx admin-prohibited");
+    }
     let _ = writeln!(out, "\t}}");
-    if record_contacts {
+    if with.record_contacts {
         contacted_chain(&mut out);
     }
     let _ = writeln!(out, "\tchain input {{");
@@ -589,6 +626,15 @@ mod tests {
         assert!(!input.contains("counter"));
     }
 
+    /// The record of contacted destinations with `grant_counters`.
+    fn contacts(grant_counters: usize) -> Instrumentation {
+        Instrumentation {
+            grant_counters,
+            record_contacts: true,
+            ..Instrumentation::default()
+        }
+    }
+
     #[test]
     fn the_contacted_record_only_adds_and_turns_accept_into_goto() {
         let approval = Approval::new(
@@ -596,8 +642,14 @@ mod tests {
             Some(EndsAt::parse("2099-01-01T00:00:00Z").unwrap_or_else(|e| panic!("{e}"))),
         );
         for counters in [0, 1, 2] {
-            let plain = render_instrumented(&approval, counters, false);
-            let recorded = render_instrumented(&approval, counters, true);
+            let plain = render_instrumented(
+                &approval,
+                Instrumentation {
+                    grant_counters: counters,
+                    ..Instrumentation::default()
+                },
+            );
+            let recorded = render_instrumented(&approval, contacts(counters));
             assert!(!plain.contains("contacted") && !plain.contains("seen"));
             assert_eq!(recorded.matches(" goto contacted\n").count(), 2);
             let added = [
@@ -613,7 +665,7 @@ mod tests {
             }
             assert_eq!(stripped, plain);
         }
-        let output = render_instrumented(&approval, 1, true);
+        let output = render_instrumented(&approval, contacts(1));
         assert!(output.contains(
             "\t\tip daddr 192.0.2.0/30 ip daddr != { 192.0.2.0, 192.0.2.3 } tcp dport 8000-8002 counter name grant_1 goto contacted\n"
         ));
@@ -629,6 +681,68 @@ mod tests {
             assert!(at(pair[0]) < at(pair[1]), "{pair:?} in\n{record}");
         }
         assert!(record.ends_with("\t\taccept"), "{record}");
+    }
+
+    #[test]
+    fn the_tripwire_is_on_the_refusal_path_only_with_the_option() {
+        let approval = ending("2026-12-01T12:34:56Z");
+        assert_eq!(
+            render_instrumented(&approval, Instrumentation::default()),
+            render_approval(&approval)
+        );
+        // The same lines with and without the record of contacts.
+        for without in [Instrumentation::default(), contacts(1)] {
+            let plain = render_instrumented(&approval, without);
+            assert!(!plain.contains("add @cut"));
+            assert!(!plain.contains("--on-drop"));
+            let text = render_instrumented(
+                &approval,
+                Instrumentation {
+                    tripwire: true,
+                    ..without
+                },
+            );
+            assert_eq!(text.matches("add @cut { 0 }").count(), 1);
+            assert!(!text.contains("reject"));
+            let output = chain(&text, "output");
+            let at = |needle: &str| output.find(needle).unwrap_or(usize::MAX);
+            let order = [
+                "meta mark @cut counter name \"cut\" drop",
+                "ip daddr 192.0.2.1 tcp dport 443",
+                "add @drop6 { ip6 daddr . meta l4proto . 0 }",
+                "# --on-drop: the first packet that gets here closes all egress, and is dropped.",
+                "add @cut { 0 }",
+                "counter name \"dropped\"",
+                "\t\tdrop",
+            ];
+            for pair in order.windows(2) {
+                assert!(at(pair[0]) < at(pair[1]), "{pair:?} in\n{output}");
+            }
+            assert!(
+                output.ends_with("\t\tcounter name \"dropped\"\n\t\tdrop"),
+                "{output}"
+            );
+            // The rest is the same: only the refusal path and the size of
+            // the cut set differ.
+            let input = |t: &str| t[t.find("\tchain input").unwrap_or(0)..].to_owned();
+            assert_eq!(input(&text), input(&plain));
+            assert_eq!(
+                text.matches("\tset cut {\n\t\ttype mark\n\t\tsize 65535\n\t\tflags dynamic\n\t}")
+                    .count(),
+                1
+            );
+            let stripped = text
+                .replace("\t\ttype mark\n\t\tsize 65535\n", "\t\ttype mark\n")
+                .replace(
+                    "\t\t# --on-drop: the first packet that gets here closes all egress, and is dropped.\n\t\tadd @cut { 0 }\n",
+                    "",
+                )
+                .replace(
+                    "counter name \"dropped\"\n\t\tdrop\n",
+                    "counter name \"dropped\"\n\t\treject with icmpx admin-prohibited\n",
+                );
+            assert_eq!(stripped, plain);
+        }
     }
 
     #[test]
@@ -792,7 +906,7 @@ mod tests {
             Some(expected.as_str())
         );
         // With the contacted record, the same lines end in the goto.
-        let recorded = render_instrumented(&Approval::new(rules.to_vec(), None), 0, true);
+        let recorded = render_instrumented(&Approval::new(rules.to_vec(), None), contacts(0));
         let goto = expected.replace(" accept\n", " goto contacted\n");
         prop_assert_eq!(recorded.matches(goto.as_str()).count(), 1);
         prop_assert_eq!(recorded.matches(" goto contacted\n").count(), rules.len());

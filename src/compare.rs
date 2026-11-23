@@ -125,7 +125,18 @@ fn dropped_endpoints(v: &Value) -> (BTreeSet<Endpoint>, bool) {
         complete = false;
     }
     complete &= sum == v["dropped"]["packets"].as_u64();
+    complete &= !cut_hid_drops(v);
     (endpoints, complete)
+}
+
+/// With `--on-drop`: the cut tripped, and it refused packets after that,
+/// or the count is unknown. It refuses them before the drop sets, so the
+/// report does not say where they went.
+fn cut_hid_drops(v: &Value) -> bool {
+    match v.get("egress_cut") {
+        None | Some(Value::Null) => false,
+        Some(cut) => cut["refused"].as_u64() != Some(0),
+    }
 }
 
 /// A full report as inert JSON: at most 1 MiB, of the 0.1.0 schema.

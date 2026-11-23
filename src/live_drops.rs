@@ -1,12 +1,15 @@
 //! Dropped destinations while the command runs.
 //!
-//! With `--events-fd` or `--live-drops`, the setup process C reads the
-//! ruleset's `dropped` counter every [`INTERVAL`] while the command runs.
-//! When the counter has moved since the last listing, C lists the table and
-//! sends each destination it has not sent before to the supervisor, one
-//! `denied` line each. The supervisor turns each line into a `denied` event
-//! and, with `--live-drops`, a line on stderr. The final report still comes
-//! from the readback at teardown; nothing here changes it.
+//! With `--events-fd`, `--live-drops` or `--on-drop`, the setup process C
+//! reads the ruleset's `dropped` counter every [`INTERVAL`] while the
+//! command runs. When the counter has moved since the last listing, C lists
+//! the table and sends each destination it has not sent before to the
+//! supervisor, one `denied` line each. The supervisor turns each line into
+//! a `denied` event and, with `--live-drops`, a line on stderr. With
+//! `--on-drop`, the first reading that finds the counter above zero also
+//! tells the supervisor that the cut has tripped ([`LiveDrops::tripped`]).
+//! The final report still comes from the readback at teardown; nothing here
+//! changes it.
 //!
 //! This module holds what C remembers between readings and the parsing.
 //! Running `nft` and the schedule are in `sandbox` (`watch_sandbox`).
@@ -36,9 +39,34 @@ pub struct LiveDrops {
     sent: HashSet<(String, String, Option<u16>)>,
     /// A failed reading has been reported.
     failure_reported: bool,
+    /// The ruleset has the tripwire (`--on-drop`).
+    tripwire: bool,
+    /// A reading has found the cut tripped.
+    tripped: bool,
 }
 
 impl LiveDrops {
+    /// The state before the first reading; `tripwire` with `--on-drop`.
+    #[must_use]
+    pub fn new(tripwire: bool) -> Self {
+        Self {
+            tripwire,
+            ..Self::default()
+        }
+    }
+
+    /// With the tripwire: true the first time a reading finds `packets`,
+    /// the `dropped` counter, above zero. Every packet counted there has
+    /// tripped the cut on its way (see [`crate::tripwire`]). Always false
+    /// without the tripwire.
+    pub const fn tripped(&mut self, packets: u64) -> bool {
+        if !self.tripwire || self.tripped || packets == 0 {
+            return false;
+        }
+        self.tripped = true;
+        true
+    }
+
     /// Whether the table must be listed: `packets`, the `dropped` counter
     /// just read, differs from its value at the last listing.
     #[must_use]
@@ -82,6 +110,16 @@ impl LiveDrops {
 /// When the JSON does not parse, or the counter is missing, repeated or
 /// invalid.
 pub fn parse_dropped(json: &str) -> Result<u64, String> {
+    parse_counter(json, "dropped")
+}
+
+/// The packet count of the counter `name` in nft's JSON: a listing of that
+/// counter, or of the whole table.
+///
+/// # Errors
+/// When the JSON does not parse, or the counter is missing, repeated or
+/// invalid.
+pub fn parse_counter(json: &str, name: &str) -> Result<u64, String> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| format!("nft printed JSON that does not parse: {e}"))?;
     let items = value
@@ -90,20 +128,20 @@ pub fn parse_dropped(json: &str) -> Result<u64, String> {
         .ok_or("nft JSON has no \"nftables\" array")?;
     let mut found = None;
     for counter in items.iter().filter_map(|item| item.get("counter")) {
-        if counter.get("name").and_then(serde_json::Value::as_str) != Some("dropped") {
+        if counter.get("name").and_then(serde_json::Value::as_str) != Some(name) {
             continue;
         }
         if found.is_some() {
-            return Err("nft JSON has duplicate dropped counters".into());
+            return Err(format!("nft JSON has duplicate {name} counters"));
         }
         found = Some(
             counter
                 .get("packets")
                 .and_then(serde_json::Value::as_u64)
-                .ok_or("invalid dropped counter")?,
+                .ok_or_else(|| format!("invalid {name} counter"))?,
         );
     }
-    found.ok_or_else(|| "nft JSON has no \"dropped\" counter".into())
+    found.ok_or_else(|| format!("nft JSON has no \"{name}\" counter"))
 }
 
 #[cfg(test)]
@@ -228,6 +266,29 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(list.len(), 1);
         assert!(!live.moved(4));
+    }
+
+    #[test]
+    fn the_trip_is_found_once_and_only_with_the_tripwire() {
+        let mut plain = LiveDrops::new(false);
+        assert!(!plain.tripped(0));
+        assert!(!plain.tripped(5));
+        let mut live = LiveDrops::new(true);
+        assert!(!live.tripped(0));
+        assert!(!live.tripped(0));
+        assert!(live.tripped(1));
+        assert!(!live.tripped(1));
+        assert!(!live.tripped(7));
+    }
+
+    #[test]
+    fn reads_any_counter_by_name() {
+        let table = r#"{"nftables": [{"counter": {"name": "dropped", "packets": 1}}, {"counter": {"name": "cut", "packets": 37}}]}"#;
+        assert_eq!(parse_counter(table, "cut"), Ok(37));
+        assert_eq!(parse_counter(table, "dropped"), Ok(1));
+        assert!(parse_counter(table, "late").is_err());
+        let twice = table.replace("\"dropped\"", "\"cut\"");
+        assert!(parse_counter(&twice, "cut").is_err());
     }
 
     #[test]

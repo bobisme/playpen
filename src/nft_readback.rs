@@ -7,7 +7,10 @@ use serde_json::{Value, json};
 
 use crate::approval::{AllowRule, Approval, Proto};
 use crate::contacts;
-use crate::ruleset::{CUT_COUNTER, CUT_SET, DROP_SET_SIZE, LATE_COUNTER, TABLE, end_second};
+use crate::ruleset::{
+    CUT_COUNTER, CUT_MARK, CUT_SET, CUT_SET_SIZE, DROP_SET_SIZE, Instrumentation, LATE_COUNTER,
+    TABLE, end_second,
+};
 
 /// The time zone `nft` is run in when it lists the table. `nft --json`
 /// prints `meta time` as a wall-clock date without an offset, in the local
@@ -88,14 +91,14 @@ fn end_rules(end: Option<i64>, output: bool) -> Vec<Value> {
 /// The table, its chains (without rules), counters and sets. With
 /// `record_contacts`, also the chain, counter and sets of
 /// [`crate::contacts`].
-fn declarations(timed: bool, grant_counters: usize, record_contacts: bool) -> Table {
+fn declarations(timed: bool, with: Instrumentation) -> Table {
     let mut table = Table::default();
     let mut counters = vec![String::from("dropped"), CUT_COUNTER.to_owned()];
     if timed {
         counters.push(LATE_COUNTER.to_owned());
     }
-    counters.extend((0..grant_counters).map(crate::grant_use::counter_name));
-    if record_contacts {
+    counters.extend((0..with.grant_counters).map(crate::grant_use::counter_name));
+    if with.record_contacts {
         counters.push(contacts::COUNTER.to_owned());
         table.objects.insert(
             (String::from("chain"), contacts::CHAIN.to_owned()),
@@ -107,14 +110,16 @@ fn declarations(timed: bool, grant_counters: usize, record_contacts: bool) -> Ta
         let fields = json!({"family":"inet","table":TABLE,"name":name});
         ((String::from("counter"), name), fields)
     }));
+    // An empty set: nft prints no `elem` for it (see `parse`). With
+    // --on-drop it has a declared size.
+    let mut cut =
+        json!({"family":"inet","table":TABLE,"name":CUT_SET,"type":"mark","flags":["dynamic"]});
+    if with.tripwire {
+        cut["size"] = json!(CUT_SET_SIZE);
+    }
     table.objects.extend([
         object("table", TABLE, json!({"family":"inet","name":TABLE})),
-        // An empty set: nft prints no `elem` for it (see `parse`).
-        object(
-            "set",
-            CUT_SET,
-            json!({"family":"inet","table":TABLE,"name":CUT_SET,"type":"mark","flags":["dynamic"]}),
-        ),
+        object("set", CUT_SET, cut),
     ]);
     for hook in ["output", "input", "forward"] {
         table.objects.insert(
@@ -124,7 +129,7 @@ fn declarations(timed: bool, grant_counters: usize, record_contacts: bool) -> Ta
         table.chains.insert(hook.to_owned(), Vec::new());
     }
     let mut sets = vec![("drop4", "ipv4_addr"), ("drop6", "ipv6_addr")];
-    if record_contacts {
+    if with.record_contacts {
         // Empty at start, like the cut set (see `parse`).
         sets.extend([
             (contacts::SEEN4, "ipv4_addr"),
@@ -141,9 +146,9 @@ fn declarations(timed: bool, grant_counters: usize, record_contacts: bool) -> Ta
     table
 }
 
-fn expected(approval: &Approval, grant_counters: usize, record_contacts: bool) -> Table {
+fn expected(approval: &Approval, with: Instrumentation) -> Table {
     let end = end_second(approval);
-    let mut table = declarations(end.is_some(), grant_counters, record_contacts);
+    let mut table = declarations(end.is_some(), with);
     let established = json!([
         matcher("in", json!({"ct":{"key":"state"}}), [2, 4].map(Value::from).to_vec().into()),
         {"accept":null}
@@ -180,8 +185,8 @@ fn expected(approval: &Approval, grant_counters: usize, record_contacts: bool) -
     output.push(established.clone());
     output.push(neighbour_discovery.clone());
     output.extend(approval.rules().iter().enumerate().map(|(index, rule)| {
-        let counter = (index < grant_counters).then(|| crate::grant_use::counter_name(index));
-        grant(approval, rule, counter.as_deref(), record_contacts)
+        let counter = (index < with.grant_counters).then(|| crate::grant_use::counter_name(index));
+        grant(approval, rule, counter.as_deref(), with.record_contacts)
     }));
     for (family, set) in [("ip", "@drop4"), ("ip6", "@drop6")] {
         for (operation, port) in [("==", payload("th", "dport")), ("!=", json!(0))] {
@@ -191,8 +196,17 @@ fn expected(approval: &Approval, grant_counters: usize, record_contacts: bool) -
             ]));
         }
     }
+    // With --on-drop: the tripwire, and a drop instead of the reject (see
+    // `ruleset::render_instrumented`).
+    if with.tripwire {
+        output.push(json!([{"set":{"op":"add","elem":CUT_MARK,"set":format!("@{CUT_SET}")}}]));
+    }
     output.push(json!([{"counter":"dropped"}]));
-    output.push(json!([{"reject":{"type":"icmpx","expr":3}}]));
+    output.push(if with.tripwire {
+        json!([{"drop":null}])
+    } else {
+        json!([{"reject":{"type":"icmpx","expr":3}}])
+    });
     let input = table.chains.get_mut("input").expect("declared input chain");
     input.push(json!([matcher("==", meta("iif"), json!("lo")), {"accept":null}]));
     input.extend(end_rules(end, false));
@@ -479,24 +493,23 @@ fn parse(mut value: Value) -> Result<Table, String> {
 /// # Errors
 /// When nft's JSON is invalid, unsupported, or differs from the approval.
 pub fn verify_policy(json: &str, approval: &Approval) -> Result<(), String> {
-    verify_instrumented(json, approval, 0, false)
+    verify_instrumented(json, approval, Instrumentation::default())
 }
 
 /// [`verify_policy`] for the ruleset of
-/// [`crate::ruleset::render_instrumented`] with the same records.
+/// [`crate::ruleset::render_instrumented`] with the same instrumentation.
 ///
 /// # Errors
 /// As [`verify_policy`].
 pub fn verify_instrumented(
     json: &str,
     approval: &Approval,
-    grant_counters: usize,
-    record_contacts: bool,
+    with: Instrumentation,
 ) -> Result<(), String> {
     let value: Value =
         serde_json::from_str(json).map_err(|e| format!("nft printed invalid JSON: {e}"))?;
     let actual = parse(value)?;
-    let expected = expected(approval, grant_counters, record_contacts);
+    let expected = expected(approval, with);
     if actual.objects != expected.objects {
         return Err("nft table, chains, or accounting declarations differ".into());
     }
@@ -664,6 +677,64 @@ mod tests {
         assert!(verify_policy(&wider, &approval).is_err());
     }
 
+    const ON_DROP: &str = include_str!("../tests/fixtures/nft/on-drop.json");
+    const TRIPWIRE: Instrumentation = Instrumentation {
+        grant_counters: 0,
+        record_contacts: false,
+        tripwire: true,
+    };
+    const ON_DROP_NUMERIC: &str = include_str!("../tests/fixtures/nft/on-drop-numeric.json");
+
+    #[test]
+    fn tripwire_is_read_back_only_where_it_was_asked_for() {
+        let approval = until("2026-12-01T12:34:56Z");
+        for json in [ON_DROP, ON_DROP_NUMERIC] {
+            verify_instrumented(json, &approval, TRIPWIRE).expect("recorded tripwire");
+            // Without --on-drop the tripwire is extra, and the drop is not
+            // the reject.
+            assert!(verify_policy(json, &approval).is_err());
+        }
+        // With it, a ruleset without the tripwire is refused.
+        assert!(verify_instrumented(UNTIL, &approval, TRIPWIRE).is_err());
+        // The tripwire must add the cut mark to the cut set, nothing else.
+        for (from, to) in [
+            (
+                "{\"set\": {\"op\": \"add\", \"elem\": 0, \"set\": \"@cut\"}}",
+                "{\"set\": {\"op\": \"add\", \"elem\": 1, \"set\": \"@cut\"}}",
+            ),
+            (
+                "{\"set\": {\"op\": \"add\", \"elem\": 0, \"set\": \"@cut\"}}",
+                "{\"set\": {\"op\": \"add\", \"elem\": {\"meta\": {\"key\": \"mark\"}}, \"set\": \"@cut\"}}",
+            ),
+            (
+                "{\"set\": {\"op\": \"add\", \"elem\": 0, \"set\": \"@cut\"}}",
+                "{\"set\": {\"op\": \"delete\", \"elem\": 0, \"set\": \"@cut\"}}",
+            ),
+            (
+                "{\"counter\": \"dropped\"}]}}",
+                "{\"counter\": \"dropped\"}, {\"set\": {\"op\": \"add\", \"elem\": 0, \"set\": \"@cut\"}}]}}",
+            ),
+        ] {
+            let altered = ON_DROP.replacen(from, to, 1);
+            assert_ne!(ON_DROP, altered, "{to}");
+            assert!(
+                verify_instrumented(&altered, &approval, TRIPWIRE).is_err(),
+                "{to}"
+            );
+        }
+        // The tripped set fails the start check like any filled cut set.
+        let filled = ON_DROP.replacen(
+            "\"flags\": [\"dynamic\"]}}",
+            "\"flags\": [\"dynamic\"], \"elem\": [0]}}",
+            1,
+        );
+        assert_ne!(ON_DROP, filled);
+        assert_eq!(
+            verify_instrumented(&filled, &approval, TRIPWIRE),
+            Err("the cut set is not empty".into())
+        );
+    }
+
     #[test]
     fn unknown_expression_is_refused() {
         let unsupported = RULES.replacen("\"accept\": null", "\"unrecognized\": null", 1);
@@ -689,7 +760,15 @@ mod tests {
     const CONTACTS: &str = include_str!("../tests/fixtures/nft/contacts.json");
 
     fn contacts(json: &str, grant_counters: usize) -> Result<(), String> {
-        verify_instrumented(json, &approval(), grant_counters, true)
+        verify_instrumented(
+            json,
+            &approval(),
+            Instrumentation {
+                grant_counters,
+                record_contacts: true,
+                tripwire: false,
+            },
+        )
     }
 
     #[test]
@@ -699,6 +778,35 @@ mod tests {
         // the other.
         assert!(verify_policy(CONTACTS, &approval()).is_err());
         assert!(contacts(RULES, 0).is_err());
+    }
+
+    const CONTACTS_ON_DROP: &str = include_str!("../tests/fixtures/nft/contacts-on-drop.json");
+
+    #[test]
+    fn readback_of_the_record_and_the_tripwire_together_matches() {
+        let both = Instrumentation {
+            grant_counters: 0,
+            record_contacts: true,
+            tripwire: true,
+        };
+        verify_instrumented(CONTACTS_ON_DROP, &approval(), both)
+            .expect("recorded record and tripwire");
+        // Each is part of the policy: a readback with one of them only
+        // fails for both, and this one fails for either alone.
+        assert!(verify_instrumented(CONTACTS, &approval(), both).is_err());
+        assert!(verify_instrumented(CONTACTS_ON_DROP, &approval(), TRIPWIRE).is_err());
+        assert!(contacts(CONTACTS_ON_DROP, 0).is_err());
+        // The tripwire in place, but before the record's chain is taken.
+        let early = CONTACTS_ON_DROP.replacen(
+            "{\"goto\": {\"target\": \"contacted\"}}",
+            "{\"set\": {\"op\": \"add\", \"elem\": 0, \"set\": \"@cut\"}}, {\"goto\": {\"target\": \"contacted\"}}",
+            1,
+        );
+        assert_ne!(CONTACTS_ON_DROP, early);
+        assert_eq!(
+            verify_instrumented(&early, &approval(), both),
+            Err("output rule 7 differs".into())
+        );
     }
 
     #[test]

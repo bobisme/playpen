@@ -30,7 +30,8 @@ rule rejects with `admin-prohibited`. Without it a blocked TCP connect hangs
 for minutes in SYN retries; with it the tool fails at once with "No route to
 host" (over IPv6: "Permission denied"), which is clearer and makes test
 runs fast. The policy is still drop,
-so anything that gets past the reject (nothing should) is dropped.
+so anything that gets past the reject (nothing should) is dropped. With
+`--on-drop` the last rule is a drop instead ("The tripwire").
 
 **nix, not rustix.** playpen needs fork, unshare, setns, mount, signalfd,
 prctl (pdeathsig, dumpable, no_new_privs), setresuid/gid, waitpid, poll and
@@ -800,7 +801,8 @@ matter for safety:
    expressions and verdicts, and the accounting sets and counters,
    including the time rule and the empty `cut` set, and with
    `--report-contacts` the `contacted` chain and the empty `seen4` and
-   `seen6` sets. It normalizes the
+   `seen6` sets, and with `--on-drop` the tripwire and the declared size
+   of `cut`. It normalizes the
    supported numeric and symbolic spellings (and reads the time, listed
    with `TZ=UTC0`, as UTC) and ignores handles, counter values and the
    elements of the drop sets. Unknown material
@@ -1102,9 +1104,9 @@ CPU. A run that keeps sending to known destinations moves the counter at
 every reading and has C list the table each time: with both sets full,
 about 31 to 37 ms per 2 seconds, under 2% of one CPU, and with a handful
 of destinations about 2 ms. The figures are for `nft` alone; C's parse of
-the listing is not in them. The readings run only with `--events-fd` or
-`--live-drops`. Without them the counter is read once, at teardown, as
-before.
+the listing is not in them. The readings run only with `--events-fd`,
+`--live-drops` or `--on-drop`. Without them the counter is read once, at
+teardown, as before.
 
 **nft, not netlink.** A netlink request would be 300 times cheaper, but
 1.2 ms per 2 seconds does not need it. It would also be raw nfnetlink
@@ -1172,25 +1174,133 @@ The report's `destinations_truncated` says so.
 in flight: at most the time of one listing, about 40 ms with full sets,
 well inside P's 2-second limit.
 
-**The hook for `--on-drop stop`.** A planned option, `--on-drop
-cut|stop`, would have the kernel close egress by itself on the first
-drop (`add @cut { meta mark }` on the refusal path, before the drop
-counter). Then C must learn that it happened, and, for `stop`, P must
-stop the command. `read_drops_live` is the place: the packet that trips
-the cut goes on to the drop counter, so the next reading sees `dropped`
-move and lists the table, and that listing has the `cut` set (and the
-tripping destination in the drop sets). When the set holds the element
-and C did not add it, C sends one more line (for example `tripped`) to
-P, which stops the command as on an expiry. No new read is needed, and
-the delay is the same one interval. Such a run needs the readings
-whatever `--events-fd` and `--live-drops` say, so `Plan::watch_drops`
-would also be true for it.
-
 **Later: NFLOG.** A `log group N` rule beside the drop rule would hand
 each refused packet to a netlink listener at once, without polling, and
 with more than the destination (the source port, the first bytes). It
 needs a listener in C with its own netlink code and rate limits, and it
 duplicates what the sets already count. Not done.
+
+## The tripwire (`--on-drop`)
+
+By default a refused packet fails only its own connection. A command that
+tries a place nobody approved can go on using every approved destination,
+and the owner learns of it from the summary, or within 2 seconds from the
+`denied` records. For a run where the first refused packet already means
+the command is not doing what was reviewed, `--on-drop cut|stop` closes
+all egress at that packet, in the kernel.
+
+**The rule.** With the option, the refusal path of the output chain adds
+the element `0` to the `cut` set (`add @cut { 0 }`) after the two drop-set
+rules and before `counter name "dropped"`, and ends in `drop` instead of
+the reject. The first packet that gets there closes egress: the cut rule
+comes before every accept but loopback, so from the next packet on, on
+any CPU, everything else is refused, established connections and replies
+included, exactly as after P's cut request. Nothing polls, and P being
+stopped or slow changes nothing. The packet itself still goes into its
+drop set and the `dropped` counter, so the report names it; later packets
+never get that far.
+
+- **The constant, not `meta mark`.** The bone that planned this named
+  `add @cut { meta mark }`. Every packet in the sandbox has mark 0 and the
+  command cannot set another (`SO_MARK` needs a capability over the
+  namespace), so both add the same element. The constant is the element
+  the cut rule matches and the one C adds, whatever the packet.
+- **Drop, not reject.** Measured in a throwaway namespace with an ICMP
+  counter in front of the cut rule: the reject's own ICMP error for the
+  tripping packet is sent through the output chain after the element is
+  in. The cut drops it and counts it in `cut`, so the command does not get
+  it either (a TCP connect waits for its timeout as with a drop), and the
+  `cut` counter has one packet the command did not send. With `drop` the
+  command sees the same thing, "Operation not permitted" for UDP and a
+  TCP connect that times out, and the counter holds only the command's
+  packets.
+- **The set's size.** A set that a rule adds to gets `size 65535` from nft
+  when none is declared, and the readback would depend on that default.
+  The tripwire ruleset declares it.
+- **Only with the option.** Without it the ruleset, the readback, the
+  plan and the report are what they were (`playpen rules`, `plan` and a
+  run's report with a drop were compared with the previous build). `cut`
+  and `stop` load the same ruleset; they differ in what P does.
+
+**How P learns of it.** Every packet counted in `dropped` has passed the
+trip statement first. So with the tripwire, the cut has tripped exactly
+when the `dropped` counter is above 0, whether or not C also added the
+element. The readings of "Drops while the command runs" already read that
+counter every 2 seconds; they run with `--on-drop` alone too. The first
+reading that finds it above 0 sends `tripped JSON` after its `denied`
+lines, with the destinations its listing found (the drop sets hold
+nothing else once the cut has tripped; at most 8, so the line stays one
+write). The plan was to look at the `cut` set in the listing and check
+that C had not added the element; the counter needs no extra read and no
+memory of who added it, and a cut P asked for (end time, pass) can never
+look like a trip, because after it nothing reaches the counter.
+
+**What P does.** With `cut`, it prints the destination and that the
+command runs on. With `stop`, it does what it does at the end time: asks
+C for the cut (the element is there already, and adding it again changes
+nothing; the answer confirms egress is closed), prints the notice, sends
+SIGTERM, and SIGKILL after the 3-second grace, or SIGKILL at once when
+the cut is not confirmed within 2 seconds. P acts on the first `tripped`
+line only, and not when it is stopping the command already or has its
+exit status: then the summary tells. The command ends within one
+interval, the reading and the grace of the packet, about 5 seconds; a
+command that exits on SIGTERM, within about 2.
+
+**The report.** `on_drop`, `egress_cut` and `stopped_by_drop` are one
+optional part of the report (`tripwire::OnDropReport`, flattened), so a
+run without the option has none of the keys. `egress_cut` is null until
+something trips it; then `tripped_by` lists the destinations from the
+teardown readback (from the reading's line when the readback failed), and
+`refused` the `cut` counter. Once the cut tripped, every packet the cut
+refused came after the trip: none of them is an unapproved destination
+the report could name, and none came after the end of the approval. So
+`refused_after_end` keeps only `late` then, and `refused` has the rest.
+Before this, `refused_after_end` was `late` plus `cut`; without a trip it
+still is.
+
+**The exit status.** A `stop` run whose cut tripped never exits 0. A
+command that catches SIGTERM and exits 0 in its grace would otherwise
+pass for success, and so would one that ended before the next reading. In
+both, playpen exits 1 and `exit_code` keeps the 0. A signal stays 128 + N
+and any other status stays as it is, as with `--fail-on-drop`. With `cut`
+the command's own status stands: the option chose to let it run.
+
+**The shareable report** gets `on_drop` and `stopped_by_drop` and keeps
+its schema name: only added keys, only with the option. `egress_cut` names
+destinations, so it stays out, like `dropped`'s list.
+
+**`compare`.** After a trip, the cut refuses packets before the drop sets,
+so a report whose `egress_cut.refused` is not 0 does not say where they
+went. `compare` counts its drop evidence as incomplete. `on_drop` is not
+policy: it changes what is observed, not what is allowed.
+
+**With `--report-contacts`.** The two change separate rules: the record
+is the grants' `goto` and the `contacted` chain, the tripwire is the end
+of the refusal path. So the readback compares each where it is, and
+`tests/fixtures/nft/contacts-on-drop.json` (both at once) differs from
+`contacts.json` only in the tripwire. After a trip the cut rule refuses
+every packet before the grants, so `contacted` holds what the command
+reached before its first unapproved packet, and `suggest` proposes no
+more than that. `contacts_are_recorded_until_the_tripwire_closes_egress`
+runs both on the fake host: the record counts every datagram that reached
+the approved listener before the trip, and none after it.
+
+**What trips it without an attack.** That is why the option is opt-in:
+
+- multicast name lookups: mDNS to 224.0.0.251 or ff02::fb port 5353, and
+  LLMNR to 224.0.0.252 or ff02::1:3 port 5355, which some resolvers and
+  libraries send for `.local` and single-label names;
+- a client that sends to its own DNS server (a configured 8.8.8.8, or the
+  host's resolver address from its own settings) instead of the stub;
+- a cloud SDK that probes the instance metadata address 169.254.169.254
+  to find credentials or its region;
+- a client that tries the other address family first: an IPv6 address
+  for a service approved only over IPv4, or the other way round.
+
+The kernel's own IPv6 multicast listener reports and router solicitations
+are dropped before the drop sets and do not trip it; nor do refused Unix
+sockets, or lookups, which the stub answers on loopback. Tripping on those
+is out of scope.
 
 ## Contacted destinations (`--report-contacts`)
 
@@ -1308,6 +1418,7 @@ less.
 | Approval running out while the command runs | the time rule refuses all but loopback from the end second, in both chains; timer in playpen: the cut, SIGTERM, then SIGKILL after 3 s to the PID namespace's init | yes, both paths; loopback still works after the end, an approved address does not (`loopback_still_works_after_the_end`) |
 | The command using approved destinations during the grace | the cut, confirmed before the notice and SIGTERM; SIGKILL at once when it is not confirmed within 2 s | yes (`a_revoked_pass_closes_egress_before_the_notice`: a command that ignores SIGTERM keeps sending through its grace, and the fixture gets nothing after the notice; `a_failed_cut_kills_the_command_at_once`: an `nft` that fails or hangs on the cut) |
 | A pass revoked, deleted or edited (destination in use) while the command runs | re-read every 2 s; the cut; SIGTERM, then SIGKILL after 3 s | yes (revoke, delete, port change; and SIGKILL for a command that ignores SIGTERM after a revocation) |
+| With `--on-drop`: a command that, after one refused packet, goes on using approved destinations | the refusal path adds the cut's element itself; with `stop`, P stops the command within one reading interval | yes (`the_first_unapproved_packet_closes_egress_to_every_destination`: two approved fixtures and one unapproved address on a fake host; after the one datagram to the unapproved address, nothing reaches either fixture, and their logs agree; `stop_ends_the_command_within_one_reading_and_never_exits_0`, `stop_kills_a_command_that_ignores_sigterm_after_the_grace`) |
 | A pass edited to add a destination or extend the window during a run | rules and end time fixed at start; never reloaded; the only change, the cut, narrows | yes (added destination stays blocked) |
 | A pass swapped for a symbolic link, or made writable by others | hallpass's loader refuses both, at start and on every re-read | yes, at start (symlink, mode 0666) and during the run (renamed over by a symlink; mode 0620 and 0602) |
 | `--allow` adding a destination beside a pass | refused | yes |

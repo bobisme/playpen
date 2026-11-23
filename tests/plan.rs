@@ -120,6 +120,65 @@ fn live_drops_is_in_the_plan_only_when_given() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("differs from current scope"));
 }
 
+/// `--on-drop` is in the plan and its digest only when given, with its
+/// value: cut and stop are different plans, and a run that adds the option
+/// to a reviewed plan, or changes it, is refused.
+#[test]
+fn on_drop_is_in_the_plan_only_when_given() {
+    let plan = |flags: &[&str]| {
+        let out = Command::new(BIN)
+            .args(["plan", "--format", "json", "--allow", "192.0.2.1:443/tcp"])
+            .args(flags)
+            .args(["--", "true"])
+            .output()
+            .expect("plan");
+        assert!(out.status.success(), "{flags:?}");
+        serde_json::from_slice::<Value>(&out.stdout).expect("plan JSON")
+    };
+    let without = plan(&[]);
+    let cut = plan(&["--on-drop", "cut"]);
+    let stop = plan(&["--on-drop", "stop"]);
+    assert!(without["plan"].get("on_drop").is_none(), "{without}");
+    assert_eq!(cut["plan"]["on_drop"], "cut");
+    assert_eq!(stop["plan"]["on_drop"], "stop");
+    assert_ne!(cut["digest"], without["digest"]);
+    assert_ne!(stop["digest"], cut["digest"]);
+    for with in [&cut, &stop] {
+        let mut stripped = with["plan"].clone();
+        stripped
+            .as_object_mut()
+            .expect("plan object")
+            .remove("on_drop");
+        assert_eq!(stripped, without["plan"]);
+    }
+    let text = Command::new(BIN)
+        .args(["plan", "--no-network", "--on-drop", "stop", "--", "true"])
+        .output()
+        .expect("text plan");
+    assert!(text.status.success());
+    assert!(String::from_utf8_lossy(&text.stdout).contains("on_drop  \"stop\""));
+    for (digest, flags) in [
+        (&without["digest"], &["--on-drop", "stop"][..]),
+        (&cut["digest"], &["--on-drop", "stop"][..]),
+        (&stop["digest"], &[][..]),
+    ] {
+        let refused = Command::new(BIN)
+            .args(["run", "--expect-plan", digest.as_str().expect("digest")])
+            .args(["--allow", "192.0.2.1:443/tcp"])
+            .args(flags)
+            .args(["--", "true"])
+            .output()
+            .expect("pinned run");
+        assert_eq!(refused.status.code(), Some(2), "{flags:?}");
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("differs from current scope"));
+    }
+    let bad = Command::new(BIN)
+        .args(["plan", "--no-network", "--on-drop", "warn", "--", "true"])
+        .output()
+        .expect("invalid value");
+    assert_eq!(bad.status.code(), Some(2));
+}
+
 #[test]
 fn private_tty_changes_the_reviewed_scope_and_conflicts_with_detachment() {
     let inspect = |flags: &[&str]| {

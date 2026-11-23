@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::dns_stub::{self, Lookups};
 use crate::ruleset::DropSummary;
+use crate::tripwire::{OnDropReport, ShareableOnDrop};
 
 /// What happened, in one word. Stable field values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -140,6 +141,10 @@ pub struct Report {
     /// stderr while the command ran. `dropped` is read at the end either
     /// way.
     pub live_drops: bool,
+    /// With `--on-drop`, the keys `on_drop`, `egress_cut` and
+    /// `stopped_by_drop`. Without it the report has none of them.
+    #[serde(flatten)]
+    pub on_drop: Option<OnDropReport>,
 }
 
 /// Explicit allowlist for reports intended to be shared.
@@ -147,7 +152,9 @@ pub struct Report {
 /// It leaves out `started_at` and `ended_at` (exact times let a reader
 /// match the report to a destination's own logs, and so recover the
 /// destinations it leaves out) and `capture` (the capture holds payloads).
-/// See docs/spec.md, "Shareable reports".
+/// With `--on-drop` it has `on_drop` and `stopped_by_drop`, and not
+/// `egress_cut` (it names destinations). See docs/spec.md, "Shareable
+/// reports".
 #[derive(Serialize)]
 pub struct ShareableReport {
     // An empty, fixed-size array cannot carry private diagnostic strings.
@@ -164,6 +171,8 @@ pub struct ShareableReport {
     dropped_packets: Option<u64>,
     destinations_truncated: Option<bool>,
     drop_assertion: Option<DropAssertion>,
+    #[serde(flatten)]
+    on_drop: Option<ShareableOnDrop>,
 }
 
 impl From<&Report> for ShareableReport {
@@ -188,6 +197,7 @@ impl From<&Report> for ShareableReport {
             dropped_packets: r.dropped.as_ref().map(|d| d.packets),
             destinations_truncated: r.dropped.as_ref().map(|d| d.destinations_truncated),
             drop_assertion: r.drop_assertion,
+            on_drop: r.on_drop.as_ref().map(ShareableOnDrop::from),
         }
     }
 }
@@ -240,6 +250,15 @@ pub fn text_summary(r: &Report) -> String {
                 .unwrap_or("the pass no longer permits it")
         );
     }
+    if r.on_drop.as_ref().is_some_and(|o| o.stopped_by_drop) {
+        let _ = writeln!(
+            out,
+            "playpen: stopped the command because {}",
+            r.stop_reason
+                .as_deref()
+                .unwrap_or("a packet to an unapproved destination was dropped")
+        );
+    }
     match (r.exit_code, r.signal) {
         (Some(c), _) => {
             let _ = writeln!(out, "playpen: command exited with status {c}");
@@ -288,6 +307,7 @@ pub fn text_summary(r: &Report) -> String {
         }
         (None, None) => {}
     }
+    egress_cut_summary(&mut out, r);
     if let Some(n) = r.refused_after_end
         && (n > 0 || r.stopped_by_until || r.stopped_by_pass)
     {
@@ -331,6 +351,38 @@ fn contacts_summary(out: &mut String, r: &Report) {
             );
         }
         (None, None) => {}
+    }
+}
+
+/// The line for a cut that a dropped packet tripped (`--on-drop`).
+fn egress_cut_summary(out: &mut String, r: &Report) {
+    let Some((on_drop, cut)) = r
+        .on_drop
+        .as_ref()
+        .and_then(|o| o.egress_cut.as_ref().map(|c| (o.on_drop, c)))
+    else {
+        return;
+    };
+    let by = if cut.tripped_by.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", crate::tripwire::destinations(&cut.tripped_by))
+    };
+    let refused = cut.refused.map_or_else(String::new, |n| {
+        format!("; {n} packet(s) refused after that")
+    });
+    let _ = writeln!(
+        out,
+        "playpen: the firewall closed all egress at the first dropped packet (--on-drop {}){by}{refused}",
+        on_drop.name()
+    );
+    if on_drop == crate::tripwire::OnDrop::Stop
+        && r.exit_code == Some(0)
+        && r.playpen_exit_status == 1
+    {
+        out.push_str(
+            "playpen: exiting with status 1: with --on-drop stop, a run whose cut tripped never exits 0\n",
+        );
     }
 }
 
@@ -420,7 +472,88 @@ mod tests {
             new_session: false,
             private_tty: false,
             live_drops: false,
+            on_drop: None,
         }
+    }
+
+    /// A report of a run with `--on-drop stop` whose cut a packet to
+    /// `private-destination` tripped.
+    fn tripped() -> Report {
+        let mut r = base();
+        let dest = DroppedDest {
+            address: "private-destination".into(),
+            protocol: "udp".into(),
+            port: Some(53),
+            packets: 1,
+        };
+        r.dropped = Some(DropSummary {
+            packets: 1,
+            destinations: vec![dest.clone()],
+            destinations_truncated: false,
+        });
+        r.on_drop = Some(OnDropReport {
+            on_drop: crate::tripwire::OnDrop::Stop,
+            egress_cut: Some(crate::tripwire::EgressCut {
+                tripped_by: vec![dest],
+                refused: Some(12),
+            }),
+            stopped_by_drop: true,
+        });
+        r.stop_reason = Some("a packet to private-destination was dropped".into());
+        r.signal = Some(15);
+        r.exit_code = None;
+        r
+    }
+
+    #[test]
+    fn on_drop_keys_are_in_the_report_only_with_the_option() {
+        let plain = serde_json::to_value(base()).unwrap_or_default();
+        for key in ["on_drop", "egress_cut", "stopped_by_drop"] {
+            assert!(plain.get(key).is_none(), "{key}: {plain}");
+        }
+        let mut quiet = base();
+        quiet.on_drop = Some(OnDropReport::new(crate::tripwire::OnDrop::Cut));
+        let json = serde_json::to_value(&quiet).unwrap_or_default();
+        assert_eq!(json["on_drop"], "cut");
+        assert!(json["egress_cut"].is_null() && json.get("egress_cut").is_some());
+        assert_eq!(json["stopped_by_drop"], false);
+        assert_eq!(text_summary(&quiet), text_summary(&base()));
+        let json = serde_json::to_value(tripped()).unwrap_or_default();
+        assert_eq!(json["on_drop"], "stop");
+        assert_eq!(json["stopped_by_drop"], true);
+        assert_eq!(
+            json["egress_cut"]["tripped_by"][0]["address"],
+            "private-destination"
+        );
+        assert_eq!(json["egress_cut"]["refused"], 12);
+    }
+
+    #[test]
+    fn a_tripped_cut_has_its_own_lines() {
+        let t = text_summary(&tripped());
+        assert!(
+            t.contains(
+                "playpen: stopped the command because a packet to private-destination was dropped\n"
+            ),
+            "{t}"
+        );
+        assert!(
+            t.contains("playpen: the firewall closed all egress at the first dropped packet (--on-drop stop): private-destination udp port 53; 12 packet(s) refused after that\n"),
+            "{t}"
+        );
+        assert!(t.contains("WARNING: 1 packet(s)"), "{t}");
+        assert!(!t.contains("refused after the approval ended"), "{t}");
+        assert!(!t.contains("exiting with status"), "{t}");
+        let mut zero = tripped();
+        zero.signal = None;
+        zero.exit_code = Some(0);
+        zero.playpen_exit_status = 1;
+        let t = text_summary(&zero);
+        assert!(
+            t.contains("playpen: command exited with status 0\n")
+                && t.contains("playpen: exiting with status 1: with --on-drop stop, a run whose cut tripped never exits 0\n"),
+            "{t}"
+        );
     }
 
     #[test]
@@ -507,6 +640,27 @@ mod tests {
             assert!(serde_json::to_value(ShareableReport::from(&r)).unwrap_or_default()["dropped_packets"].is_null());
             r.dropped = Some(DropSummary::default());
         }
+    }
+
+    #[test]
+    fn shareable_has_the_on_drop_option_and_not_the_destination() {
+        let r = tripped();
+        let value = serde_json::to_value(ShareableReport::from(&r)).unwrap_or_default();
+        let serialized = value.to_string();
+        assert!(!serialized.contains("private-"), "{serialized}");
+        assert!(value.get("egress_cut").is_none(), "{serialized}");
+        assert_eq!(value["schema"], "playpen-shareable-v1");
+        assert_eq!(value["on_drop"], "stop");
+        assert_eq!(value["stopped_by_drop"], true);
+        assert_eq!(value["dropped_packets"], 1);
+        let keys: std::collections::BTreeSet<_> = value
+            .as_object()
+            .unwrap_or_else(|| panic!("not object"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys.len(), 15, "{keys:?}");
+        assert!(keys.contains("on_drop") && keys.contains("stopped_by_drop"));
     }
 
     #[test]

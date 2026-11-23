@@ -73,6 +73,10 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
     if args.report_contacts {
         scope["report_contacts"] = json!(true);
     }
+    // And for runs without the tripwire.
+    if let Some(on_drop) = args.on_drop {
+        scope["on_drop"] = json!(on_drop);
+    }
     Ok(scope)
 }
 

@@ -14,6 +14,10 @@ playpen rules --allow 192.0.2.0/28:444/tcp --allow 192.0.2.6/31:445/udp \
 playpen rules --allow 192.0.2.0/30:8000-8002/tcp --until 2026-12-01T12:34:56Z > until.nft
 playpen rules --allow 192.0.2.0/30:8000-8002/tcp --allow 192.0.2.4/32:53/udp \
     --allow '[2001:db8::/124]:80/udp' --report-contacts > contacts.nft
+playpen rules --allow 192.0.2.0/30:8000-8002/tcp --until 2026-12-01T12:34:56Z \
+    --on-drop cut > on-drop.nft
+playpen rules --allow 192.0.2.0/30:8000-8002/tcp --allow 192.0.2.4/32:53/udp \
+    --allow '[2001:db8::/124]:80/udp' --report-contacts --on-drop stop > contacts-on-drop.nft
 list='nft -f "$1" && TZ=UTC0 nft --json list table inet playpen'
 unshare -Urn sh -c "$list" _ edges.nft
 unshare -Urn sh -c "$list" _ empty.nft
@@ -22,6 +26,9 @@ unshare -Urn sh -c "$list" _ until.nft
 unshare -Urn sh -c "$list" _ contacts.nft
 unshare -Urn sh -c 'nft -f "$1" && TZ=UTC0 nft --numeric --json list table inet playpen' _ nonempty.nft
 unshare -Urn sh -c 'nft -f "$1" && TZ=Asia/Kolkata nft --json list table inet playpen' _ until.nft
+unshare -Urn sh -c "$list" _ on-drop.nft
+unshare -Urn sh -c 'nft -f "$1" && TZ=UTC0 nft --numeric --json list table inet playpen' _ on-drop.nft
+unshare -Urn sh -c "$list" _ contacts-on-drop.nft
 ```
 
 The last one is `until-kolkata.json`. `nft --json` prints `meta time` as a
@@ -30,12 +37,21 @@ the `nft` process, with or without `--numeric`. Playpen lists the table with
 `TZ=UTC0` and reads that date as UTC. The Kolkata dump names another moment
 (`"2026-12-01 18:04:56"`) and is refused.
 
+The two before the last are `on-drop.json` and `on-drop-numeric.json`. With
+`--on-drop` the refusal path adds the mark 0 to the `cut` set before the
+`dropped` counter (`{"set": {"op": "add", "elem": 0, "set": "@cut"}}`, the
+same in both spellings) and ends with `drop` instead of the reject. The
+`cut` set is declared with `size 65535`, the size nft gives a set that a
+rule adds to when none is declared, so the readback has `"size": 65535`
+with either.
+
 The comparator accepts the following expression vocabulary from these dumps.
 It checks connection state, interface, IP destination and prefix, IPv6 hop
 limit and ICMP type, transport protocol and inclusive ports, the packet
 mark against the `cut` set, the time, the four dynamic additions to the
-drop sets and the two to the `seen` sets, the named counters, and accept,
-drop, `goto contacted` and ICMPx reject verdicts. Named and
+drop sets, the two to the `seen` sets and, with `--on-drop`, the addition
+of the mark 0 to the `cut` set, the named counters, and accept, drop,
+`goto contacted` and ICMPx reject verdicts. Named and
 numeric spellings from the recorded dumps are equivalent, as are anonymous
 set member permutations and textual IP address spellings. Rule order and
 expression order are checked. Handles, counter values and the elements of
@@ -58,3 +74,9 @@ recorded on the same host with nftables 1.1.7. It differs from
 sets, the regular `contacted` chain with its four rules, and `goto
 contacted` in place of `accept` in the three grant rules. nft prints the two
 additions in that chain without their `meta nfproto` matches.
+
+`contacts-on-drop.json` is the `contacts.json` approval with `--on-drop`
+as well (`cut` and `stop` render the same table). It differs from
+`contacts.json` only in the size of the `cut` set, the addition to it
+before the `dropped` counter, and `drop` in place of the reject: the two
+options change separate parts of the table.

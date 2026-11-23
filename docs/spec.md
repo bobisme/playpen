@@ -48,6 +48,14 @@ If you used v0.1, these will be different:
   stderr (section 4.1). The report has the new field `live_drops`, and
   the plan has `live_drops` when the option is given. The report's
   `dropped` is read at the end, as before.
+- **The first refused packet can close all egress.** With
+  `--on-drop cut|stop`, the ruleset closes all egress by itself at the
+  first packet it drops, and with `stop` playpen also stops the command
+  (section 4.1). Only with the option: the ruleset ends in `drop` instead
+  of the reject, the report has `on_drop`, `egress_cut` and
+  `stopped_by_drop`, the shareable report has `on_drop` and
+  `stopped_by_drop`, and the plan has `on_drop`. Without it the ruleset,
+  the plan and the reports are as before.
 
 ## 1. Purpose and non-goals
 
@@ -157,11 +165,11 @@ and exits 2.
 playpen run --pass FILE [--only LABEL]... [--pass-hosts]
             [--host NAME=ADDR]... [--until RFC3339] [SOCKETS]
             [--format text|pretty|json] [--report FILE] [--capture FILE]
-            [--live-drops] -- COMMAND [ARGS...]
+            [--live-drops] [--on-drop cut|stop] -- COMMAND [ARGS...]
 playpen run [--allow SPEC]... [--host NAME=ADDR]... [--until RFC3339]
             [--no-network] [SOCKETS] [--format text|pretty|json]
             [--report FILE] [--capture FILE] [--live-drops]
-            -- COMMAND [ARGS...]
+            [--on-drop cut|stop] -- COMMAND [ARGS...]
 
 SOCKETS = [--expose PATH]... [--display] [--hide PATH]...
           [--without-landlock] [--new-session | --private-tty]
@@ -500,8 +508,8 @@ does not cross the interface either.
   2 seconds for pasta to exit by itself (it looks once a second whether
   the sandbox is gone) and sends it SIGTERM only after that.
 
-**Drops while the command runs.** With `--events-fd` or `--live-drops`,
-the sandbox's setup process reads the ruleset's `dropped` counter every 2
+**Drops while the command runs.** With `--events-fd`, `--live-drops` or
+`--on-drop`, the sandbox's setup process reads the ruleset's `dropped` counter every 2
 seconds while the command runs (`live_drops::INTERVAL`, the cadence of
 the pass re-read), from 2 seconds after it starts the sandbox's init. When
 the count differs from the one at its last listing, it lists the table and
@@ -510,8 +518,9 @@ reported before, with the packet count at that reading. So each
 destination is reported once, within one interval of its first dropped
 packet plus the time of the reading, while the command is still alive.
 `--events-fd` gets one `denied` record for each ("Supervisor lifecycle
-events" below); `--live-drops` prints a line. Without either option the
-counter is read only at teardown, as before.
+events" below); `--live-drops` prints a line; `--on-drop` learns of the
+trip (below). Without these options the counter is read only at teardown,
+as before.
 
 - Only destinations in the drop sets are reported: at most 1024 per
   address family (section 6.1). A packet to a destination beyond that is
@@ -561,6 +570,72 @@ cannot be combined with `--shareable-report` (usage error, exit 2).
 `playpen suggest` turns the record into options (see "Suggesting a
 narrower allow list").
 
+**`--on-drop cut|stop`**. Close all egress at the first packet the
+firewall drops. The ruleset's refusal path adds the mark 0 to the `cut`
+set before the `dropped` counter, and drops the packet instead of
+rejecting it (section 6.1). So the first packet that gets there closes
+all egress in the kernel itself, with no polling: from the next packet
+on, the cut rule refuses everything but loopback, in both directions,
+approved destinations and established connections included, until the
+run ends. The packet that trips it gets no ICMP error. UDP still fails
+with "Operation not permitted"; a TCP connect waits for its own timeout.
+
+- `cut`: the command runs on and sees its connections fail.
+- `stop`: playpen also stops the command once it learns of the trip, as
+  at the end time. The readings above run with `--on-drop` alone too, and
+  the first one that finds `dropped` above 0 tells the supervisor. The
+  supervisor asks for the cut (it is in place already, so nothing
+  changes, but the answer confirms it), prints the notice, sends SIGTERM,
+  and SIGKILL 3 seconds later; or SIGKILL at once when the cut cannot be
+  confirmed within 2 seconds. The command ends within one reading interval
+  (2 s), the time of the reading, and the grace (3 s) of the packet:
+  about 5 seconds.
+
+The first reading that finds the trip while the command runs prints, once:
+
+```text
+playpen: a packet to an unapproved destination was dropped: 198.51.100.7 udp port 53 (--on-drop cut); the firewall now refuses all traffic but loopback, and the command keeps running
+playpen: a packet to an unapproved destination was dropped: 198.51.100.7 udp port 53 (--on-drop stop); the firewall now refuses all traffic but loopback; sending SIGTERM to the command (SIGKILL in 3 s)
+```
+
+The first line is `cut`'s, the second `stop`'s. With several
+destinations (packets sent at the same moment from other CPUs) it says
+`packets to unapproved destinations were dropped: A, B`, at most 8 of
+them, then `and N more`; with none (the reading could not list the
+table) it says only `a packet to an unapproved destination was dropped`.
+Nothing is printed when the command is being stopped already (end time,
+pass) or has ended before the reading; the summary at the end has it.
+The exit status is in section 4.2; the report fields `on_drop`,
+`egress_cut` and `stopped_by_drop` in section 4.5. The plan digest covers
+`--on-drop` and its value, and `playpen rules --on-drop` prints the
+ruleset with it (`cut` and `stop` load the same ruleset).
+
+Refused Unix sockets and name lookups do not trip it: the stub answers on
+loopback, which is accepted. Nor do the IPv6 multicast listener reports
+and router solicitations the output chain drops before the drop sets.
+Other packets commonly trip it without any attack, which is why it is
+off by default:
+
+- multicast name lookups: mDNS (224.0.0.251 or ff02::fb, port 5353) and
+  LLMNR (224.0.0.252 or ff02::1:3, port 5355);
+- a client that sends to its own DNS server instead of the stub;
+- a cloud SDK that probes the metadata address 169.254.169.254;
+- a client that tries the other address family first, such as IPv6 for a
+  service approved only over IPv4.
+
+Decision: the trip statement adds the constant mark 0, not the packet's
+mark (`meta mark`). Every packet in the sandbox has mark 0 and only the
+setup process could change that, so the two add the same element; the
+constant is the one element the cut rule and the supervisor's cut request
+use, whatever the packet. Decision: with the option the refusal path ends
+in `drop`. A reject sends its ICMP error to the command through the
+output chain, after the cut is in place, so the cut would drop it and
+count it, and the command would not get it either. Decision: the
+supervisor learns of the trip from the `dropped` counter, not from the
+`cut` set. Every packet counted there passed the trip statement first, so
+a count above 0 means the cut tripped, and a cut the supervisor asked for
+(end time, pass) never counts as a trip.
+
 **`--format text|pretty|json`**. With JSON and no report path, stdout carries
 one final JSON report. The workload’s stdout and stderr both stream to
 Playpen’s stderr alongside supervisor diagnostics. With `--report FILE`,
@@ -587,7 +662,12 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   `; packet capture: PATH` (the absolute path). Then, with
   `--live-drops`, `; dropped destinations printed while the command runs
   (the first 8)`. Then, with `--report-contacts`, `; contacted
-  destinations recorded`. Then, always,
+  destinations recorded`. Then, with `--on-drop cut`, `; at the first
+  dropped packet the firewall itself refuses all traffic but loopback, and
+  the command runs on (--on-drop cut)`, or with `--on-drop stop` `...; at
+  the first dropped packet the firewall itself refuses all traffic but
+  loopback, and playpen stops the command (--on-drop stop)`: what is
+  recorded comes before what the first drop does. Then, always,
   `; host Unix sockets: none reachable` (with `--without-landlock`: `;
   host Unix sockets: hidden under /run, /tmp, /var/tmp and the runtime
   directory only (--without-landlock); sockets elsewhere stay reachable`),
@@ -616,10 +696,20 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   destinations; see the summary at the end`, and once at most `could not
   read the drop counter while the command runs: ...` (see
   `--live-drops`);
-- at the end: how the command ended; then either `no packets to
+- with `--on-drop`, once, when a reading finds that a dropped packet has
+  closed egress: the lines shown under `--on-drop`;
+- at the end: with `--on-drop stop`, when playpen stopped the command,
+  `stopped the command because a packet to an unapproved destination was
+  dropped: ADDR PROTO port N (--on-drop stop)` (the `stop_reason`); how
+  the command ended; then either `no packets to
   unapproved destinations were dropped`, or a block between lines of
   asterisks starting `WARNING: N packet(s) to UNAPPROVED destinations were
   dropped.` listing each destination with protocol, port and packet count;
+  then, with `--on-drop`, when the cut tripped, `the firewall closed all
+  egress at the first dropped packet (--on-drop cut|stop): DESTINATIONS;
+  N packet(s) refused after that` (each part only when known), and with
+  `stop`, when the command exited 0, `exiting with status 1: with
+  --on-drop stop, a run whose cut tripped never exits 0`;
   then `N packet(s) refused after the approval ended` when that count was
   read and is not 0, or playpen stopped the command because the approval
   ended or the pass withdrew it; then, with `--capture`, `packet capture
@@ -642,9 +732,18 @@ The supervisor’s human-readable diagnostics on stderr include the following me
 | Status | Meaning |
 |---|---|
 | the command's own status | the command ran and exited |
-| 128 + N | the command was killed by signal N (including SIGTERM 15 or SIGKILL 9 sent because the approval ended or the pass withdrew it) |
+| 128 + N | the command was killed by signal N (including SIGTERM 15 or SIGKILL 9 sent because the approval ended, the pass withdrew it, or a dropped packet tripped `--on-drop stop`) |
 | 2 | refused by policy before anything was built; nothing was run |
-| 1 | the sandbox could not be built (nothing was run), or something failed after the command started |
+| 1 | the sandbox could not be built (nothing was run), or something failed after the command started; or the command exited 0 and `--fail-on-drop` failed, or `--on-drop stop` had tripped |
+
+With `--on-drop stop`, a run whose cut tripped never exits 0. That covers
+a command that catches SIGTERM and exits 0 in its grace, and one that
+ended before playpen learned of the trip: playpen exits 1, and the
+report's `exit_code` keeps the 0. Any other status is kept, so a command
+killed by SIGTERM gives 143 and one killed after the grace 137. The cut
+counts as tripped when a reading found it or the `dropped` counter read
+at teardown is above 0 (`egress_cut` is not null). With `--on-drop cut`
+the command's status stands; `--fail-on-drop` still applies to both.
 
 A command can itself exit with 1 or 2. To tell these apart, use
 `--report`: `outcome` is `"ran"` when the command ran (and `exit_code`
@@ -716,8 +815,9 @@ playpen run --events-fd 3 --no-network -- printf hello 3> >(jq -c '{seq,event,de
 Version 1 records have `version`, a sequence number starting at 1, `event`
 and `details`. Ignore unfamiliar fields. Buffer partial lines until a newline.
 A validated request emits `validated`; `starting` is immediately before the
-supervisor releases the workload. `stopping` carries `reason` of `expiry` or
-`pass_withdrawn`, and `egress_closed`: true when the firewall confirmed the
+supervisor releases the workload. `stopping` carries `reason` of `expiry`,
+`pass_withdrawn` or `drop` (a dropped packet tripped `--on-drop stop`; it
+comes after that packet's `denied` record), and `egress_closed`: true when the firewall confirmed the
 cut before SIGTERM, false when the command is killed at once because it
 did not (section 4.1, `--until`). `denied` carries `address`, `protocol`,
 `port` (null for protocols other than TCP and UDP) and `packets` (the count
@@ -729,7 +829,8 @@ hold 1024 per address family). They come between `starting` and
 `terminal`, and a `stopping` record can come before some of them. The
 report's `dropped` remains the complete record. With `--events-fd` the
 drop counter is read while the command runs; the records are the same
-with or without `--live-drops`. `terminal` carries the outcome, startup
+with or without `--live-drops` or `--on-drop`. `--on-drop cut` adds no
+record: its trip is the first `denied` record. `terminal` carries the outcome, startup
 evidence, child exit/signal, wrapper exit and drop assertion. A policy
 refusal can emit just the terminal record. Pre-parse errors and an invalid
 descriptor have no stream. The supervisor sets the supplied pipe writer
@@ -758,7 +859,8 @@ mapping and argument order are preserved. With `--pass-hosts` the plan has
 `"pass_hosts": true`, and `hosts` lists the entries from the pass after the
 `--host` ones. Without it the field is absent, so plans without the option
 keep their digest. The same holds for `--live-drops` and `"live_drops":
-true`, and for `--report-contacts` and `"report_contacts": true`.
+true`, for `--report-contacts` and `"report_contacts": true`, and for
+`--on-drop` and `"on_drop": "cut"` or `"stop"`.
 
 The top-level `digest` is SHA-256 of the compact JSON encoding of the v1
 plan (object keys in lexical order). Give it to `run --expect-plan DIGEST`
@@ -773,9 +875,10 @@ lifetimes.
 
 ```text
 playpen rules [--allow SPEC]... [--until RFC3339] [--report-contacts]
-              [--format text|pretty|json]
+              [--on-drop cut|stop] [--format text|pretty|json]
 playpen rules --pass FILE [--only LABEL]... [--pass-hosts] [--until RFC3339]
-              [--report-contacts] [--format text|pretty|json]
+              [--report-contacts] [--on-drop cut|stop]
+              [--format text|pretty|json]
 ```
 
 Prints the ruleset that `run` would load for these rules. Sends nothing,
@@ -795,7 +898,11 @@ no rule. `--until` is checked as by `run` (a time in the past, or with
 --report-contacts` loads: each grant rule ends in `goto contacted` in
 place of `accept`, and the `contacted` counter, the `seen4` and `seen6`
 sets and the `contacted` chain are added (section 6.1, item 7). Without it
-the output is the same as before the option existed.
+the output is the same as before the option existed. `--on-drop cut` or
+`stop` prints the ruleset with the tripwire (section 6.1; both values give
+the same ruleset), and the JSON then has `"on_drop": "cut"` or `"stop"`;
+without it there is no such key. The two options change separate parts
+of the ruleset and can be combined.
 
 ### 4.4 `playpen doctor`
 
@@ -937,7 +1044,7 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `signal` | integer or null | the signal that killed the command |
 | `stopped_by_until` | bool | playpen stopped the command because the end time was reached |
 | `stopped_by_pass` | bool | playpen stopped the command after re-reading the pass |
-| `stop_reason` | string or null | why playpen stopped the command, when `stopped_by_until` or `stopped_by_pass` |
+| `stop_reason` | string or null | why playpen stopped the command, when `stopped_by_until`, `stopped_by_pass` or `stopped_by_drop` |
 | `enforcement_coverage` | object, if available | selected pass enforcement coverage; omitted when unavailable |
 | `pass` | object or null | null without `--pass`; else `{"file", "id", "name", "owner", "digest", "valid_until", "labels"}`: the file as given, the pass id, name, `approval.owner`, `sha256:` digest of the file at start, `valid_until` (RFC 3339 UTC), and the labels in use. When the pass could not be loaded, everything but `file` is null and `labels` is empty |
 | `capture` | object or null | null without `--capture` and when nothing was run; else `{"file", "bytes", "sha256"}`: the capture file (absolute), its size, and the SHA-256 of its bytes in lower-case hex as `sha256sum` prints it, read through the descriptor playpen created it with, after pasta has exited. Also null when the file could not be read back; `message` then says why |
@@ -949,13 +1056,16 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `lookups_error` | string or null | why the record of names could not be read |
 | `contacted` | object or null | present only with `--report-contacts`: `{"destinations": [{"address", "protocol", "port", "packets"}], "truncated": bool}`, as shown in "Contacted destinations in private reports"; null when `outcome` is not `"ran"` or the record could not be read |
 | `contacted_error` | string or null | present only with `--report-contacts`: why the record of contacted destinations could not be read |
-| `refused_after_end` | integer or null | packets the command sent that the firewall refused because the approval had ended: by the time rule from the end second on, or by the cut once playpen stopped the command (section 6.1). Not part of `dropped`, not unapproved destinations, and not judged by `--fail-on-drop`. Null when the counters could not be read |
+| `refused_after_end` | integer or null | packets the command sent that the firewall refused because the approval had ended: by the time rule from the end second on, or by the cut once playpen stopped the command (section 6.1). Not part of `dropped`, not unapproved destinations, and not judged by `--fail-on-drop`. Null when the counters could not be read. With `--on-drop` and a tripped cut, the time rule's packets only, and null also when the `cut` counter could not be read: every packet the cut refused came after the trip and is in `egress_cut.refused` |
 | `socket_guard` | `"landlock"` or `"mounts_only"` | how host Unix sockets were kept from the command; `"mounts_only"` with `--without-landlock` |
 | `exposed` | array of strings | every exposed path (`--expose` and `--display`), canonical once checked; the `--expose` values as typed when refused |
 | `private_tty` | bool | whether the caller requested a private controlling terminal |
 | `live_drops` | bool | `--live-drops` was given: new dropped destinations were printed on stderr while the command ran. `dropped` is read at teardown either way |
 | `display` | bool | `--display` was given |
 | `new_session` | bool | the command ran (or would have run) in its own session without a controlling terminal |
+| `on_drop` | `"cut"` or `"stop"` | present only with `--on-drop`: its value |
+| `egress_cut` | object or null | present only with `--on-drop`. Null when no dropped packet tripped the cut, as far as playpen could read (no reading found it and the `dropped` counter read at teardown is 0 or unreadable). Else `{"tripped_by": [{"address", "protocol", "port", "packets"}], "refused": N}`: the destinations of the packets dropped before the cut closed egress, as in `dropped` (the packet that tripped it, and any sent at the same moment from another CPU; empty when they could not be read), and the packets the cut refused on their way out after that (null when the counter could not be read). `refused` is not part of `dropped` or `refused_after_end`, and not judged by `--fail-on-drop` |
+| `stopped_by_drop` | bool | present only with `--on-drop`: playpen stopped the command because a dropped packet tripped `--on-drop stop` |
 
 ### Counted-drop assertion
 
@@ -971,7 +1081,9 @@ expiry or pass revocation cannot become success. Refusal and setup failures
 retain their existing statuses. This counts dropped IP packets, not names
 the stub answered "no such name", Unix sockets, packets that never reached
 the ruleset, or packets refused after the approval ended
-(`refused_after_end`). Without the
+(`refused_after_end`), or packets the cut refused after `--on-drop`
+tripped it (`egress_cut.refused`); the packet that tripped it is counted
+in `dropped`. Without the
 option, the existing exit contract and JSON shape are unchanged.
 
 ### Grant use in private reports
@@ -1049,7 +1161,11 @@ null too), and when the record could not be read (`contacted_error` says
 why). Otherwise `contacted_error` is null. A `--no-network` run has
 `{"destinations": [], "truncated": false}`. The record works beside
 `--report-grant-use`: a grant's counter comes before its `goto` in the
-same rule. The record cannot be combined with `--shareable-report`. The
+same rule. With `--on-drop`, the record ends when the cut trips: from
+then on the cut rule refuses every packet before the grants (section
+6.1), so `contacted` holds what the command reached before its first
+unapproved packet. The record cannot be combined with
+`--shareable-report`. The
 record shows what one run did. One quiet run does not show that a later
 run needs less.
 
@@ -1059,7 +1175,8 @@ run needs less.
 JSON object directly. Its only fields are `advice` (always an empty array), `schema`, `outcome`, `exit_code`,
 `signal`, `playpen_exit_status`, `network`, `socket_guard`, `stopped_by_until`,
 `stopped_by_pass`, `dropped_packets`, `destinations_truncated`, and
-`drop_assertion`. The two drop fields are null when unavailable; zero is a
+`drop_assertion`; with `--on-drop`, also `on_drop` and `stopped_by_drop`
+(the same values as in the full report). The two drop fields are null when unavailable; zero is a
 known zero. The stop booleans classify expiry and pass stops without copying
 free-text reasons. It has no host names: not the `--host` mappings and not
 the names the command looked up. The normal full report remains the default and retains its
@@ -1079,6 +1196,14 @@ times for the owner. The schema stays `playpen-shareable-v1`, unchanged.
 digest name a file that must not travel with a shared report. `contacted`
 is never added either: it lists the destinations.
 
+Decision (`--on-drop`): `on_drop` and `stopped_by_drop` are added, only
+when the option is given, so a shareable report without it is unchanged.
+A reader needs them to tell a stop by drop from a command that ended by
+itself, as the other stop booleans do; whether the cut tripped follows
+from `dropped_packets`. `egress_cut` is not added: it names destinations.
+The schema stays `playpen-shareable-v1`: no field changes meaning and
+none is removed, and readers already ignore unfamiliar fields.
+
 Child output and files created by the caller or child are separate from this
 report and may contain sensitive data. Aggregate counts and the occurrence of
 stops can themselves disclose information, including timing-related behavior.
@@ -1097,7 +1222,12 @@ observations. A newly observed tuple
 requires a complete baseline; a no-longer-observed tuple requires a complete
 later report and does not mean it is allowed or fixed. Missing or partial
 counters, malformed detail, unstarted runs and unsupported/reduced schemas
-cannot establish equality.
+cannot establish equality. So cannot a report whose `--on-drop` cut
+tripped and then refused packets (`egress_cut.refused` not 0, or null):
+the cut refuses them before the drop sets, so the report does not say
+where they went, and its drop evidence is incomplete. `on_drop` and
+`stopped_by_drop` are not policy: they change what is observed, not what
+is allowed.
 
 Names looked up without a `--host` mapping are observations too, compared
 the same way: `new_unmapped_lookups` needs a complete `lookups` record in
@@ -1272,7 +1402,9 @@ Each step either succeeds or stops the run with a message that ends
    the packet mark against the `cut` set, the time, set additions, counters
    and verdicts, `goto contacted` among them. The `cut` set must be empty.
    With `--report-contacts`, the `contacted` chain, its counter and the
-   `seen4` and `seen6` sets are compared too, and both sets must be empty. `nft --json` prints the time
+   `seen4` and `seen6` sets are compared too, and both sets must be empty.
+   With `--on-drop`, the tripwire and the size of the `cut` set are
+   compared too (section 6.1). `nft --json` prints the time
    rule's operand as a date without an offset (`"2026-12-01 12:34:56"`) in
    the time zone of the `nft` process, so C lists the table with
    `TZ=UTC0` and reads that date as UTC; the time rule must be at exactly
@@ -1363,8 +1495,8 @@ reports on. P prints the notice and sends SIGTERM only after `cut`. On
 closed and sends SIGKILL to I at once. If the sandbox has ended before it
 answers, there is nothing left to cut.
 
-With `--events-fd` or `--live-drops`, C also reads the `dropped` counter
-every 2 seconds on a fixed schedule from the moment it has forked S
+With `--events-fd`, `--live-drops` or `--on-drop`, C also reads the
+`dropped` counter every 2 seconds on a fixed schedule from the moment it has forked S
 (`nft --json list counter inet playpen dropped`). When the count moved
 since its last listing, it lists the table and sends each destination it
 has not sent before on the pipe it reports on, as `denied JSON` (address,
@@ -1374,6 +1506,18 @@ destination on as a `denied` record and, with `--live-drops`, a line
 (4.1, "Drops while the command runs"). A `CUT` byte that comes during a
 reading is answered when the reading ends: up to about 40 ms with full
 drop sets, well inside P's 2 seconds.
+
+With `--on-drop`, C reads the counter on the same schedule, and C's
+readback at start expects the tripwire (section 6.1). The first reading
+that finds `dropped` above 0 also sends `tripped JSON`, after that
+reading's `denied` lines: the destinations of its listing, at most 8, so
+that the line stays one write (an empty list when the listing failed). P
+acts on the first such line only, and only while it is not stopping the
+command and has not read its exit status. With `stop` it sends `CUT`
+(C adds the element again, which changes nothing, and answers `cut`),
+prints the notice, and stops the command as at the end time; with `cut`
+it prints the notice. At teardown C also sends `cutcount N`, the `cut`
+counter alone, with every run; P uses it only with `--on-drop`.
 
 If any step before the command starts fails and
 `kernel.apparmor_restrict_unprivileged_userns` is 1, the message adds that
@@ -1454,10 +1598,34 @@ In this order:
    counted in the `dropped` counter, and rejected with ICMP
    administratively prohibited.
 
+With `--on-drop` (either value), 8 differs, and nothing else but the
+declared size of the `cut` set (`size 65535`, the size nft gives a set a
+rule adds to): after the drop sets the packet adds the element `0` to the
+`cut` set (`add @cut { 0 }`), then it is counted in `dropped`, then
+dropped instead of rejected. So the first packet that reaches 8 closes all
+egress, as C's `nft add element` does, and every later packet but
+loopback meets 4 first. A send fails with "Operation not permitted"; a TCP
+connect waits for its timeout. With `--report-contacts` as well, 7
+and 8 each have their own change: an approved packet goes to `contacted`
+until the trip, and after it 4 refuses every packet before 7, so the
+record ends at the first unapproved packet. `playpen rules --on-drop cut`
+prints:
+
+```text
+		meta nfproto ipv6 meta l4proto != { tcp, udp } add @drop6 { ip6 daddr . meta l4proto . 0 }
+		# --on-drop: the first packet that gets here closes all egress, and is dropped.
+		add @cut { 0 }
+		counter name "dropped"
+		drop
+```
+
 The packets counted by `late` and `cut` are reported together as
 `refused_after_end` (section 4.5). A packet meets at most one of the two
 rules, so none is counted twice. After the end, a packet to an unapproved
 destination is refused by 3 or 4 and counted there, not in `dropped`.
+With `--on-drop` and a tripped cut, the `cut` packets are reported as
+`egress_cut.refused` instead, and `refused_after_end` has the `late`
+packets only.
 
 The finite packet-scope regression builds 255 valid full passes from an
 eight-destination universe and checks all 6,305 nonempty full-pass/subset
@@ -1481,6 +1649,8 @@ So by default:
 | the host's loopback | unreachable: pasta maps nothing to it and forwards no loopback ports |
 | the sandbox's own loopback (`127.0.0.0/8`, `::1`) | allowed, also after the approval ends |
 | everything but loopback, after the approval ended or the cut | dropped and counted in `refused_after_end` |
+| with `--on-drop`: the first unapproved packet | dropped and counted (UDP send fails with "Operation not permitted", TCP connect waits for its timeout); it closes all egress like the cut |
+| with `--on-drop`: everything but loopback after that packet | dropped and counted in `egress_cut.refused` |
 | the sandbox's own non-loopback addresses (copied by pasta from the host) | treated like any other destination: only if approved; such traffic stays inside the sandbox anyway |
 
 ### 6.2 Input chain (policy drop) and forward chain (policy drop)
@@ -1613,6 +1783,16 @@ Not guarded against, or known limits:
   in the last interval before the command ends can have no record, and a
   destination beyond the 1024 of its family's set has none. The report's
   `dropped` is the complete record;
+- `--on-drop` trips on refused IP packets only. A refused Unix socket, a
+  lookup the stub answers "no such name", a non-IP socket family and the
+  IPv6 reports the output chain drops uncounted do not trip it. What the
+  command sent to approved destinations before its first refused packet
+  has left. With `stop`, the command can run up to about 5 seconds after
+  the packet (one reading interval and the grace), with egress closed. A
+  packet sent at the same moment as the tripping one, from another CPU,
+  can also be dropped and listed in `egress_cut.tripped_by`. After the
+  trip the report does not say where the refused packets went, only how
+  many there were;
 - an approval of this host's own address, on the interface pasta copies
   into the sandbox, does not reach the host: inside, that address is the
   sandbox's. playpen prints a NOTE at the start when a rule approves such

@@ -26,8 +26,10 @@ use crate::pass::{
 };
 use crate::report::{Outcome, PassReport, Report, StartupEvidence, text_summary};
 use crate::resolver::{HostEntry, check_hosts, parse_host};
+use crate::ruleset::Instrumentation;
 use crate::sandbox::{self, CommandStatus, Events, Plan, RunError};
 use crate::sockets;
+use crate::tripwire::{self, OnDrop, OnDropReport};
 
 /// Why `--pass` and `--allow` cannot be combined.
 const PASS_AND_ALLOW: &str = "--pass and --allow cannot be combined: the pass lists every destination its owner approved in writing, and an --allow beside it would add a destination the owner did not approve. Add the destination to the pass (with the owner's written approval), or use --only LABEL to narrow the pass";
@@ -98,6 +100,10 @@ enum Cmd {
         /// chain that records its destination, then accepts.
         #[arg(long)]
         report_contacts: bool,
+        /// As with run: the first refused packet closes all egress, and is
+        /// dropped instead of rejected. cut and stop load the same ruleset.
+        #[arg(long, value_enum, value_name = "ACTION")]
+        on_drop: Option<OnDrop>,
     },
     /// Check that this machine can run playpen, and say exactly what is missing.
     #[command(display_order = 1, after_help = discovery::DOCTOR)]
@@ -234,6 +240,17 @@ struct RunArgs {
     /// Allow only private loopback. No DNS or external network.
     #[arg(help_heading = "Network policy", long)]
     no_network: bool,
+    /// At the first packet the firewall drops, close all egress but loopback:
+    /// cut lets the command run on, stop also stops it (SIGTERM, 3 s, SIGKILL;
+    /// learned within 2 s). Off by default: mDNS and LLMNR lookups, a client's
+    /// own DNS server, a cloud metadata probe or an IPv6 try trip it too.
+    #[arg(
+        help_heading = "Network policy",
+        long,
+        value_enum,
+        value_name = "ACTION"
+    )]
+    on_drop: Option<OnDrop>,
     /// Serve one literal HTTP fixture on private loopback in offline mode.
     #[arg(
         help_heading = "Launch and reporting",
@@ -366,6 +383,7 @@ fn dispatch(cmd: Cmd, format: Format) -> i32 {
             only,
             until,
             report_contacts,
+            on_drop,
             ..
         } => rules(
             &allow,
@@ -373,6 +391,7 @@ fn dispatch(cmd: Cmd, format: Format) -> i32 {
             &only,
             until.as_deref(),
             report_contacts,
+            on_drop,
             format,
         ),
         Cmd::Doctor { mode } => crate::doctor::run_formatted(mode, format),
@@ -390,6 +409,7 @@ fn rules(
     only: &[String],
     until: Option<&str>,
     report_contacts: bool,
+    on_drop: Option<OnDrop>,
     format: Format,
 ) -> i32 {
     let refuse =
@@ -432,18 +452,26 @@ fn rules(
     if let Err(e) = approval.check_active(now) {
         return refuse(&e.to_string());
     }
-    let text = crate::ruleset::render_instrumented(&approval, 0, report_contacts);
+    let with = Instrumentation {
+        record_contacts: report_contacts,
+        tripwire: on_drop.is_some(),
+        ..Instrumentation::default()
+    };
+    let text = crate::ruleset::render_instrumented(&approval, with);
     match format {
         Format::Text | Format::Pretty => print!("{text}"),
-        Format::Json => println!(
-            "{}",
-            serde_json::json!({
+        Format::Json => {
+            let mut out = serde_json::json!({
                 "allowed": approval.rules().iter().map(ToString::to_string).collect::<Vec<_>>(),
                 "pass": identity.as_ref().map(pass_report),
                 "until": approval.ends_at.map(EndsAt::to_rfc3339),
                 "ruleset": text, "advice": [],
-            })
-        ),
+            });
+            if let Some(on_drop) = on_drop {
+                out["on_drop"] = serde_json::json!(on_drop);
+            }
+            println!("{out}");
+        }
     }
     0
 }
@@ -947,7 +975,10 @@ impl Events for StderrEvents<'_> {
         }
         self.live_shown += 1;
         if self.live_shown <= crate::live_drops::SHOWN {
-            eprintln!("playpen: dropped: {} (not approved)", destination(dest));
+            eprintln!(
+                "playpen: dropped: {} (not approved)",
+                tripwire::destination(dest)
+            );
         } else if self.live_shown == crate::live_drops::SHOWN + 1 {
             eprintln!(
                 "playpen: dropped: more than {} destinations; see the summary at the end",
@@ -963,13 +994,22 @@ impl Events for StderrEvents<'_> {
             );
         }
     }
-}
-
-/// A dropped destination as the live lines write it: `ADDR PROTO port N`,
-/// without the port for protocols other than TCP and UDP.
-fn destination(dest: &crate::ruleset::DroppedDest) -> String {
-    let port = dest.port.map_or_else(String::new, |p| format!(" port {p}"));
-    format!("{} {}{port}", dest.address, dest.protocol)
+    fn tripped(&mut self, tripped_by: &[crate::ruleset::DroppedDest], cut: Option<&sandbox::Cut>) {
+        let on_drop = self.args.on_drop.unwrap_or(OnDrop::Cut);
+        let reason = tripwire::reason(tripped_by, on_drop);
+        match cut {
+            Some(cut) => {
+                self.pipe.send(
+                    "stopping",
+                    &serde_json::json!({"reason":"drop","egress_closed":*cut == sandbox::Cut::Closed}),
+                );
+                eprintln!("playpen: {reason}; {}", stopping(cut));
+            }
+            None => eprintln!(
+                "playpen: {reason}; the firewall now refuses all traffic but loopback, and the command keeps running"
+            ),
+        }
+    }
 }
 
 /// The rest of the notice that the command is being stopped.
@@ -1036,6 +1076,16 @@ fn start_line(c: &Checked, args: &RunArgs, capture: Option<&Path>) -> String {
     } else {
         ""
     };
+    // What is recorded first, then what the first drop does.
+    let on_drop = match args.on_drop {
+        None => "",
+        Some(OnDrop::Cut) => {
+            "; at the first dropped packet the firewall itself refuses all traffic but loopback, and the command runs on (--on-drop cut)"
+        }
+        Some(OnDrop::Stop) => {
+            "; at the first dropped packet the firewall itself refuses all traffic but loopback, and playpen stops the command (--on-drop stop)"
+        }
+    };
     let session = if args.private_tty {
         "; private controlling terminal"
     } else if c.new_session {
@@ -1044,7 +1094,7 @@ fn start_line(c: &Checked, args: &RunArgs, capture: Option<&Path>) -> String {
         ""
     };
     format!(
-        "{line}{capture}{drops}{contacts}{}{session}{}",
+        "{line}{capture}{drops}{contacts}{on_drop}{}{session}{}",
         sockets_clause(c, !args.without_landlock),
         start_notes(c)
     )
@@ -1179,6 +1229,7 @@ fn base_report(args: &RunArgs) -> Report {
         new_session: new_session(args),
         private_tty: args.private_tty,
         live_drops: args.live_drops,
+        on_drop: args.on_drop.map(OnDropReport::new),
     }
 }
 
@@ -1409,7 +1460,8 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         pasta,
         capture: capture.clone(),
         watch: checked.from_pass.map(|p| p.watch),
-        watch_drops: args.events_fd.is_some() || args.live_drops,
+        watch_drops: args.events_fd.is_some() || args.live_drops || args.on_drop.is_some(),
+        on_drop: args.on_drop,
     };
     let outcome = sandbox::run_with_output(&plan, &mut events, stdout_report, args.private_tty);
     report.started_at = events.started_at.map(crate::report::stamp);
@@ -1493,7 +1545,22 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         }
     }
     report.refused_after_end = result.refused_after_end;
+    if let Some(on_drop) = args.on_drop {
+        let seen = tripwire::Observed {
+            drops: report.dropped.as_ref(),
+            live: result.tripped_by.as_deref(),
+            cut_packets: result.cut_packets,
+            refused_after_end: result.refused_after_end,
+        };
+        let (on, after_end) = OnDropReport::observe(on_drop, result.stopped_by_drop, seen);
+        if let Some(cut) = on.egress_cut.as_ref().filter(|_| on.stopped_by_drop) {
+            report.stop_reason = Some(tripwire::reason(&cut.tripped_by, on_drop));
+        }
+        report.on_drop = Some(on);
+        report.refused_after_end = after_end;
+    }
     let code = apply_drop_assertion(&mut report, code, args.fail_on_drop);
+    let code = tripwire::exit_status(report.on_drop.as_ref(), code);
     report.playpen_exit_status = code;
     eprint!("{}", text_summary(&report));
     finish(report_file.as_mut(), &mut report)

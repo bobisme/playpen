@@ -200,6 +200,99 @@ fn run_and_plan_help_list_live_drops() {
 }
 
 #[test]
+fn run_plan_and_rules_help_list_on_drop() {
+    for name in ["run", "plan", "rules"] {
+        let help = json(&invoke(&["help", name, "--format", "json"], None).stdout);
+        let arg = help["arguments"]
+            .as_array()
+            .expect("arguments")
+            .iter()
+            .find(|a| a["long"] == "on-drop")
+            .cloned()
+            .unwrap_or_else(|| panic!("{name}: no --on-drop in {help}"));
+        assert_eq!(arg["takes_value"], true, "{name}");
+        assert_eq!(arg["values"], serde_json::json!(["cut", "stop"]), "{name}");
+        assert_eq!(arg["value_names"], serde_json::json!(["ACTION"]), "{name}");
+        let said = arg["help"].as_str().unwrap_or("");
+        assert!(
+            said.contains("closes all egress") || said.contains("close all egress"),
+            "{name}: {said}"
+        );
+    }
+    let help = json(&invoke(&["help", "run", "--format", "json"], None).stdout);
+    let said = help["arguments"]
+        .as_array()
+        .expect("arguments")
+        .iter()
+        .find(|a| a["long"] == "on-drop")
+        .and_then(|a| a["help"].as_str())
+        .unwrap_or("")
+        .to_owned();
+    // Why it is off by default.
+    for cause in ["mDNS", "LLMNR", "DNS server", "metadata", "IPv6"] {
+        assert!(said.contains(cause), "{cause}: {said}");
+    }
+    assert!(
+        help["examples"]
+            .as_array()
+            .expect("examples")
+            .iter()
+            .any(|e| e.as_str().is_some_and(|e| e.contains("--on-drop stop"))),
+        "{help}"
+    );
+    let workflow = help["workflow"].as_str().unwrap_or("");
+    assert!(
+        workflow.contains("--on-drop stop") && workflow.contains("egress_cut"),
+        "{workflow}"
+    );
+    let text = String::from_utf8(invoke(&["run", "--help"], None).stdout).expect("help");
+    assert!(text.contains("--on-drop <ACTION>"), "{text}");
+}
+
+#[test]
+fn rules_show_the_tripwire_only_with_on_drop() {
+    let rules = |flags: &[&str]| {
+        let out = invoke(
+            &[&["rules", "--allow", "192.0.2.1:443/tcp"][..], flags].concat(),
+            None,
+        );
+        assert!(out.status.success(), "{flags:?}");
+        String::from_utf8(out.stdout).expect("rules")
+    };
+    let plain = rules(&[]);
+    assert!(!plain.contains("add @cut"), "{plain}");
+    assert!(
+        plain.contains("\t\tcounter name \"dropped\"\n\t\treject with icmpx admin-prohibited\n")
+    );
+    let cut = rules(&["--on-drop", "cut"]);
+    assert_eq!(cut, rules(&["--on-drop", "stop"]));
+    assert!(
+        cut.contains("\t\tadd @cut { 0 }\n\t\tcounter name \"dropped\"\n\t\tdrop\n"),
+        "{cut}"
+    );
+    assert!(!cut.contains("reject"), "{cut}");
+    let json_rules = |flags: &[&str]| {
+        json(
+            &invoke(
+                &[
+                    &["rules", "--allow", "192.0.2.1:443/tcp", "--format", "json"][..],
+                    flags,
+                ]
+                .concat(),
+                None,
+            )
+            .stdout,
+        )
+    };
+    let without = json_rules(&[]);
+    assert!(without.get("on_drop").is_none(), "{without}");
+    assert_eq!(without["ruleset"], plain);
+    let with = json_rules(&["--on-drop", "stop"]);
+    assert_eq!(with["on_drop"], "stop");
+    assert_eq!(with["ruleset"], cut);
+}
+
+#[test]
 fn json_run_refusal_is_a_report_even_without_a_file() {
     let out = invoke(
         &["run", "--allow", "invalid", "--json", "--", "false"],

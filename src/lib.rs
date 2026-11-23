@@ -28,3 +28,4 @@ pub mod sockets;
 mod suggest;
 mod terminal_relay;
 pub mod tools;
+pub mod tripwire;

@@ -52,6 +52,13 @@
 //! [`live_drops::INTERVAL`] while the command runs and sends each new
 //! dropped destination on the report pipe as `denied JSON`; P passes it on
 //! ([`Events::denied`]).
+//!
+//! With [`Plan::on_drop`] the ruleset closes all egress by itself at the
+//! first packet it drops (see [`crate::tripwire`]). The first reading that
+//! finds the drop counter above zero also sends `tripped JSON`. P reports
+//! it ([`Events::tripped`]), and with [`OnDrop::Stop`] stops the command as
+//! at the end time: [`CUT`] (the element is there already, so nothing
+//! changes), the notice, SIGTERM, the grace, SIGKILL.
 
 use std::ffi::OsString;
 use std::fs;
@@ -84,7 +91,8 @@ use crate::approval::Approval;
 use crate::live_drops::{self, LiveDrops};
 use crate::pass::{PassWatch, Recheck};
 use crate::resolver::{self, HostEntry};
-use crate::ruleset::{self, DropSummary};
+use crate::ruleset::{self, DropSummary, Instrumentation};
+use crate::tripwire::OnDrop;
 
 /// How long the command gets between SIGTERM and SIGKILL when the approval
 /// ends.
@@ -164,10 +172,14 @@ pub struct Plan {
     /// With `--pass`: the pass file to re-read while the command runs. A
     /// re-read can stop the run, never change the rules.
     pub watch: Option<PassWatch>,
-    /// With `--events-fd` or `--live-drops`: C reads the drop counter every
-    /// [`crate::live_drops::INTERVAL`] while the command runs, and P reports
-    /// each new dropped destination ([`Events::denied`]).
+    /// With `--events-fd`, `--live-drops` or `--on-drop`: C reads the drop
+    /// counter every [`crate::live_drops::INTERVAL`] while the command
+    /// runs, and P reports each new dropped destination
+    /// ([`Events::denied`]).
     pub watch_drops: bool,
+    /// With `--on-drop`: the ruleset closes all egress at the first packet
+    /// it drops, and needs [`Plan::watch_drops`] for P to learn of it.
+    pub on_drop: Option<OnDrop>,
 }
 
 impl Plan {
@@ -175,6 +187,16 @@ impl Plan {
         self.grant_counters
             .min(self.approval.rules().len())
             .min(crate::grant_use::LIMIT)
+    }
+
+    /// What the ruleset of this run holds beyond the approval: P renders
+    /// it, and C verifies it and reads its counters at teardown.
+    fn instrumentation(&self) -> Instrumentation {
+        Instrumentation {
+            grant_counters: self.grant_counter_count(),
+            record_contacts: self.report_contacts,
+            tripwire: self.on_drop.is_some(),
+        }
     }
 }
 
@@ -208,6 +230,15 @@ pub struct RunResult {
     /// With `--report-contacts`: the destinations the command contacted
     /// through a grant, or why they could not be read. `None` without it.
     pub contacts: Option<Result<crate::contacts::Contacted, String>>,
+    /// With `--on-drop`: the destinations a reading found when the cut
+    /// tripped, if a reading did.
+    pub tripped_by: Option<Vec<ruleset::DroppedDest>>,
+    /// True when playpen stopped the command because the cut tripped
+    /// (`--on-drop stop`).
+    pub stopped_by_drop: bool,
+    /// Packets the cut alone refused on their way out; `None` when the
+    /// counter could not be read.
+    pub cut_packets: Option<u64>,
 }
 
 /// Whether egress was closed in the firewall when playpen began to stop
@@ -279,6 +310,13 @@ pub trait Events {
     /// the command ran, for the reason given. Said once; later readings are
     /// still tried.
     fn denied_unreadable(&mut self, _why: &str) {}
+    /// With [`Plan::on_drop`]: a reading found that a dropped packet has
+    /// closed all egress, sent to one of `tripped_by` (empty when the
+    /// reading could not list them). With `stopping`, the command is being
+    /// stopped and egress is closed as it says; without, the command keeps
+    /// running. Said once, and not when the command is being stopped
+    /// already or has ended.
+    fn tripped(&mut self, _tripped_by: &[ruleset::DroppedDest], _stopping: Option<&Cut>) {}
 }
 
 /// Number of threads in this process, from `/proc/self/status`.
@@ -785,9 +823,7 @@ fn run_sandbox(
     };
     let job =
         JobControl::for_run(plan.new_session, private_terminal_requested).map_err(not_started)?;
-    let grant_counters = plan.grant_counter_count();
-    let ruleset_text =
-        ruleset::render_instrumented(&plan.approval, grant_counters, plan.report_contacts);
+    let ruleset_text = ruleset::render_instrumented(&plan.approval, plan.instrumentation());
     let files = SandboxFiles::build(plan);
 
     match fork_checked().map_err(not_started)? {
@@ -944,6 +980,13 @@ struct ParentState {
     denied_error: Option<String>,
     /// The contacted destinations C read at teardown, or why it could not.
     contacts: Option<Result<crate::contacts::Contacted, String>>,
+    /// With `--on-drop`: the destinations C sent when it found the cut
+    /// tripped.
+    tripped: Option<Vec<ruleset::DroppedDest>>,
+    /// The same, until P has acted on the trip.
+    trip_pending: Option<Vec<ruleset::DroppedDest>>,
+    /// The `cut` counter, read by C at teardown.
+    cut_packets: Option<u64>,
 }
 
 impl ParentState {
@@ -957,9 +1000,19 @@ impl ParentState {
                 }
             }
             "deniederr" => self.denied_error = Some(rest.to_owned()),
+            "tripped" if self.tripped.is_none() => {
+                let list: Vec<_> = serde_json::from_str::<Vec<DroppedWire>>(rest)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(DroppedWire::into_dest)
+                    .collect();
+                self.tripped = Some(list.clone());
+                self.trip_pending = Some(list);
+            }
             "cut" => self.cut = Some(Ok(())),
             "cuterr" => self.cut = Some(Err(rest.to_owned())),
             "afterend" => self.refused_after_end = rest.parse().ok(),
+            "cutcount" => self.cut_packets = rest.parse().ok(),
             "fail" => {
                 if self.failure.is_none() {
                     self.failure = Some(rest.to_owned());
@@ -1253,6 +1306,7 @@ fn parent(
     // Phase 3: the command runs.
     let mut shutdown = Shutdown::default();
     let mut stopped_by_pass: Option<String> = None;
+    let mut stopped_by_drop = false;
     let mut terminal_failure: Option<String> = None;
     let mut next_recheck = watch.as_ref().map(|w| Instant::now() + w.interval);
     let mut next_beat = Instant::now();
@@ -1347,6 +1401,24 @@ fn parent(
             events.own_addresses(&std::mem::take(&mut st.own));
         }
         st.report_denied(events);
+        // The firewall has closed all egress at a dropped packet. With
+        // `stop` P stops the command as at the end time; its cut request
+        // changes nothing, but confirms the cut before the notice. Nothing
+        // is said when the command is being stopped already or has ended;
+        // the summary tells.
+        if let Some(tripped_by) = st.trip_pending.take()
+            && shutdown.started.is_none()
+            && st.status.is_none()
+        {
+            if plan.on_drop == Some(OnDrop::Stop) {
+                let cut = cut_egress(&mut st, up_r, &control_w);
+                events.tripped(&tripped_by, Some(&cut));
+                stopped_by_drop = true;
+                stop_after_cut(&cut, st.init, child, &down_w, &mut shutdown);
+            } else {
+                events.tripped(&tripped_by, None);
+            }
+        }
         // W's reports are read before P's own signals. A signal for the
         // whole group is pending here by the time W can have reported it,
         // so a report with no signal of P's own beside it is not a group's.
@@ -1462,7 +1534,9 @@ fn parent(
     };
     Ok(RunResult {
         status,
-        stopped_by_until: shutdown.started.is_some() && stopped_by_pass.is_none(),
+        stopped_by_until: shutdown.started.is_some()
+            && stopped_by_pass.is_none()
+            && !stopped_by_drop,
         stopped_by_pass,
         drops: st
             .drops
@@ -1476,6 +1550,9 @@ fn parent(
             st.contacts
                 .unwrap_or_else(|| Err("the contacted destinations were not reported".into()))
         }),
+        tripped_by: st.tripped,
+        stopped_by_drop,
+        cut_packets: st.cut_packets,
     })
 }
 
@@ -1863,13 +1940,8 @@ fn stage_c(
             .map_err(|e| format!("cannot add {addr} to lo: {e}"))?;
     }
     load_ruleset(&plan.nft, ruleset_text)?;
-    let grant_counters = plan.grant_counter_count();
-    verify_ruleset(
-        &plan.nft,
-        &plan.approval,
-        grant_counters,
-        plan.report_contacts,
-    )?;
+    let with = plan.instrumentation();
+    verify_ruleset(&plan.nft, &plan.approval, with)?;
     // Made now, so that C can watch S and P's control pipe at once later,
     // and a failure stops the run before anything runs.
     let mut chld = SigSet::empty();
@@ -1917,35 +1989,32 @@ fn stage_c(
             exit_now(code);
         }
         ForkResult::Parent { child } => {
-            watch_sandbox(&plan.nft, plan.watch_drops, child, &control_r, &chld, up_w);
+            let live = plan.watch_drops.then(|| LiveDrops::new(with.tripwire));
+            watch_sandbox(&plan.nft, live, child, &control_r, &chld, up_w);
         }
     }
     // S has ended, and with it the command: nothing can look up a name now.
     stub.report(up_w);
-    report_counters(
-        &plan.nft,
-        grant_counters,
-        plan.approval.ends_at.is_some(),
-        plan.report_contacts,
-        up_w,
-    );
+    report_counters(&plan.nft, with, plan.approval.ends_at.is_some(), up_w);
     Ok(())
 }
 
 /// C's work while the command runs: wait for S to end, close all egress in
-/// the firewall when P asks ([`CUT`]), and, with `watch_drops`, read the
-/// drop counter every [`live_drops::INTERVAL`] ([`read_drops_live`]).
+/// the firewall when P asks ([`CUT`]), and, with `live` (for
+/// [`Plan::watch_drops`]), read the drop counter every
+/// [`live_drops::INTERVAL`] ([`read_drops_live`]).
 ///
 /// One `poll` over P's control pipe and C's SIGCHLD, with the next reading
 /// as its timeout; another duty for C while the command runs is one more
 /// descriptor here. C answers every [`CUT`], so P never waits for an
-/// answer that will not come; the element is added once. A reading waits
-/// for `nft` (about 1 ms, about 40 ms when it lists the table with both
-/// drop sets full), and a [`CUT`] that comes meanwhile is answered right
-/// after it.
+/// answer that will not come; the element is added once by C (with
+/// `--on-drop` the ruleset may have added it before, and adding it again
+/// changes nothing). A reading waits for `nft` (about 1 ms, about 40 ms
+/// when it lists the table with both drop sets full), and a [`CUT`] that
+/// comes meanwhile is answered right after it.
 fn watch_sandbox(
     nft: &Path,
-    watch_drops: bool,
+    mut live: Option<LiveDrops>,
     s: Pid,
     control_r: &OwnedFd,
     chld: &SignalFd,
@@ -1955,7 +2024,6 @@ fn watch_sandbox(
     // ends C as well.
     let mut listening = true;
     let mut cut: Option<Result<(), String>> = None;
-    let mut live = watch_drops.then(LiveDrops::default);
     let mut next_reading = Instant::now() + live_drops::INTERVAL;
     loop {
         let timeout = live.as_mut().map_or(PollTimeout::NONE, |live| {
@@ -2023,36 +2091,47 @@ fn watch_sandbox(
 ///
 /// Packets refused by the cut or the time rule are counted in `cut` and
 /// `late`, not in `dropped`, so after the end of egress there is nothing
-/// new to send. A later change that has the ruleset close egress by itself
-/// learns of it here, on the same interval: the packet that does it moves
-/// `dropped`, and the listing of the table has the `cut` set (docs/DESIGN.md,
-/// "Drops while the command runs").
+/// new to send.
+///
+/// With `--on-drop` the ruleset closes egress by itself, and every packet
+/// counted in `dropped` has tripped the cut on its way (see
+/// [`crate::tripwire`]). So the first reading that finds the counter above
+/// zero also sends `tripped JSON`, after the `denied` lines: the
+/// destinations of this reading's listing (the drop sets hold nothing
+/// else once the cut has tripped), at most [`live_drops::SHOWN`] of them,
+/// so that the line stays one write; none when the listing failed. It
+/// does not matter whether C has added the element too.
 fn read_drops_live(nft: &Path, live: &mut LiveDrops, up_w: &OwnedFd) {
-    let fresh = list_dropped_counter(nft)
-        .and_then(|json| live_drops::parse_dropped(&json))
-        .and_then(|packets| {
-            if live.moved(packets) {
-                list_table(nft).and_then(|table| live.fresh(packets, &table))
-            } else {
-                Ok(Vec::new())
-            }
-        });
-    match fresh {
-        Ok(list) => {
-            for dest in list {
-                if let Ok(json) = serde_json::to_string(&dest) {
-                    write_line(up_w, &format!("denied {json}"));
-                }
+    let counter = list_dropped_counter(nft).and_then(|json| live_drops::parse_dropped(&json));
+    let fresh = counter.clone().and_then(|packets| {
+        if live.moved(packets) {
+            list_table(nft).and_then(|table| live.fresh(packets, &table))
+        } else {
+            Ok(Vec::new())
+        }
+    });
+    if let Ok(list) = &fresh {
+        for dest in list {
+            if let Ok(json) = serde_json::to_string(dest) {
+                write_line(up_w, &format!("denied {json}"));
             }
         }
-        Err(why) => {
-            if live.first_failure() {
-                // Short enough to stay one write, and so one line, on the
-                // pipe S and I write to as well.
-                let why: String = why.chars().take(512).collect();
-                write_line(up_w, &format!("deniederr {why}"));
-            }
-        }
+    }
+    if let Ok(packets) = counter
+        && live.tripped(packets)
+    {
+        let list = fresh.as_deref().unwrap_or_default();
+        let shown = &list[..list.len().min(live_drops::SHOWN)];
+        let json = serde_json::to_string(shown).unwrap_or_else(|_| "[]".into());
+        write_line(up_w, &format!("tripped {json}"));
+    }
+    if let Err(why) = fresh
+        && live.first_failure()
+    {
+        // Short enough to stay one write, and so one line, on the pipe S
+        // and I write to as well.
+        let why: String = why.chars().take(512).collect();
+        write_line(up_w, &format!("deniederr {why}"));
     }
 }
 
@@ -2187,24 +2266,16 @@ fn list_table(nft: &Path) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|_| "nft printed non-UTF-8 output".into())
 }
 
-fn verify_ruleset(
-    nft: &Path,
-    approval: &Approval,
-    grant_counters: usize,
-    record_contacts: bool,
-) -> Result<(), String> {
+fn verify_ruleset(nft: &Path, approval: &Approval, with: Instrumentation) -> Result<(), String> {
     let json = list_table(nft).map_err(|e| format!("cannot verify the ruleset: {e}"))?;
-    crate::nft_readback::verify_instrumented(&json, approval, grant_counters, record_contacts)
+    crate::nft_readback::verify_instrumented(&json, approval, with)
         .map_err(|e| format!("the loaded ruleset is not the one playpen built: {e}"))
 }
 
-fn report_counters(
-    nft: &Path,
-    grant_counters: usize,
-    timed: bool,
-    record_contacts: bool,
-    up: &OwnedFd,
-) {
+/// C's teardown lines from one listing of the table: the drops, the
+/// packets refused after the end, the cut's own count, and what `with`
+/// recorded.
+fn report_counters(nft: &Path, with: Instrumentation, timed: bool, up: &OwnedFd) {
     let snapshot = list_table(nft);
     match snapshot
         .as_ref()
@@ -2224,13 +2295,22 @@ fn report_counters(
     {
         write_line(up, &format!("afterend {refused}"));
     }
-    if record_contacts {
+    if with.record_contacts {
         report_contacts(snapshot.as_deref(), up);
     }
-    if grant_counters != 0
+    // The cut's packets alone: with `--on-drop`, the ones refused after the
+    // trip (see `tripwire::OnDropReport::observe`).
+    if let Ok(cut) = snapshot
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|json| live_drops::parse_counter(json, ruleset::CUT_COUNTER))
+    {
+        write_line(up, &format!("cutcount {cut}"));
+    }
+    if with.grant_counters != 0
         && let Ok(snapshot) = snapshot
     {
-        let counters = crate::grant_use::read_packets(&snapshot, grant_counters);
+        let counters = crate::grant_use::read_packets(&snapshot, with.grant_counters);
         let json = serde_json::to_string(&counters).unwrap_or_default();
         write_line(up, &format!("grants {json}"));
     }
@@ -3344,6 +3424,9 @@ mod tests {
             denied: Vec::new(),
             denied_error: None,
             contacts: None,
+            tripped: None,
+            trip_pending: None,
+            cut_packets: None,
         };
         st.handle_line("cuterr nft could not close egress");
         assert_eq!(st.cut, Some(Err("nft could not close egress".into())));
@@ -3403,6 +3486,29 @@ mod tests {
         );
         st.handle_line("lookupserr the DNS stub ended before the end of the run");
         assert!(matches!(st.lookups, Some(Err(_))));
+        st.handle_line("cutcount 37");
+        assert_eq!(st.cut_packets, Some(37));
+    }
+
+    #[test]
+    fn the_first_tripped_line_is_kept_and_acted_on_once() {
+        let mut st = ParentState::default();
+        st.receive(
+            b"tripped [{\"address\":\"198.51.100.9\",\"protocol\":\"udp\",\"port\":9563,\"packets\":1}]\n",
+        );
+        let first = st.trip_pending.take().unwrap_or_default();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].address, "198.51.100.9");
+        assert_eq!(first[0].port, Some(9563));
+        assert_eq!(st.tripped.as_ref(), Some(&first));
+        st.receive(b"tripped []\n");
+        assert!(st.trip_pending.is_none(), "a second line is ignored");
+        assert_eq!(st.tripped, Some(first));
+        // A list that does not parse still says that the cut tripped.
+        let mut st = ParentState::default();
+        st.receive(b"tripped not-json\n");
+        assert_eq!(st.trip_pending, Some(Vec::new()));
+        assert_eq!(st.tripped, Some(Vec::new()));
     }
 
     /// Records what P passes on from C's readings while the command runs.

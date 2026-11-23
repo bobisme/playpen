@@ -259,6 +259,59 @@ record or line. Packets refused after the end of the approval are counted
 apart (`refused_after_end`) and get none. The summary and the report's
 `dropped` are read at the end and are the complete list.
 
+### Close all egress at the first refused packet
+
+By default a refused packet fails only its own connection, and the
+command can still reach every approved destination. When the first
+refused packet means the command is not doing what was reviewed, close
+everything at that packet:
+
+```sh
+playpen run --allow 192.0.2.10:443/tcp --on-drop stop --report run.json -- ./scan
+```
+
+With `--on-drop cut` or `--on-drop stop`, the firewall itself closes all
+egress at the first packet it drops. From the next packet on it refuses
+everything but loopback, in both directions, approved destinations too,
+until the run ends. Nothing polls for this. The packet that trips it is
+dropped without an ICMP error, so UDP still gets "Operation not
+permitted", but a TCP connect to the unapproved destination waits for
+its own timeout instead of failing at once.
+
+With `cut` the command runs on and sees its connections fail, and
+playpen exits with the command's status. With `stop` playpen also stops
+the command, as at the end time: it learns of the trip within about 2
+seconds (it reads the drop counter every 2 seconds), sends `SIGTERM`,
+and kills the command 3 seconds later. A `stop` run whose cut tripped
+never exits 0: if the command exits 0 (from a `SIGTERM` handler, say),
+playpen exits 1. Either way playpen names the destination while the
+command runs:
+
+```text
+playpen: a packet to an unapproved destination was dropped: 198.51.100.7 udp port 53 (--on-drop stop); the firewall now refuses all traffic but loopback; sending SIGTERM to the command (SIGKILL in 3 s)
+```
+
+The report gets `on_drop`, `stopped_by_drop` and `egress_cut`: the
+destinations that tripped it (`tripped_by`) and the packets refused after
+that (`refused`, not counted as dropped). With `stop` it also has the
+`stop_reason`. The option is on the start line, in the plan and in its
+digest; a run without it has none of these. A refused Unix socket or a
+lookup of a name without a `--host` mapping does not trip it.
+
+The option is off by default because ordinary programs trip it with no
+attack at all:
+
+- multicast name lookups: mDNS (224.0.0.251 or ff02::fb, port 5353) and
+  LLMNR (224.0.0.252 or ff02::1:3, port 5355);
+- a client that sends to its own DNS server (8.8.8.8 port 53, say)
+  instead of the sandbox's stub;
+- a cloud SDK that probes the metadata address 169.254.169.254;
+- a client that tries the other address family first, such as IPv6 for a
+  service approved only over IPv4.
+
+Run the command once without the option and read the summary. If its
+list of dropped destinations is empty, the same run will not trip it.
+
 ### Keep a record of what was sent
 
 `--capture FILE` writes a pcap of every packet that crossed the sandbox's
@@ -306,7 +359,9 @@ not `ran`. A
 set holds 1024 destinations of each address family. Each destination's
 `packets` counts flow starts, not volume. Review the list before you use
 it: a later run can need a destination that this run did not use. The
-record is only in the private report.
+record is only in the private report. With `--on-drop` as well, the
+record ends at the first refused packet, because nothing leaves after
+it.
 
 ### Run an HTTP client offline
 
