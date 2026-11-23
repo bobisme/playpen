@@ -410,9 +410,9 @@ fn terminal_check() -> Check {
         name: "terminal input injection (TIOCSTI)",
         ok: true,
         detail: if crate::sandbox::tiocsti_allowed() {
-            "this kernel allows TIOCSTI: the command runs in its own session, without a controlling terminal".into()
+            "this kernel allows TIOCSTI: the default workload has no controlling terminal".into()
         } else {
-            "refused by the kernel (dev.tty.legacy_tiocsti = 0): the command keeps the terminal and job control".into()
+            "refused by the kernel (dev.tty.legacy_tiocsti = 0): the default workload keeps the terminal and job control".into()
         },
     }
 }

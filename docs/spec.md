@@ -28,12 +28,12 @@ If you used v0.1, these will be different:
   hiding (section 4.1).
 - **Standard streams that are network sockets are refused** (UDP and
   TCP, connected or not).
-- **Ctrl-Z stops the whole sandbox**, and `fg` resumes it. On kernels that
-  still allow `TIOCSTI`, the command runs in its own session without a
+- **At the top level, Ctrl-Z stops the whole sandbox**, and `fg` resumes it. On kernels that
+  still allow `TIOCSTI`, the default command runs in its own session without a
   controlling terminal (section 4.1, `--new-session`).
 - **The start line** has new clauses about host sockets, exposed paths and
   the session; **the report** has the new fields `socket_guard`,
-  `exposed`, `display` and `new_session`.
+  `exposed`, `display`, `new_session` and `private_tty`.
 
 ## 1. Purpose and non-goals
 
@@ -143,7 +143,7 @@ playpen run [--allow SPEC]... [--host NAME=ADDR]... [--until RFC3339]
             [--report FILE] -- COMMAND [ARGS...]
 
 SOCKETS = [--expose PATH]... [--display] [--hide PATH]...
-          [--without-landlock] [--new-session]
+          [--without-landlock] [--new-session | --private-tty]
 ```
 
 Runs `COMMAND` (looked up on `PATH`) in the sandbox with the caller's
@@ -340,7 +340,7 @@ the start, stay reachable. Without this option and without Landlock ABI 9,
 
 **`--new-session`**. Run the command in a new session with no controlling
 terminal, so it cannot push input into the caller's terminal with
-`TIOCSTI`. This is automatic when the kernel allows `TIOCSTI` for
+`TIOCSTI`. This is the default when the kernel allows `TIOCSTI` for
 unprivileged processes (`/proc/sys/dev/tty/legacy_tiocsti` is missing or
 not `0`). In this mode playpen passes Ctrl-C (SIGINT), Ctrl-\ (SIGQUIT) and
 resizes (SIGWINCH) from the terminal on to the command's process group,
@@ -355,8 +355,14 @@ prints a note to stderr naming the explicit `--hide` path that was not found.
 A dangling symlink is treated the same way. Command stdout is unchanged.
 Applied after the mount layer and `--expose`.
 
-**Terminal and job control.** With a controlling terminal and without
-`--new-session`, the command stays in
+**`--private-tty`**. Run the workload with a private controlling terminal.
+Start playpen in the foreground with its controlling terminal on stdin, and
+dedicate keyboard input to this run. The workload can open `/dev/tty`, use
+an interactive shell and receive signals forwarded from the playpen PID or
+its process group. Redirected output retains its destination. Terminal
+availability is checked at launch. The plan digest covers `--private-tty`.
+
+**Terminal and job control.** In the default attached mode, the command stays in
 the terminal's foreground process group: Ctrl-C, Ctrl-\, resizes and
 reading from the terminal reach it as they would without playpen, and a
 shell inside (`-- bash -i`) has job control for its own jobs. Ctrl-Z (or
@@ -401,7 +407,8 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   directory only (--without-landlock); sockets elsewhere stay reachable`),
   then `; exposed: PATH, ...` when `--expose` was given, `; display
   exposed: PATH, ...` with `--display`, and `; the command runs in its own
-  session, without a controlling terminal` in a new session;
+  session, without a controlling terminal` in detached mode, or
+  `; private controlling terminal` with `--private-tty`;
 - when the end time is reached: what happened and that SIGKILL follows;
 - with `--pass`, when a re-read finds a harmless edit: `the pass was edited
   (now sha256:...); nothing this run uses changed, so the command continues
@@ -546,7 +553,7 @@ The egress checks, without changing any host setting:
 3. Landlock ABI 9 or later (`FAIL` otherwise, with the same message `run`
    gives);
 4. whether the kernel allows `TIOCSTI` (always `ok`; says whether the
-   command will run in its own session);
+   default command will run in its own session);
 5. a self-test of the real mechanism, run only if 1 to 4 pass: playpen
    runs itself in a sandbox with pasta, with documentation addresses
    (`192.0.2.1`, `192.0.2.2`, `2001:db8::1`, `2001:db8::2`) added to the
@@ -605,7 +612,7 @@ unsupported and exits 1; offline scenarios may still execute.
 The scenario IDs are `offline-command`, `offline-loopback`,
 `network-privileges`, `unix-socket-guard`, `socket-runtime-directory`,
 `egress-filter`, `run-loopback`, `pass-egress`, `gateway-host-loopback`,
-`routed-peer`, and `terminal-pty-input`.
+`routed-peer`, `terminal-pty-input`, and `private-tty-signals`.
 
 The `routed-peer` scenario runs `tests/routed_peer.py` from the trusted source
 against the qualifying executable. It needs Python 3, ip, unshare, curl,
@@ -656,6 +663,7 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `dropped_error` | string or null | why the counters could not be read |
 | `socket_guard` | `"landlock"` or `"mounts_only"` | how host Unix sockets were kept from the command; `"mounts_only"` with `--without-landlock` |
 | `exposed` | array of strings | every exposed path (`--expose` and `--display`), canonical once checked; the `--expose` values as typed when refused |
+| `private_tty` | bool | whether the caller requested a private controlling terminal |
 | `display` | bool | `--display` was given |
 | `new_session` | bool | the command ran (or would have run) in its own session without a controlling terminal |
 
@@ -867,14 +875,16 @@ other processes in its PID namespace. Signal routing depends on the job:
 | --- | --- | --- |
 | No controlling terminal | Workload's current process group | P forwards one copy |
 | `--new-session` (explicit or automatic) | Workload's initial session process group | P forwards one copy |
+| `--private-tty` | Private terminal foreground group | P forwards one copy |
 | Attached to the caller's terminal | Workload PID | A workload still in P's group can receive both the direct and forwarded copies |
 
 The supervisor's controlling terminal determines the default even when
 stdin, stdout and stderr are redirected. In an attached job the kernel
 delivers terminal-generated signals to the foreground group directly. In a
 new session P forwards those signals. Standard signals of the same kind can
-coalesce while pending.
-On SIGTSTP, P asks I to stop every
+coalesce while pending. With a private terminal, a nested foreground job
+receives its keyboard interrupts and stops through that terminal.
+On a top-level SIGTSTP, P asks I to stop every
 process in the sandbox that is not stopped already, then stops itself; on
 SIGCONT it asks I to continue them. P sends I one byte every second; after
 5 seconds without any, I stops the sandbox's processes itself until the

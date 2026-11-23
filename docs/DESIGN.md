@@ -82,7 +82,7 @@ one by one with `--expose`.
 | POSIX shared memory (`/dev/shm`) | files in a host tmpfs | closed: private empty `/dev/shm` | same test |
 | Named pipes (FIFOs), and files a host process reads or watches | yes, if a host process reads them: a sync client, a spooler, a mail drop | open: playpen does not confine files | none possible |
 | Network file systems (NFS, SMB, sshfs and other FUSE mounts) | yes: writing a file sends it | open, except FUSE mounts in the runtime directory (gvfs, the document portal), which the private runtime directory hides; use `--hide` | none |
-| The terminal: `TIOCSTI` (pushing input into the terminal, read by the host shell after playpen exits) | only where the kernel allows it | closed: refused by the kernel when `dev.tty.legacy_tiocsti` is 0; elsewhere the command runs in a new session without a controlling terminal, and `TIOCSTI` needs one | `the_command_cannot_type_into_the_terminal` (both modes; on this machine the kernel refuses in both, so the new-session layer is shown only by `/dev/tty` being unavailable) |
+| The terminal: `TIOCSTI` (pushing input into the terminal, read by the host shell after playpen exits) | only where the kernel allows it | closed: refused by the kernel when `dev.tty.legacy_tiocsti` is 0; elsewhere the default runs the command in a new session without a controlling terminal, and `TIOCSTI` needs one | `the_command_cannot_type_into_the_terminal` (both modes; on this machine the kernel refuses in both, so the new-session layer is shown only by `/dev/tty` being unavailable) |
 | Other terminals of the same user (`/dev/pts/N`) | the command can open them: write text, read keystrokes | open; not a network path (`TIOCSTI` on them needs them to be the controlling terminal) | none |
 | The display server (X11, Wayland) | yes: an X11 client can type into any other window, for example a host terminal | closed by default (the sockets are refused and hidden); `--display` opens it, and the start line says so | `display_exposes_the_wayland_socket_and_is_off_by_default`; `display_works_with_a_real_x_server_and_is_off_by_default` (a private headless X server with a cookie, a real client, with and without Landlock) |
 
@@ -229,7 +229,7 @@ is in the kernel and keeps working throughout.
 unprivileged process push input into its controlling terminal (kernels
 before the `dev.tty.legacy_tiocsti` setting, or with it set to 1), a
 command could queue a shell command for the operator's shell to read after
-playpen exits. There playpen runs the command in a new session (`setsid`
+playpen exits. There the default runs the command in a new session (`setsid`
 in X), with no controlling terminal: `TIOCSTI` needs the terminal to be the
 caller's controlling one. `--new-session` forces this mode. Playpen retains its place in the caller's job.
 PID 1 leaves that group before it forks the command. The supervisor sends
@@ -246,6 +246,26 @@ keeps the workload free to create a session of its own and keeps PID 1 out
 of signals sent by the command to its own group. PID 1 forwards a signal from
 the control pipe to the workload's current group. A sender inside the namespace
 can also signal PID 1.
+
+**Private interactive jobs.** With `--private-tty`, the command leads a
+new session with a private controlling terminal. The supervisor stays in
+the caller's job. PID 1 forwards a signal from the supervisor to the private
+terminal's foreground process group. A signal addressed to the caller's
+whole job takes the same route. The relay copies the initial terminal
+settings and propagates window size changes. It connects terminal-backed
+streams to the private terminal and preserves redirected output.
+
+At the top level, Ctrl-Z lets the outer shell suspend and resume Playpen.
+When an inner shell gives the private terminal to a foreground job, the
+relay passes control characters through to that terminal. Ctrl-Z then
+returns control to the inner shell, including when Playpen's stdout goes
+through an outer pipeline. The relay samples terminal modes and foreground
+ownership every 20 ms, so a key pressed during a mode or job transition
+can follow the previous setting. While the relay is active, host terminal
+output processing is disabled. A sibling pipeline stage writing directly
+to the host terminal may emit a newline without a carriage return. At
+teardown the relay drains pending
+output and restores the caller's terminal settings.
 
 **Attached jobs.** A group signal sent with `kill` can reach both the
 supervisor and the workload. Linux supplies the sender's PID and UID to the
@@ -475,7 +495,7 @@ matter for safety:
 | Abstract Unix sockets of the host | own network namespace; Landlock scope | yes |
 | Host processes' System V IPC, message queues, `/dev/shm` | own IPC namespace, fresh `/dev/mqueue`, private `/dev/shm` | yes |
 | The display server typing into host windows | display sockets refused and hidden unless `--display` | yes |
-| Input pushed into the operator's terminal (`TIOCSTI`) | refused by the kernel (`legacy_tiocsti = 0`), else new session without a controlling terminal | yes (both modes; see the Unix sockets section for what that shows here) |
+| Input pushed into the operator's terminal (`TIOCSTI`) | refused by the kernel (`legacy_tiocsti = 0`), else a separate session with either no controlling terminal or a private one | yes (both modes; see the Unix sockets section for what that shows here) |
 | The command running on while playpen is suspended (Ctrl-Z), unchecked by the end time and the pass re-read | P freezes every process in the sandbox through I before it stops | yes, with a child outside the terminal's process group; the test fails without the freeze |
 | The command running on while playpen is stopped with SIGSTOP (which it cannot catch) or is stuck | I freezes the sandbox after 5 s without a byte from P, until P is heard again | yes (`sigstop_of_playpen_itself_freezes_the_command`: the end time passes while playpen is stopped; the command does not run on, and is stopped when playpen continues) |
 | ptrace of the privileged helper or of playpen | helpers non-dumpable; playpen and other host processes invisible in the PID namespace; Yama ptrace_scope 1 on this machine adds another layer | `/proc/1/mem` and `/proc/1/ns/user` denied |

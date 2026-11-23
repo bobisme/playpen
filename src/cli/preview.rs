@@ -33,7 +33,7 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
             "name_limits": p.name_limited, "coverage": p.coverage,
         })
     });
-    Ok(json!({
+    let mut scope = json!({
         "schema": "playpen.plan.v1",
         "fixture": checked.fixture,
         "fail_on_drop": args.fail_on_drop,
@@ -51,7 +51,12 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
         "display": args.display, "display_paths": paths(&checked.display),
         "socket_guard": if args.without_landlock { "mounts_only" } else { "landlock" },
         "new_session": checked.new_session,
-    }))
+    });
+    // Keep pre-existing plan digests valid for unchanged terminal behavior.
+    if args.private_tty {
+        scope["private_tty"] = json!(true);
+    }
+    Ok(scope)
 }
 
 fn digest(value: &Value) -> hallpass::Digest {

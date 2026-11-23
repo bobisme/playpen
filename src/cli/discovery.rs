@@ -18,6 +18,7 @@ Agent workflow
 pub(super) const RUN: &str = "Examples
   playpen run --no-network -- printf hello
   playpen run --format json --no-network -- printf hello
+  playpen run --no-network --private-tty -- bash -i
   playpen run --allow 192.0.2.10:443/tcp --report run.json -- true
 
 Agent workflow

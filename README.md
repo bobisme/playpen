@@ -93,6 +93,21 @@ giving it a second copy. For automation that allocates a terminal and signals
 the whole group, use `--new-session`. The command keeps its standard streams
 and gives up its controlling terminal.
 
+### Run an interactive shell with single signal delivery
+
+From a foreground terminal, run:
+
+```sh
+playpen run --no-network --private-tty -- bash -i
+```
+
+The shell gets its own controlling terminal for prompts and job control.
+Send a forwarded signal such as SIGTERM or SIGUSR1 to the playpen PID or
+its process group. Either way, the private terminal’s foreground job gets
+one copy. Use this mode when playpen has exclusive use of terminal input.
+For a pipeline with another stage that reads the keyboard, use the default
+terminal behavior.
+
 ### Run with a command-line allow list
 
 ```sh
@@ -259,7 +274,7 @@ requests arrived, and playpen reports which packets it dropped.
 
 | Tested Linux configuration | nftables | pasta | Landlock | Checks that ran |
 | --- | --- | --- | --- | --- |
-| Arch host, 7.2.8-arch1-2 | 1.1.7 | 2026_09_25.df90211 | ABI 10 | All 11 qualification scenarios |
+| Arch host, 7.2.8-arch1-2 | 1.1.7 | 2026_09_25.df90211 | ABI 10 | All 12 qualification scenarios, including private-terminal signal delivery |
 | Isolated Arch guest, 7.1.4-arch1-1 | 1.1.6 | 2026_07_28.f8df3f1 | ABI 9 | Egress doctor, offline command and routed-peer fixture |
 
 The guest had no external network interface. Its test servers ran inside the

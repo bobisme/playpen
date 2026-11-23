@@ -68,3 +68,29 @@ fn pin_is_bound_to_command_and_grants_before_start() {
         assert!(String::from_utf8_lossy(&result.stderr).contains("differs from current scope"));
     }
 }
+
+#[test]
+fn private_tty_changes_the_reviewed_scope_and_conflicts_with_detachment() {
+    let inspect = |flags: &[&str]| {
+        Command::new(BIN)
+            .args(["plan", "--format", "json", "--no-network"])
+            .args(flags)
+            .args(["--", "true"])
+            .output()
+            .expect("plan")
+    };
+    let plan = |flags: &[&str]| {
+        let output = inspect(flags);
+        assert!(output.status.success());
+        serde_json::from_slice::<Value>(&output.stdout).expect("plan JSON")
+    };
+    let shared = plan(&[]);
+    let private = plan(&["--private-tty"]);
+    assert_ne!(shared["digest"], private["digest"]);
+    assert_eq!(private["plan"]["private_tty"], true);
+    assert_eq!(private["plan"]["new_session"], false);
+    let conflict = inspect(&["--private-tty", "--new-session"]);
+    assert_eq!(conflict.status.code(), Some(2));
+    let error: Value = serde_json::from_slice(&conflict.stderr).expect("structured CLI error");
+    assert_eq!(error["error"]["type"], "invalid-arguments");
+}

@@ -37,7 +37,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Write as _;
 use std::net::IpAddr;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -48,13 +48,17 @@ use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::mount::{MsFlags, mount};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::pty::{Winsize, openpty};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::prctl;
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, sigprocmask};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType, socket};
+use nix::sys::termios::tcgetattr;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Gid, Pid, Uid, getgid, getpid, getppid, getuid, pipe2, read};
+use nix::unistd::{
+    ForkResult, Gid, Pid, Uid, getgid, getpgrp, getpid, getppid, getuid, pipe2, read,
+};
 
 use crate::approval::Approval;
 use crate::pass::{PassWatch, Recheck};
@@ -380,6 +384,10 @@ const GO: u8 = b'g';
 /// running, so the end time and the pass are being watched.
 const BEAT: u8 = b'b';
 
+/// P asks I to decide whether a keyboard stop belongs to an inner job or to
+/// the whole playpen invocation.
+const PRIVATE_TSTP: u8 = b'z';
+
 /// How often P tells I that it is running.
 const BEAT_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -429,7 +437,7 @@ pub fn tiocsti_allowed() -> bool {
 /// what the operator can do about it); [`RunError::Failed`] for trouble
 /// afterwards.
 pub fn run(plan: &Plan, events: &mut dyn Events) -> Result<RunResult, RunError> {
-    run_with_output(plan, events, false)
+    run_with_output(plan, events, false, false)
 }
 
 /// Reserve stdout for the final report when requested by the CLI.
@@ -437,13 +445,143 @@ pub(crate) fn run_with_output(
     plan: &Plan,
     events: &mut dyn Events,
     stdout_report: bool,
+    private_terminal_requested: bool,
 ) -> Result<RunResult, RunError> {
-    run_sandbox(plan, events, stdout_report).map_err(|e| match e {
+    run_sandbox(plan, events, stdout_report, private_terminal_requested).map_err(|e| match e {
         RunError::NotStarted(m) => {
             RunError::NotStarted(with_apparmor_hint(m, apparmor_restricts()))
         }
         other @ RunError::Failed(_) => other,
     })
+}
+
+/// Resources for the opt-in private terminal. The relay owns the master side;
+/// the slave stays open in P so it can be inherited through sandbox setup and
+/// closed only after I has reported the command's exit.
+struct PrivateTerminal {
+    relay: crate::terminal_relay::Relay,
+    slave: Option<OwnedFd>,
+    monitor: Option<OwnedFd>,
+    streams: [bool; 3],
+}
+
+#[derive(Clone, Copy)]
+struct PrivateTtyFds {
+    slave: RawFd,
+    master: RawFd,
+}
+
+impl PrivateTerminal {
+    fn prepare(stdout_report: bool) -> Result<Self, String> {
+        let stdin = unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
+        if unsafe { libc::isatty(stdin.as_raw_fd()) } != 1 {
+            return Err("--private-tty needs an interactive terminal on standard input".into());
+        }
+        let host_group = getpgrp();
+        let foreground = unsafe { libc::tcgetpgrp(stdin.as_raw_fd()) };
+        if foreground < 0 || foreground != host_group.as_raw() {
+            return Err(
+                "--private-tty needs to run in the caller terminal's foreground process group"
+                    .into(),
+            );
+        }
+        let host_session = unsafe { libc::tcgetsid(stdin.as_raw_fd()) };
+        if host_session < 0 || unsafe { libc::getsid(0) } != host_session {
+            return Err(
+                "--private-tty standard input is not the caller's controlling terminal".into(),
+            );
+        }
+
+        let mut streams = [true, false, false];
+        for (index, fd) in [libc::STDOUT_FILENO, libc::STDERR_FILENO]
+            .into_iter()
+            .enumerate()
+        {
+            if unsafe { libc::isatty(fd) } != 1 {
+                continue;
+            }
+            if unsafe { libc::tcgetsid(fd) } != host_session
+                || unsafe { libc::tcgetpgrp(fd) } != host_group.as_raw()
+            {
+                return Err(format!(
+                    "--private-tty cannot preserve terminal-connected standard {} on a different terminal",
+                    if index == 0 { "output" } else { "error" }
+                ));
+            }
+            streams[index + 1] = true;
+        }
+        // `run --json` moves stdout to stderr in C before exec. Match that
+        // final descriptor layout so a redirected stderr stays redirected.
+        if stdout_report {
+            streams[1] = streams[2];
+        }
+
+        let termios =
+            tcgetattr(stdin).map_err(|e| format!("cannot read terminal settings: {e}"))?;
+        let mut winsize = std::mem::MaybeUninit::<Winsize>::zeroed();
+        // SAFETY: TIOCGWINSZ writes one `winsize` value to this valid buffer.
+        if unsafe {
+            libc::ioctl(
+                stdin.as_raw_fd(),
+                libc::TIOCGWINSZ as libc::c_ulong,
+                winsize.as_mut_ptr(),
+            )
+        } < 0
+        {
+            return Err(format!("cannot read terminal size: {}", Errno::last()));
+        }
+        // SAFETY: ioctl succeeded and initialized the complete winsize value.
+        let winsize = unsafe { winsize.assume_init() };
+        let pair = openpty(Some(&winsize), Some(&termios))
+            .map_err(|e| format!("cannot create a private terminal: {e}"))?;
+        let slave = pair.slave;
+        // I needs its own-namespace view of the private foreground group.
+        let monitor_raw = unsafe { libc::fcntl(pair.master.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        if monitor_raw < 0 {
+            return Err(format!(
+                "cannot retain private terminal monitor: {}",
+                Errno::last()
+            ));
+        }
+        // SAFETY: fcntl duplicated the live master descriptor into a new fd.
+        let monitor = unsafe { OwnedFd::from_raw_fd(monitor_raw) };
+        // Keep the descriptor through fork, but never let it leak past exec.
+        fcntl(slave.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+            .map_err(|e| format!("cannot protect private terminal descriptor: {e}"))?;
+        fcntl(monitor.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+            .map_err(|e| format!("cannot protect private terminal monitor: {e}"))?;
+        // SAFETY: run_sandbox verified this process is single-threaded before
+        // creating the relay helper.
+        let relay = unsafe { crate::terminal_relay::Relay::start(pair.master) }
+            .map_err(|e| format!("cannot start the private terminal relay: {e}"))?;
+        Ok(Self {
+            relay,
+            slave: Some(slave),
+            monitor: Some(monitor),
+            streams,
+        })
+    }
+
+    fn fds(&self) -> Option<PrivateTtyFds> {
+        Some(PrivateTtyFds {
+            slave: self.slave.as_ref()?.as_raw_fd(),
+            master: self.monitor.as_ref()?.as_raw_fd(),
+        })
+    }
+
+    fn stop(mut self) -> std::io::Result<()> {
+        self.slave.take();
+        self.monitor.take();
+        self.relay.stop()
+    }
+}
+
+impl Drop for PrivateTerminal {
+    fn drop(&mut self) {
+        self.slave.take();
+        self.monitor.take();
+        let _ = self.relay.stop();
+    }
 }
 
 /// True when `kernel.apparmor_restrict_unprivileged_userns` is 1.
@@ -472,6 +610,7 @@ fn run_sandbox(
     plan: &Plan,
     events: &mut dyn Events,
     stdout_report: bool,
+    private_terminal_requested: bool,
 ) -> Result<RunResult, RunError> {
     let not_started = RunError::NotStarted;
     match thread_count() {
@@ -497,6 +636,13 @@ fn run_sandbox(
         .map_err(|e| not_started(format!("cannot block signals: {e}")))?;
     let sigfd = SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)
         .map_err(|e| not_started(format!("cannot create signalfd: {e}")))?;
+    let private_tty = if private_terminal_requested {
+        Some(PrivateTerminal::prepare(stdout_report).map_err(not_started)?)
+    } else {
+        None
+    };
+    let private_fds = private_tty.as_ref().and_then(PrivateTerminal::fds);
+    let tty_streams = private_tty.as_ref().map_or([false; 3], |tty| tty.streams);
     let (up_r, up_w) = pipe2(OFlag::O_CLOEXEC).map_err(|e| not_started(format!("pipe: {e}")))?;
     let (down_r, down_w) =
         pipe2(OFlag::O_CLOEXEC).map_err(|e| not_started(format!("pipe: {e}")))?;
@@ -505,7 +651,8 @@ fn run_sandbox(
         gid: getgid(),
         parent: getpid(),
     };
-    let job = JobControl::for_run(plan.new_session).map_err(not_started)?;
+    let job =
+        JobControl::for_run(plan.new_session, private_terminal_requested).map_err(not_started)?;
     let grant_counters = plan.grant_counter_count();
     let ruleset_text = ruleset::render_instrumented(&plan.approval, grant_counters);
     let files = SandboxFiles::build(plan);
@@ -523,7 +670,17 @@ fn run_sandbox(
                 );
                 exit_now(1);
             }
-            let code = match stage_c(plan, &ids, &ruleset_text, &files, &up_w, &down_r, job) {
+            let code = match stage_c(
+                plan,
+                &ids,
+                &ruleset_text,
+                &files,
+                &up_w,
+                &down_r,
+                job,
+                private_fds,
+                tty_streams,
+            ) {
                 Ok(()) => 0,
                 Err(msg) => {
                     write_line(&up_w, &format!("fail {msg}"));
@@ -535,7 +692,7 @@ fn run_sandbox(
         ForkResult::Parent { child } => {
             drop(up_w);
             drop(down_r);
-            parent(plan, child, &sigfd, &up_r, down_w, events, job)
+            parent(plan, child, &sigfd, &up_r, down_w, events, job, private_tty)
         }
     }
 }
@@ -605,6 +762,7 @@ struct ParentState {
     buf: Vec<u8>,
     failure: Option<String>,
     status_error: Option<String>,
+    private_tstp: Option<bool>,
     init: Option<Pid>,
     started: bool,
     status: Option<CommandStatus>,
@@ -626,6 +784,7 @@ impl ParentState {
             }
             "init" => self.init = rest.parse::<i32>().ok().map(Pid::from_raw),
             "statuserr" => self.status_error = Some(rest.to_owned()),
+            "private-tstp" => self.private_tstp = Some(rest == "outer"),
             "started" => self.started = true,
             "exit" => self.status = rest.parse().ok().map(CommandStatus::Exited),
             "signal" => self.status = rest.parse().ok().map(CommandStatus::Signaled),
@@ -732,6 +891,10 @@ fn wait_readable(fd: &OwnedFd, deadline: Instant) -> bool {
     clippy::too_many_lines,
     reason = "one event loop; splitting it would scatter its state"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parent loop receives the existing supervisor channels and terminal state"
+)]
 fn parent(
     plan: &Plan,
     child: Pid,
@@ -740,6 +903,7 @@ fn parent(
     down_w: OwnedFd,
     events: &mut dyn Events,
     job: JobControl,
+    mut private_tty: Option<PrivateTerminal>,
 ) -> Result<RunResult, RunError> {
     let deadline = plan.approval.ends_at.map(|end| {
         let left = end.at() - time::OffsetDateTime::now_utc();
@@ -815,10 +979,19 @@ fn parent(
     // Phase 3: the command runs.
     let mut shutdown = Shutdown::default();
     let mut stopped_by_pass: Option<String> = None;
+    let mut terminal_failure: Option<String> = None;
     let mut next_recheck = watch.as_ref().map(|w| Instant::now() + w.interval);
     let mut next_beat = Instant::now();
     while !st.eof {
         let now = Instant::now();
+        if let Some(tty) = private_tty.as_mut()
+            && terminal_failure.is_none()
+            && let Err(e) = tty.relay.check()
+        {
+            terminal_failure = Some(format!("private terminal relay failed: {e}"));
+            shutdown.request(now);
+            stop_command(st.init, child, &down_w);
+        }
         // Tell I that P is running and looking at the clock and the pass.
         if now >= next_beat {
             send_byte(&down_w, BEAT);
@@ -882,6 +1055,14 @@ fn parent(
         if up_ready {
             st.pump(up_r);
         }
+        if st.private_tstp.take() == Some(true) {
+            if let Some(tty) = private_tty.as_mut()
+                && let Err(e) = tty.relay.pause()
+            {
+                terminal_failure = Some(format!("cannot pause private terminal relay: {e}"));
+            }
+            suspend(&down_w);
+        }
         if sig_ready {
             while let Ok(Some(info)) = sigfd.read_signal() {
                 let Ok(sig) = Signal::try_from(i32::try_from(info.ssi_signo).unwrap_or(0)) else {
@@ -891,8 +1072,41 @@ fn parent(
                     Signal::SIGCHLD | Signal::SIGTTIN | Signal::SIGTTOU => {}
                     // Signals are read only after "go"; I reads the bytes
                     // once its loop runs, even if they come before that.
-                    Signal::SIGTSTP => suspend(&down_w),
-                    Signal::SIGCONT => send_byte(&down_w, THAW),
+                    Signal::SIGTSTP
+                        if job == JobControl::PrivateTerminal && info.ssi_code == SI_KERNEL =>
+                    {
+                        send_byte(&down_w, PRIVATE_TSTP);
+                    }
+                    Signal::SIGTSTP => {
+                        if let Some(tty) = private_tty.as_mut()
+                            && let Err(e) = tty.relay.pause()
+                        {
+                            terminal_failure =
+                                Some(format!("cannot pause private terminal relay: {e}"));
+                        }
+                        suspend(&down_w);
+                    }
+                    Signal::SIGCONT => {
+                        if let Some(tty) = private_tty.as_mut()
+                            && let Err(e) = tty.relay.resume()
+                        {
+                            terminal_failure =
+                                Some(format!("cannot resume private terminal relay: {e}"));
+                        }
+                        send_byte(&down_w, THAW);
+                    }
+                    Signal::SIGWINCH
+                        if job == JobControl::PrivateTerminal && info.ssi_code == SI_KERNEL =>
+                    {
+                        if let Some(tty) = private_tty.as_mut()
+                            && let Err(e) = tty.relay.resize()
+                        {
+                            terminal_failure = Some(format!("cannot resize private terminal: {e}"));
+                        }
+                    }
+                    Signal::SIGWINCH if job == JobControl::PrivateTerminal => {
+                        pass_on(&down_w, sig);
+                    }
                     // An attached foreground workload receives the terminal's
                     // signal directly. Detached helpers have already left this
                     // group, so P is the single route into a new session.
@@ -901,13 +1115,27 @@ fn parent(
                 }
             }
         }
+        if terminal_failure.is_some() && shutdown.started.is_none() {
+            shutdown.request(Instant::now());
+            stop_command(st.init, child, &down_w);
+        }
     }
     drop(down_w);
     let _ = waitpid(child, None);
+    if let Some(tty) = private_tty.take()
+        && let Err(e) = tty.stop()
+    {
+        terminal_failure = Some(format!(
+            "private terminal output did not drain cleanly: {e}"
+        ));
+    }
     if let Some(p) = pasta {
         p.stop();
     }
     st.launch_result()?;
+    if let Some(error) = terminal_failure {
+        return Err(RunError::Failed(error));
+    }
     let status = match st.status {
         Some(s) => s,
         None if shutdown.killed => CommandStatus::Signaled(Signal::SIGKILL as i32),
@@ -1001,6 +1229,10 @@ fn die_with_parent(parent: Pid) -> Result<(), String> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "C receives the inherited sandbox setup channels and private tty descriptors"
+)]
 fn stage_c(
     plan: &Plan,
     ids: &Ids,
@@ -1009,8 +1241,15 @@ fn stage_c(
     up_w: &OwnedFd,
     down_r: &OwnedFd,
     job: JobControl,
+    private_fds: Option<PrivateTtyFds>,
+    tty_streams: [bool; 3],
 ) -> Result<(), String> {
     die_with_parent(ids.parent)?;
+    if job == JobControl::PrivateTerminal {
+        // Keep the setup process out of the caller's process group before any
+        // later group-directed signal can become pending for the workload.
+        make_process_group()?;
+    }
     unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET).map_err(|e| {
         format!(
             "cannot create a user and network namespace ({e}); run `playpen doctor` to see what is missing"
@@ -1044,7 +1283,7 @@ fn stage_c(
 
     match fork_checked()? {
         ForkResult::Child => {
-            let code = match stage_s(plan, files, up_w, down_r, job) {
+            let code = match stage_s(plan, files, up_w, down_r, job, private_fds, tty_streams) {
                 Ok(()) => 0,
                 Err(msg) => {
                     write_line(up_w, &format!("fail {msg}"));
@@ -1141,13 +1380,26 @@ enum JobControl {
     CallerTerminal,
     PrivateGroup,
     NewSession,
+    PrivateTerminal,
 }
 
 impl JobControl {
-    fn forward(self, child: Pid, sig: Signal) {
+    fn forward(self, child: Pid, sig: Signal, private_fds: Option<PrivateTtyFds>) {
         let target = match self {
             Self::CallerTerminal => child,
             Self::NewSession => Pid::from_raw(-child.as_raw()),
+            Self::PrivateTerminal => {
+                let Some(fds) = private_fds else {
+                    return;
+                };
+                // X owns the private terminal session. I sees the foreground
+                // group number in I's PID namespace and signals it here.
+                let foreground = unsafe { libc::tcgetpgrp(fds.master) };
+                if foreground <= 1 {
+                    return;
+                }
+                Pid::from_raw(-foreground)
+            }
             Self::PrivateGroup => match nix::unistd::getpgid(Some(child)) {
                 // The workload may make its own session or change groups.
                 // Never translate an invisible group or PID 1 to kill(0/-1).
@@ -1158,7 +1410,10 @@ impl JobControl {
         let _ = kill(target, sig);
     }
 
-    fn for_run(new_session: bool) -> Result<Self, String> {
+    fn for_run(new_session: bool, private_tty: bool) -> Result<Self, String> {
+        if private_tty {
+            return Ok(Self::PrivateTerminal);
+        }
         if new_session {
             return Ok(Self::NewSession);
         }
@@ -1192,12 +1447,14 @@ fn stage_s(
     up_w: &OwnedFd,
     down_r: &OwnedFd,
     job: JobControl,
+    private_fds: Option<PrivateTtyFds>,
+    tty_streams: [bool; 3],
 ) -> Result<(), String> {
     prctl::set_pdeathsig(Signal::SIGKILL).map_err(|e| format!("PR_SET_PDEATHSIG: {e}"))?;
     unshare(CloneFlags::CLONE_NEWPID).map_err(|e| format!("cannot create a PID namespace: {e}"))?;
     match fork_checked()? {
         ForkResult::Child => {
-            let code = match stage_i(plan, files, up_w, down_r, job) {
+            let code = match stage_i(plan, files, up_w, down_r, job, private_fds, tty_streams) {
                 Ok(code) => code,
                 Err(msg) => {
                     write_line(up_w, &format!("fail {msg}"));
@@ -1222,9 +1479,15 @@ fn stage_i(
     up_w: &OwnedFd,
     down_r: &OwnedFd,
     job: JobControl,
+    private_fds: Option<PrivateTtyFds>,
+    tty_streams: [bool; 3],
 ) -> Result<i32, String> {
     prctl::set_pdeathsig(Signal::SIGKILL).map_err(|e| format!("PR_SET_PDEATHSIG: {e}"))?;
-    if job != JobControl::CallerTerminal {
+    if job == JobControl::PrivateTerminal {
+        if private_fds.is_none() {
+            return Err("private terminal descriptors were lost".into());
+        }
+    } else if job != JobControl::CallerTerminal {
         // Leave the caller's group before forking the workload. A
         // group signal during setup must never become pending in the workload.
         make_process_group()?;
@@ -1262,7 +1525,7 @@ fn stage_i(
         ForkResult::Child => {
             drop(err_r);
             drop(sigfd);
-            let msg = match stage_x(plan, job) {
+            let msg = match stage_x(plan, job, private_fds, tty_streams) {
                 Ok(never) => match never {},
                 Err(msg) => msg,
             };
@@ -1290,7 +1553,7 @@ fn stage_i(
         return Err(String::from_utf8_lossy(&msg).trim().to_owned());
     }
     write_line(up_w, "started");
-    match init_loop(child, job, &sigfd, up_w, down_r) {
+    match init_loop(child, job, private_fds, &sigfd, up_w, down_r) {
         Ok(code) => Ok(code),
         Err(msg) => {
             write_line(up_w, &format!("statuserr {msg}"));
@@ -1308,6 +1571,7 @@ fn stage_i(
 fn init_loop(
     child: Pid,
     job: JobControl,
+    private_fds: Option<PrivateTtyFds>,
     sigfd: &SignalFd,
     up_w: &OwnedFd,
     down_r: &OwnedFd,
@@ -1373,9 +1637,21 @@ fn init_loop(
                                 asked = false;
                                 thaw(&mut frozen);
                             }
+                            PRIVATE_TSTP if job == JobControl::PrivateTerminal => {
+                                let fds =
+                                    private_fds.ok_or("private terminal descriptors were lost")?;
+                                let foreground = unsafe { libc::tcgetpgrp(fds.master) };
+                                let session = unsafe { libc::tcgetsid(fds.master) };
+                                if foreground > 1 && session > 1 && foreground != session {
+                                    let _ = kill(Pid::from_raw(-foreground), Signal::SIGTSTP);
+                                    write_line(up_w, "private-tstp inner");
+                                } else {
+                                    write_line(up_w, "private-tstp outer");
+                                }
+                            }
                             _ => {
                                 if let Some(sig) = byte_signal(byte) {
-                                    job.forward(child, sig);
+                                    job.forward(child, sig, private_fds);
                                 }
                             }
                         }
@@ -1406,7 +1682,7 @@ fn init_loop(
             // Job-control signals are P's business (freeze and thaw).
             // A sender outside this PID namespace shows as pid 0.
             if FORWARDED.contains(&sig) && info.ssi_code != SI_KERNEL && info.ssi_pid > 1 {
-                job.forward(child, sig);
+                job.forward(child, sig, private_fds);
             }
             continue;
         }
@@ -1851,7 +2127,12 @@ fn join_private_group() -> Result<(), String> {
     joined.map_err(|e| format!("cannot join the workload process group: {e}"))
 }
 
-fn stage_x(plan: &Plan, job: JobControl) -> Result<std::convert::Infallible, String> {
+fn stage_x(
+    plan: &Plan,
+    job: JobControl,
+    private_fds: Option<PrivateTtyFds>,
+    tty_streams: [bool; 3],
+) -> Result<std::convert::Infallible, String> {
     // Outer namespace ids of the caller: 0 inside the outer namespace maps
     // to the caller's uid/gid on the host. Read them from the outer map.
     let uid_map = fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
@@ -1885,6 +2166,35 @@ fn stage_x(plan: &Plan, job: JobControl) -> Result<std::convert::Infallible, Str
         }
         JobControl::PrivateGroup => join_private_group()?,
         JobControl::CallerTerminal => {}
+        JobControl::PrivateTerminal => {
+            let fds = private_fds.ok_or("private terminal descriptors were lost")?;
+            nix::unistd::setsid()
+                .map_err(|e| format!("cannot create private terminal session: {e}"))?;
+            if unsafe { libc::ioctl(fds.slave, libc::TIOCSCTTY as libc::c_ulong, 0) } < 0 {
+                return Err(format!(
+                    "cannot make the private terminal controlling: {}",
+                    Errno::last()
+                ));
+            }
+            let group = getpgrp().as_raw();
+            if unsafe { libc::tcsetpgrp(fds.slave, group) } != 0 {
+                return Err(format!(
+                    "cannot assign the private terminal: {}",
+                    Errno::last()
+                ));
+            }
+            for (fd, attach) in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
+                .into_iter()
+                .zip(tty_streams)
+            {
+                if attach && unsafe { libc::dup2(fds.slave, fd) } < 0 {
+                    return Err(format!(
+                        "cannot attach standard stream to private terminal: {}",
+                        Errno::last()
+                    ));
+                }
+            }
+        }
     }
     sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
         .map_err(|e| format!("cannot unblock signals: {e}"))?;
@@ -2057,10 +2367,10 @@ mod tests {
         for sig in FORWARDED {
             let b = signal_byte(sig);
             assert_eq!(b.and_then(byte_signal), Some(sig));
-            assert!(b.is_some_and(|b| ![FREEZE, THAW, GO].contains(&b)));
+            assert!(b.is_some_and(|b| ![FREEZE, THAW, GO, PRIVATE_TSTP].contains(&b)));
         }
         assert_eq!(signal_byte(Signal::SIGKILL), None);
-        for b in [0, 8, FREEZE, THAW, GO] {
+        for b in [0, 8, FREEZE, THAW, GO, PRIVATE_TSTP] {
             assert_eq!(byte_signal(b), None);
         }
     }
@@ -2071,6 +2381,7 @@ mod tests {
             buf: Vec::new(),
             failure: None,
             status_error: None,
+            private_tstp: None,
             init: None,
             started: false,
             status: None,
@@ -2082,6 +2393,9 @@ mod tests {
         st.handle_line("ready");
         st.handle_line("init 4321");
         st.handle_line("started");
+        st.handle_line("private-tstp outer");
+        assert_eq!(st.private_tstp, Some(true));
+        st.private_tstp = None;
         st.handle_line("exit 7");
         st.handle_line(r#"drops {"packets":2,"destinations":[],"destinations_truncated":true}"#);
         assert!(st.ready && st.started);

@@ -315,6 +315,21 @@ impl Pty {
         if !Path::new("/usr/bin/bash").exists() && !Path::new("/bin/bash").exists() {
             return None;
         }
+        let (master, slave) = Self::pair();
+        let mut cmd = Command::new("bash");
+        cmd.args(["--norc", "--noprofile", "-i"])
+            .env("PS1", "$ ")
+            .env("TERM", "dumb")
+            .env("P", BIN);
+        let mut pty = Self::spawn(master, &slave, &mut cmd);
+        drop(slave);
+        pty.expect("$ ");
+        Some(pty)
+    }
+
+    fn pair() -> (File, OwnedFd) {
+        use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
         let size = libc::winsize {
@@ -338,15 +353,17 @@ impl Pty {
         // SAFETY: both descriptors were just returned by openpty and are
         // owned by nothing else.
         let (master, slave) = unsafe { (File::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-        let clone = |fd: &OwnedFd| Stdio::from(fd.try_clone().unwrap_or_else(|e| panic!("{e}")));
-        let mut cmd = Command::new("bash");
-        cmd.args(["--norc", "--noprofile", "-i"])
-            .env("PS1", "$ ")
-            .env("TERM", "dumb")
-            .env("P", BIN)
-            .stdin(clone(&slave))
-            .stdout(clone(&slave))
-            .stderr(clone(&slave));
+        fcntl(&master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).expect("close PTY master on exec");
+        fcntl(&slave, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+            .expect("close original PTY slave on exec");
+        (master, slave)
+    }
+
+    fn spawn(master: File, slave: &OwnedFd, cmd: &mut Command) -> Self {
+        let clone = |fd: &OwnedFd| Stdio::from(fd.try_clone().expect("duplicate PTY slave"));
+        cmd.stdin(clone(slave))
+            .stdout(clone(slave))
+            .stderr(clone(slave));
         // SAFETY: setsid and ioctl are async-signal-safe; the hook makes
         // the pseudo-terminal the shell's controlling terminal.
         unsafe {
@@ -358,15 +375,12 @@ impl Pty {
             });
         }
         let child = cmd.spawn().unwrap_or_else(|e| panic!("{e}"));
-        drop(slave);
-        let mut pty = Self {
+        Self {
             master,
             child,
             seen: Vec::new(),
             at: 0,
-        };
-        pty.expect("$ ");
-        Some(pty)
+        }
     }
 
     fn send(&mut self, s: &str) {
@@ -685,5 +699,338 @@ fn attached_pid_and_new_session_group_signals_have_one_delivery() {
         kill(Pid::from_raw(pgid), Signal::SIGTERM).expect("finish the counter");
         t.expect(r#"{"usr1":4}"#);
         assert_eq!(t.status(), "0");
+    }
+}
+
+#[test]
+fn private_tty_opens_a_controlling_terminal_and_preserves_redirected_stdout() {
+    require_pty!(t);
+    t.send("output=$(mktemp); before=$(stty -g)\n");
+    t.expect("$ ");
+    t.send(
+        r#"$P run --no-network --private-tty -- sh -c 'test ! -t 1 || exit 41; printf "tty-%s\n" private >/dev/tty || exit 42; IFS= read -r value </dev/tty || exit 43; printf "file-%s\n" "$value"' >"$output"
+"#,
+    );
+    t.expect("tty-private\r\n");
+    t.send("redirected\n");
+    t.expect("$ ");
+    assert_eq!(t.status(), "0");
+    t.expect("$ ");
+    t.send(
+        r#"if test "$(cat "$output")" = "file-"redirected && test "$(stty -g)" = "$before"; then echo restored-"and-separated"; fi; rm -f "$output"
+"#,
+    );
+    t.expect("restored-and-separated\r\n");
+}
+
+#[test]
+fn private_tty_delivers_each_supervisor_and_group_signal_once() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::{Pid, getpgid};
+
+    require_pty!(t);
+    t.send(
+        r#"sh -c 'echo pt"y-pid=$$"; exec "$1" run --no-network --private-tty -- "$1" probe signals' wrapper "$P"
+"#,
+    );
+    t.expect("pty-pid=");
+    let pid: i32 = t.expect("\n").trim().parse().expect("wrapper PID");
+    let wrapper = Pid::from_raw(pid);
+    assert_eq!(
+        getpgid(Some(wrapper)).expect("wrapper process group"),
+        wrapper
+    );
+    t.expect("ready\r\n");
+    for target in [wrapper, Pid::from_raw(-pid)] {
+        for _ in 0..4 {
+            kill(target, Signal::SIGUSR1).expect("signal private test job");
+            assert!(!t.expect("usr1\r\n").contains("command exited"));
+            let additional = t.quiet_for(Duration::from_millis(200));
+            assert!(
+                !additional.contains("usr1"),
+                "duplicate receipt for {target:?}: {additional:?}"
+            );
+        }
+    }
+    kill(wrapper, Signal::SIGTERM).expect("finish counted probe");
+    t.expect(r#"{"usr1":8}"#);
+    t.expect("$ ");
+    assert_eq!(t.status(), "0");
+}
+
+#[test]
+fn private_tty_outer_stop_freezes_detached_descendant_until_fg() {
+    require_pty!(t);
+    // The detached descendant is outside the private terminal's session.
+    // Its redirected stderr bypasses the relay, so an idle master alone
+    // cannot make a live writer look frozen.
+    let pulse = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("private-tty-freeze-{}", std::process::id()));
+    let shell_path = pulse.to_string_lossy().replace('\'', "'\\''");
+    let pulse_count = || {
+        std::fs::metadata(&pulse)
+            .expect("redirected pulse file")
+            .len()
+    };
+    t.send(&format!(
+        r#"$P run --no-network --private-tty -- sh -c 'trap "kill -STOP $$" TSTP; setsid sh -c "while :; do echo private-\"tick\"; printf . >&2; sleep 0.1; done" & while :; do if IFS= read -r value </dev/tty && test "$value" = quit; then exit 0; fi; done' 2>'{shell_path}'
+"#,
+    ));
+    t.expect("private-tick\r\n");
+    t.send("\x1a");
+    t.expect("Stopped");
+    t.expect("$ ");
+    let _ = t.quiet_for(Duration::from_millis(250));
+    let frozen = pulse_count();
+    assert!(frozen > 0, "the redirected writer never started");
+    let _ = t.quiet_for(Duration::from_millis(400));
+    assert_eq!(pulse_count(), frozen, "detached writer kept running");
+    t.send("fg\n");
+    t.expect("private-tick\r\n");
+    let _ = t.quiet_for(Duration::from_millis(200));
+    assert!(pulse_count() > frozen, "detached writer failed to resume");
+    t.send("quit\n");
+    t.expect("$ ");
+    assert_eq!(t.status(), "0");
+    std::fs::remove_file(pulse).expect("remove redirected pulse file");
+}
+
+#[test]
+fn private_tty_inner_bash_controls_a_pipeline() {
+    require_pty!(t);
+    t.send("$P run --no-network --private-tty -- bash --norc --noprofile -i\n");
+    t.expect("host Unix sockets");
+    t.expect("$ ");
+    t.send("sleep 30 | sh -c 'echo pipe-\"ready\"; cat'\n");
+    t.expect("pipe-ready\r\n");
+    t.send("\x1a");
+    t.expect("Stopped");
+    t.expect("$ ");
+    t.send("bg\n");
+    t.expect("$ ");
+    assert_eq!(t.status(), "0");
+    t.expect("$ ");
+    t.send("if test -n \"$(jobs -pr)\"; then echo pipeline-\"running\"; fi\n");
+    t.expect("pipeline-running\r\n");
+    t.expect("$ ");
+    t.send("fg\n");
+    t.expect("sleep 30");
+    t.send("\x03");
+    t.expect("$ ");
+    assert_eq!(t.status(), "130");
+    t.expect("$ ");
+    t.send("echo inner-\"still-live\"; exit 0\n");
+    t.expect("inner-still-live\r\n");
+    t.expect("command exited with status 0");
+    t.expect("$ ");
+    assert_eq!(t.status(), "0");
+}
+
+#[test]
+fn private_tty_resizes_and_restores_the_outer_terminal_after_interrupt() {
+    require_pty!(t);
+    t.send("before=$(stty -g)\n");
+    t.expect("$ ");
+    t.send(
+        r#"$P run --no-network --private-tty -- sh -c 'trap "stty size </dev/tty" WINCH; printf "resize-%s\n" ready; while :; do sleep 0.1; done'
+"#,
+    );
+    t.expect("resize-ready\r\n");
+    t.set_size(41, 103);
+    t.expect("41 103\r\n");
+    t.send("\x03");
+    t.expect("$ ");
+    assert_eq!(t.status(), "130");
+    t.expect("$ ");
+    t.send("if test \"$(stty -g)\" = \"$before\"; then echo tty-\"restored\"; fi\n");
+    t.expect("tty-restored\r\n");
+}
+
+#[test]
+fn private_tty_refuses_non_terminal_input_before_starting() {
+    require_sandbox!();
+    let out = Command::new(BIN)
+        .args([
+            "run",
+            "--no-network",
+            "--private-tty",
+            "--",
+            "echo",
+            "unexpected-marker",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("launch playpen");
+    let err = text(&out.stderr);
+    assert!(matches!(out.status.code(), Some(1 | 2)), "{err}");
+    assert!(
+        err.contains("terminal") && err.contains("nothing was run"),
+        "{err}"
+    );
+    assert!(out.stdout.is_empty(), "{}", text(&out.stdout));
+}
+
+#[test]
+fn private_tty_inner_job_control_keeps_the_outer_output_pipeline_running() {
+    require_pty!(t);
+    t.send("set -o pipefail\n");
+    t.expect("$ ");
+    t.send("$P run --private-tty --no-network -- env 'PS1=private-test> ' bash --norc --noprofile -i | cat\n");
+    t.expect("host Unix sockets");
+    t.expect("private-test> ");
+    t.send("sleep 30 | sh -c 'echo nested-\"pipeline-ready\"; cat'\n");
+    t.expect("nested-pipeline-ready");
+    t.read_for(Duration::from_millis(100));
+    t.send("\x1a");
+    let stopped = t.expect("Stopped");
+    assert!(!stopped.contains("command exited"), "{stopped:?}");
+    t.expect("private-test> ");
+    t.send("bg\n");
+    t.expect("private-test> ");
+    t.send("echo bg-\"status=$?\" >&2\n");
+    t.expect("bg-status=0\r\n");
+    t.expect("private-test> ");
+    t.send("if test -n \"$(jobs -pr)\"; then echo nested-\"job-running\" >&2; fi\n");
+    t.expect("nested-job-running\r\n");
+    t.expect("private-test> ");
+    t.send("fg\n");
+    // Bash prints the fg command line on stdout. Do not wait for that
+    // line, since a stopped cat would hide the final output witness too.
+    t.read_for(Duration::from_millis(150));
+    t.send("\x03");
+    t.expect("private-test> ");
+    t.send("echo fg-\"status=$?\" >&2\n");
+    t.expect("fg-status=130\r\n");
+    t.expect("private-test> ");
+    // This marker originates on the inner shell's stdout, which reaches
+    // the host only through the outer pipeline's cat.
+    t.send("echo through-\"outer-cat\"\n");
+    t.expect("through-outer-cat");
+    t.expect("private-test> ");
+    t.send("exit 0\n");
+    t.expect("command exited with status 0");
+    t.expect("$ ");
+    assert_eq!(t.status(), "0");
+    t.expect("$ ");
+    t.send("if test -z \"$(jobs -sp)\"; then echo outer-\"jobs-clear\"; fi\n");
+    t.expect("outer-jobs-clear\r\n");
+}
+
+#[test]
+fn private_tty_drains_the_last_output_before_reporting_exit() {
+    require_pty!(t);
+    t.send("$P run --private-tty --no-network -- sh -c 'printf \"BE%sGIN\\n\" -; head -c 98304 /dev/zero | tr \"\\000\" x; printf \"FIN%sISH\\n\" -; exit 23'\n");
+    t.expect("BE-GIN\r\n");
+    let payload = t.expect("FIN-ISH\r\n");
+    assert_eq!(payload.len(), 98_304, "wrong final PTY byte count");
+    assert!(payload.bytes().all(|byte| byte == b'x'));
+    t.expect("command exited with status 23");
+    t.expect("$ ");
+    assert_eq!(t.status(), "23");
+}
+
+#[test]
+fn private_tty_signals_foreground_pipeline_after_its_leader_exits() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    require_pty!(t);
+    t.send("sh -c 'echo wrap\"per=$$\"; exec \"$1\" run --no-network --private-tty -- bash --norc --noprofile -i' wrapper \"$P\"\n");
+    t.expect("wrapper=");
+    let wrapper = Pid::from_raw(t.expect("\n").trim().parse().expect("wrapper PID"));
+    t.expect("host Unix sockets");
+    t.expect("$ ");
+    // Bash reaps the first pipeline stage while the second still owns the tty.
+    // The surviving stage acknowledges readiness only once the leader is gone.
+    t.send(r#"true | sh -c 'read -r pid comm state ppid pgid rest < /proc/self/stat; while test -d /proc/$pgid; do sleep 0.02; done; trap "echo signal-\"received\"; exit 0" USR1; echo leader-"gone"; while :; do read -r input </dev/tty; done'
+"#);
+    t.expect("leader-gone\r\n");
+    kill(wrapper, Signal::SIGUSR1).expect("signal wrapper");
+    t.expect("signal-received\r\n");
+    t.expect("$ ");
+    t.send("exit 0\n");
+    t.expect("command exited with status 0");
+    t.expect("$ ");
+    assert_eq!(t.status(), "0");
+}
+
+#[test]
+fn private_tty_restores_mode_when_session_leader_is_killed() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    require_sandbox!();
+    // Retain the slave in the test process, outside Playpen's session, so
+    // the terminal settings remain observable after its leader dies.
+    let (master, slave) = Pty::pair();
+    let mode = || {
+        // SAFETY: the retained slave is live and tcgetattr initializes the
+        // struct on success. Compare the public fields, not struct padding.
+        let mut settings = std::mem::MaybeUninit::<libc::termios>::uninit();
+        unsafe {
+            assert_eq!(libc::tcgetattr(slave.as_raw_fd(), settings.as_mut_ptr()), 0);
+            let settings = settings.assume_init();
+            (
+                [
+                    settings.c_iflag,
+                    settings.c_oflag,
+                    settings.c_cflag,
+                    settings.c_lflag,
+                ],
+                settings.c_line,
+                settings.c_cc,
+                [
+                    libc::cfgetispeed(&raw const settings),
+                    libc::cfgetospeed(&raw const settings),
+                ],
+            )
+        }
+    };
+    let before = mode();
+    let mut cmd = Command::new(BIN);
+    cmd.args([
+        "run",
+        "--no-network",
+        "--private-tty",
+        "--",
+        "sh",
+        "-c",
+        "echo kill-test-ready; exec sleep 30",
+    ]);
+    let mut t = Pty::spawn(master, &slave, &mut cmd);
+    t.expect("kill-test-ready");
+    let ready_deadline = Instant::now() + Duration::from_secs(2);
+    while mode() == before {
+        assert!(
+            Instant::now() < ready_deadline,
+            "the relay never entered raw mode"
+        );
+        t.read_for(Duration::from_millis(20));
+    }
+
+    t.child.kill().expect("send SIGKILL to the session leader");
+    let wait_deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = t.child.try_wait().expect("wait for session leader") {
+            break status;
+        }
+        assert!(
+            Instant::now() < wait_deadline,
+            "session leader did not exit"
+        );
+        t.read_for(Duration::from_millis(20));
+    };
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+    let restore_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let actual = mode();
+        if actual == before {
+            break;
+        }
+        assert!(
+            Instant::now() < restore_deadline,
+            "terminal mode left changed after leader SIGKILL: before {before:?}, after {actual:?}"
+        );
+        t.read_for(Duration::from_millis(20));
     }
 }

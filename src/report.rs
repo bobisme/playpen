@@ -109,6 +109,8 @@ pub struct Report {
     /// True when the command ran in its own session without a controlling
     /// terminal (`--new-session`, or a kernel that allows `TIOCSTI`).
     pub new_session: bool,
+    /// True when a private controlling terminal was requested.
+    pub private_tty: bool,
 }
 
 /// Explicit allowlist for reports intended to be shared.
@@ -279,6 +281,7 @@ mod tests {
             exposed: vec![],
             display: false,
             new_session: false,
+            private_tty: false,
         }
     }
 

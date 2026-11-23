@@ -149,6 +149,21 @@ const SCENARIOS: &[Scenario] = &[
             "cargo and cached integration-test dependencies",
         ],
     },
+    Scenario {
+        id: "private-tty-signals",
+        mode: "offline",
+        check: ScenarioCheck::IntegrationTest {
+            suite: "terminal",
+            test: "private_tty_delivers_each_supervisor_and_group_signal_once",
+        },
+        prerequisites: &[
+            "user namespaces available to this user",
+            "working nft executable",
+            "Landlock ABI 9 or later",
+            "bash and a working pseudoterminal",
+            "cargo and cached integration-test dependencies",
+        ],
+    },
 ];
 
 #[derive(Debug, Serialize)]

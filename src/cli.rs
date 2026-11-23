@@ -222,6 +222,10 @@ struct RunArgs {
     /// cannot open /dev/tty.
     #[arg(help_heading = "Host access", long)]
     new_session: bool,
+    /// Give the command a private controlling terminal with job control and one
+    /// signal route. Requires foreground terminal stdin dedicated to this run.
+    #[arg(help_heading = "Host access", long, conflicts_with = "new_session")]
+    private_tty: bool,
     /// Write lifecycle JSON lines to an inherited pipe above stderr.
     #[arg(help_heading = "Launch and reporting", long, value_name = "FD")]
     events_fd: Option<i32>,
@@ -741,9 +745,11 @@ fn sockets_clause(c: &Checked, landlock: bool) -> String {
     out
 }
 
-fn start_line(c: &Checked, network: bool, landlock: bool, new_session: bool) -> String {
+fn start_line(c: &Checked, network: bool, landlock: bool, private_tty: bool) -> String {
     let line = start_line_net(c, network);
-    let session = if new_session {
+    let session = if private_tty {
+        "; private controlling terminal"
+    } else if c.new_session {
         "; the command runs in its own session, without a controlling terminal"
     } else {
         ""
@@ -840,12 +846,13 @@ fn base_report(args: &RunArgs) -> Report {
             .collect(),
         display: args.display,
         new_session: new_session(args),
+        private_tty: args.private_tty,
     }
 }
 
-/// Whether the command gets its own session.
+/// Whether the workload runs without a controlling terminal.
 fn new_session(args: &RunArgs) -> bool {
-    args.new_session || sandbox::tiocsti_allowed()
+    !args.private_tty && (args.new_session || sandbox::tiocsti_allowed())
 }
 
 fn write_report(
@@ -1014,7 +1021,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
             &checked,
             !args.no_network,
             !args.without_landlock,
-            checked.new_session,
+            args.private_tty,
         ),
         until: report.until.clone(),
     };
@@ -1043,7 +1050,8 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         pasta,
         watch: checked.from_pass.map(|p| p.watch),
     };
-    let result = match sandbox::run_with_output(&plan, &mut events, stdout_report) {
+    let result = match sandbox::run_with_output(&plan, &mut events, stdout_report, args.private_tty)
+    {
         Ok(r) => r,
         Err(e @ RunError::NotStarted(_)) => {
             return fail(

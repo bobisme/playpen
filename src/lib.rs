@@ -21,4 +21,5 @@ pub mod resolver;
 pub mod ruleset;
 pub mod sandbox;
 pub mod sockets;
+mod terminal_relay;
 pub mod tools;
