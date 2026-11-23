@@ -255,11 +255,11 @@ fn pass_destinations_are_reachable_and_nothing_else_and_the_report_names_the_pas
     assert!(!reached(&r, "[2001:db8::1]:9302/tcp"));
 
     // The start line names the pass and says nothing about ceilings.
-    let start = err
-        .lines()
-        .find(|l| l.contains("allowing only"))
-        .unwrap_or_default();
-    assert!(start.contains("under pass test-pass-1"), "{start}");
+    let start = start_line(&err);
+    assert!(
+        start.contains("playpen:   under pass test-pass-1"),
+        "{start}"
+    );
     assert!(
         start.contains("owner \"Pat Owner, Example Corp\""),
         "{start}"
@@ -1198,11 +1198,14 @@ fn getent(stdout: &str, name: &str) -> Vec<String> {
         .collect()
 }
 
-fn start_line(stderr: &str) -> &str {
-    stderr
-        .lines()
-        .find(|l| l.contains("allowing only"))
-        .unwrap_or_default()
+/// The start line without its NOTE lines: the first line and the
+/// `playpen:   ` clause lines after it.
+fn start_line(stderr: &str) -> String {
+    let mut lines = stderr.lines().skip_while(|l| !l.contains("allowing only"));
+    let first = lines.next().unwrap_or_default().to_owned();
+    lines
+        .take_while(|l| l.starts_with("playpen:   "))
+        .fold(first, |acc, l| format!("{acc}\n{l}"))
 }
 
 fn on_path(tool: &str) -> bool {
@@ -1271,7 +1274,7 @@ wait",
     let start = start_line(&err);
     assert!(
         start.contains(
-            "(no DNS, names app.example.test=192.0.2.1 (pass: web), sip.example.test=192.0.2.2 (pass: sip); lookups recorded)"
+            "\nplaypen:   no DNS, names app.example.test=192.0.2.1 (pass: web), sip.example.test=192.0.2.2 (pass: sip); lookups recorded\n"
         ),
         "{start}"
     );
@@ -1360,7 +1363,7 @@ fn pass_hosts_follow_only_an_explicit_host_wins_and_a_shared_name_gets_both() {
     let start = start_line(&err);
     assert!(
         start.contains(
-            "names app.example.test=192.0.2.2, sip.example.test=192.0.2.2 (pass: sip); --host app.example.test replaces app.example.test=192.0.2.1 (pass: web); lookups recorded)"
+            "names app.example.test=192.0.2.2, sip.example.test=192.0.2.2 (pass: sip); --host app.example.test replaces app.example.test=192.0.2.1 (pass: web); lookups recorded\n"
         ),
         "{start}"
     );

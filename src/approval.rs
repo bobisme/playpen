@@ -205,16 +205,18 @@ impl Net {
             (
                 IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0)),
                 96,
-                "IPv4-mapped IPv6 (write the IPv4 address instead)",
+                "IPv4-mapped IPv6",
             ),
         ];
         for &(addr, prefix, what) in forbidden {
             let bad = Self { addr, prefix };
             if self.overlaps(bad) {
-                let extra = if what == "loopback" {
-                    "; loopback inside the sandbox is always allowed and the host's loopback cannot be approved"
-                } else {
-                    ""
+                let extra = match what {
+                    "loopback" => {
+                        "; loopback inside the sandbox is always allowed and the host's loopback cannot be approved"
+                    }
+                    "IPv4-mapped IPv6" => "; write the IPv4 address instead",
+                    _ => "",
                 };
                 return Err(SpecError::new(format!(
                     "{self} includes {what} addresses, which cannot be approved{extra}"
@@ -495,12 +497,14 @@ fn parse_v6(text: &str) -> Result<IpAddr, SpecError> {
 /// # Errors
 /// When the text is not a plain literal address.
 pub fn parse_literal_addr(text: &str) -> Result<IpAddr, SpecError> {
-    let inner = text
-        .strip_prefix('[')
-        .and_then(|t| t.strip_suffix(']'))
-        .unwrap_or(text);
+    let bracketed = text.strip_prefix('[').and_then(|t| t.strip_suffix(']'));
+    let inner = bracketed.unwrap_or(text);
     if inner.contains(':') {
         parse_v6(inner)
+    } else if bracketed.is_some() {
+        Err(SpecError::new(format!(
+            "{text} has brackets around an IPv4 address; brackets are for IPv6 only, so write {inner}"
+        )))
     } else {
         parse_v4(inner).map(IpAddr::V4)
     }
@@ -750,7 +754,11 @@ mod tests {
         assert!(refused("[::1]:443/tcp").contains("loopback"));
         assert!(refused("[ff02::1]:443/udp").contains("multicast"));
         assert!(refused("[fe80::1]:443/tcp").contains("link-local"));
-        assert!(refused("[::ffff:192.0.2.1]:443/tcp").contains("IPv4-mapped"));
+        let mapped = refused("[::ffff:192.0.2.1]:443/tcp");
+        assert!(
+            mapped.contains("includes IPv4-mapped IPv6 addresses, which cannot be approved; write the IPv4 address instead"),
+            "{mapped}"
+        );
     }
 
     #[test]
@@ -784,6 +792,7 @@ mod tests {
         assert!(parse_literal_addr("[2001:db8::5]").is_ok());
         assert!(parse_literal_addr("2001:db8::5").is_ok());
         assert!(parse_literal_addr("192.0.2.05").is_err());
+        assert!(parse_literal_addr("[192.0.2.5]").is_err());
         assert!(parse_literal_addr("example.test").is_err());
     }
 

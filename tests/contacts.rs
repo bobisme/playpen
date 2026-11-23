@@ -262,7 +262,7 @@ fn wide_run(dir: &Path, report_path: &Path) -> Vec<(String, u64)> {
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     assert!(
-        stderr.contains("; contacted destinations recorded"),
+        stderr.contains("\nplaypen:   contacted destinations recorded"),
         "{stderr}"
     );
     assert!(
@@ -598,7 +598,7 @@ fn contacts_count_flow_starts_beside_grant_use_in_both_families() {
     assert_eq!(report["grant_use"]["grants"][0]["packets"], 3, "{report}");
     assert_eq!(report["grant_use"]["grants"][1]["packets"], 3, "{report}");
     assert!(
-        stderr.contains("; contacted destinations recorded"),
+        stderr.contains("\nplaypen:   contacted destinations recorded"),
         "{stderr}"
     );
     assert!(

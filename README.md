@@ -140,12 +140,30 @@ playpen run --allow 192.0.2.10:443/tcp \
 `--pass` and `--allow` cannot be combined: an `--allow` beside a pass would
 add a destination the owner did not approve.
 
+Just before the command starts, playpen prints the start line on stderr.
+The first line is short. Each further clause group has its own line
+starting `playpen:   `, so a log filtered by the `playpen:` prefix keeps
+all of them:
+
+```text
+playpen: allowing only 192.0.2.10:443/tcp with no time limit; everything else is dropped
+playpen:   no DNS, names app.example.test=192.0.2.10; lookups recorded
+playpen:   host Unix sockets: none reachable
+```
+
+`--allow` accepts a link-local address, because you typed it, and a pass
+does not. When an allowed grant covers the cloud metadata address
+169.254.169.254 or fd00:ec2::254 on a TCP port, playpen adds a NOTE line
+that a command reaching it may read this machine's cloud credentials.
+Playpen cannot run inside playpen, or inside another sandbox that locks its
+mounts; it stops with "cannot make mounts private: EPERM".
+
 The command also cannot reach daemons on the host through their Unix
 sockets: a host daemon has the host's network (a session bus, a container
 engine, an SSH or browser automation agent). The command's runtime
 directory (`$XDG_RUNTIME_DIR`) is a fresh, empty, private one; `/tmp` is
 the host's. Bring a socket back deliberately with `--expose`; graphical
-programs need `--display`. Both are listed on the start line and in the
+programs need `--display`. Both are listed on the start line (`--hide` paths too) and in the
 report:
 
 ```console

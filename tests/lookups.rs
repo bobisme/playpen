@@ -147,7 +147,10 @@ fn an_unmapped_lookup_fails_at_once_and_is_listed_once() {
     assert_eq!(json["lookups"]["truncated"], false);
     assert!(json["lookups_error"].is_null());
     let err = text(&out.stderr);
-    assert!(err.contains("(no DNS; lookups recorded)"), "{err}");
+    assert!(
+        err.contains("\nplaypen:   no DNS; lookups recorded\n"),
+        "{err}"
+    );
     assert!(
         err.contains("playpen: The command looked up names that have no --host mapping:\n"),
         "{err}"

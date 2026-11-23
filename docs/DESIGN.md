@@ -597,6 +597,25 @@ namespace code is unchanged except that the supervisor (P) holds a
 `PassWatch` and calls it on a timer. Nothing about the start-up order or
 the ruleset changes.
 
+**Link-local and the cloud metadata address.** A pass refuses link-local
+addresses, and `--allow` accepts them. A pass is an owner's written
+approval, held to the hallpass rules, which an operator cannot bend. A
+`--allow` is typed by the operator, who then chose it. Because 169.254.169.254
+(and fd00:ec2::254) hold cloud credentials, the start line prints a NOTE when
+any allowed grant covers one on a TCP port; "covers" means the grant's
+network contains the address, so a `/16` does too. The `--allow` is not
+refused: a refusal would hide a legitimate choice, and the NOTE puts the risk
+in front of the operator.
+
+**The start line is one short line plus clause lines.** With a pass the
+line passed 600 characters, which a CI log shows badly. The first line has
+the grants, the end time and "everything else is dropped". Every other
+clause group has its own line prefixed `playpen:   `, so a filter on the
+`playpen:` prefix keeps all of them. The wording of the clauses is
+unchanged, and the JSON report is not affected. `--hide` paths are listed
+like `--expose` paths; the file of `--capture` is hidden too but left out,
+because the `packet capture:` clause already names it.
+
 **`--pass` and `--allow` cannot be combined.** The point of a pass is that
 every reachable destination is one the owner put in writing. An `--allow`
 beside it would add a destination nobody approved, and the report would

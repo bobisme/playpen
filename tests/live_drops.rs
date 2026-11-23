@@ -297,7 +297,9 @@ fn a_denied_destination_is_reported_once_while_the_command_runs() {
         "{context}"
     );
     assert!(
-        err.contains("; dropped destinations printed while the command runs (the first 8);"),
+        err.contains(
+            "\nplaypen:   dropped destinations printed while the command runs (the first 8)\n"
+        ),
         "{err}"
     );
 
@@ -463,14 +465,27 @@ fn a_run_without_drops_has_unchanged_output() {
         let f = start(&dir, &args).finish(&dir);
         let err = f.err();
         assert_eq!(f.code, Some(0), "{err}");
-        let lines: Vec<&str> = f.stderr.iter().map(|(_, l)| l.as_str()).collect();
+        let all: Vec<&str> = f.stderr.iter().map(|(_, l)| l.as_str()).collect();
+        // The start line's clause lines come after its first line.
+        let clauses: Vec<&str> = all
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with("playpen:   "))
+            .collect();
+        let lines: Vec<&str> = all
+            .iter()
+            .copied()
+            .filter(|l| !l.starts_with("playpen:   "))
+            .collect();
         assert_eq!(lines.len(), 3, "{err}");
         assert!(
             lines[0].starts_with("playpen: no network, loopback only"),
             "{err}"
         );
         assert_eq!(
-            lines[0].contains("dropped destinations printed while the command runs"),
+            clauses
+                .iter()
+                .any(|l| l.contains("dropped destinations printed while the command runs")),
             live,
             "{err}"
         );

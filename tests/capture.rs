@@ -276,9 +276,14 @@ fn the_capture_holds_the_approved_exchange_and_nothing_to_the_denied_address() {
     assert_eq!(report["outcome"], "ran", "{report}");
     let canonical = std::fs::canonicalize(&pcap).unwrap_or_default();
     assert!(
-        stderr.contains(&format!("; packet capture: {}", canonical.display())),
+        stderr.contains(&format!(
+            "\nplaypen:   packet capture: {}",
+            canonical.display()
+        )),
         "{stderr}"
     );
+    // The capture file is hidden, but the start line lists it only once.
+    assert!(!stderr.contains("hidden:"), "{stderr}");
     // Inside, the capture file is /dev/null: the command cannot change it.
     assert!(
         text(&out.stdout).contains("capture-hidden"),

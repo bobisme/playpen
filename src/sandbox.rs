@@ -2431,6 +2431,19 @@ fn stage_s(
 
 // ---------------------------------------------------------------- I ----
 
+/// The refusal when the mounts cannot be made private. With EPERM the
+/// usual cause is a sandbox around playpen whose mounts are locked, so the
+/// message says so.
+fn mounts_private_error(e: Errno) -> String {
+    if e == Errno::EPERM {
+        format!(
+            "cannot make mounts private: {e}; playpen cannot run inside playpen, or inside another sandbox that locks its mounts"
+        )
+    } else {
+        format!("cannot make mounts private: {e}")
+    }
+}
+
 fn stage_i(
     plan: &Plan,
     files: &SandboxFiles,
@@ -2462,7 +2475,7 @@ fn stage_i(
         MsFlags::MS_REC | MsFlags::MS_PRIVATE,
         None::<&str>,
     )
-    .map_err(|e| format!("cannot make mounts private: {e}"))?;
+    .map_err(mounts_private_error)?;
     mount(
         Some("proc"),
         "/proc",

@@ -40,6 +40,15 @@ pub fn parse_host(text: &str) -> Result<HostEntry, SpecError> {
             "{name:?} is not a plain host name (letters, digits, '-' and '.', at most 253 characters)"
         )));
     }
+    if let Some(v4) = addr
+        .strip_prefix('[')
+        .and_then(|a| a.strip_suffix(']'))
+        .filter(|a| !a.contains(':'))
+    {
+        return Err(wrap(format!(
+            "brackets are for IPv6 addresses only; write {name}={v4}"
+        )));
+    }
     let addr = parse_literal_addr(addr).map_err(|e| wrap(e.to_string()))?;
     Ok(HostEntry {
         name: name.to_ascii_lowercase(),
@@ -157,6 +166,10 @@ mod tests {
         let h = parse_host("Example.Test=192.0.2.10").unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(h.name, "example.test");
         assert!(parse_host("example.test=[2001:db8::10]").is_ok());
+        let err = parse_host("a.test=[192.0.2.1]")
+            .err()
+            .map_or_else(String::new, |e| e.to_string());
+        assert!(err.contains("write a.test=192.0.2.1"), "{err}");
         assert!(parse_host("example.test").is_err());
         assert!(parse_host("example.test=other.test").is_err());
         assert!(parse_host("bad name=192.0.2.1").is_err());

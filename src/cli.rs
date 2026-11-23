@@ -1056,15 +1056,20 @@ fn paths(list: &[PathBuf]) -> String {
         .join(", ")
 }
 
-/// What the start line says about host Unix sockets.
-fn sockets_clause(c: &Checked, landlock: bool) -> String {
-    let mut out = if landlock {
-        String::from("; host Unix sockets: none reachable")
-    } else {
+/// The clause groups about host Unix sockets and paths, one per line:
+/// the socket guard, `--expose`, `--hide`, and the display sockets.
+///
+/// `--capture` adds its file to the hidden paths, but that file is not
+/// listed under `hidden:`. The `packet capture:` clause already names it,
+/// and the operator did not ask to hide it.
+fn sockets_clauses(c: &Checked, args: &RunArgs) -> Vec<String> {
+    let mut out = vec![if args.without_landlock {
         String::from(
-            "; host Unix sockets: hidden under /run, /tmp, /var/tmp and the runtime directory only (--without-landlock); sockets elsewhere stay reachable",
+            "host Unix sockets: hidden under /run, /tmp, /var/tmp and the runtime directory only (--without-landlock); sockets elsewhere stay reachable",
         )
-    };
+    } else {
+        String::from("host Unix sockets: none reachable")
+    }];
     let other: Vec<PathBuf> = c
         .exposed
         .iter()
@@ -1072,61 +1077,99 @@ fn sockets_clause(c: &Checked, landlock: bool) -> String {
         .cloned()
         .collect();
     if !other.is_empty() {
-        out.push_str("; exposed: ");
-        out.push_str(&paths(&other));
+        out.push(format!("exposed: {}", paths(&other)));
+    }
+    if !args.hide.is_empty() {
+        out.push(format!("hidden: {}", paths(&args.hide)));
     }
     if !c.display.is_empty() {
-        out.push_str("; display exposed: ");
-        out.push_str(&paths(&c.display));
+        out.push(format!("display exposed: {}", paths(&c.display)));
     }
     out
 }
 
+/// The start line: a short first line, then one `playpen:   ` line for each
+/// further clause group, then the NOTE lines. A CI log filtered by the
+/// `playpen:` prefix keeps every line.
 fn start_line(c: &Checked, args: &RunArgs, capture: Option<&Path>) -> String {
-    let line = start_line_net(c, !args.no_network);
-    let capture = capture.map_or_else(String::new, |p| {
-        format!("; packet capture: {}", p.display())
-    });
-    let drops = if args.live_drops {
-        format!(
-            "; dropped destinations printed while the command runs (the first {})",
+    let mut lines = start_line_net(c, !args.no_network);
+    if let Some(p) = capture {
+        lines.push(format!("packet capture: {}", p.display()));
+    }
+    if args.live_drops {
+        lines.push(format!(
+            "dropped destinations printed while the command runs (the first {})",
             crate::live_drops::SHOWN
-        )
-    } else {
-        String::new()
-    };
-    let contacts = if args.report_contacts {
-        "; contacted destinations recorded"
-    } else {
-        ""
-    };
+        ));
+    }
+    if args.report_contacts {
+        lines.push("contacted destinations recorded".to_owned());
+    }
     // What is recorded first, then what the first drop does.
-    let on_drop = match args.on_drop {
-        None => "",
-        Some(OnDrop::Cut) => {
-            "; at the first dropped packet the firewall itself refuses all traffic but loopback, and the command runs on (--on-drop cut)"
-        }
-        Some(OnDrop::Stop) => {
-            "; at the first dropped packet the firewall itself refuses all traffic but loopback, and playpen stops the command (--on-drop stop)"
-        }
-    };
-    let session = if args.private_tty {
-        "; private controlling terminal"
+    match args.on_drop {
+        None => {}
+        Some(OnDrop::Cut) => lines.push(
+            "at the first dropped packet the firewall itself refuses all traffic but loopback, and the command runs on (--on-drop cut)".to_owned(),
+        ),
+        Some(OnDrop::Stop) => lines.push(
+            "at the first dropped packet the firewall itself refuses all traffic but loopback, and playpen stops the command (--on-drop stop)".to_owned(),
+        ),
+    }
+    if args.private_tty {
+        lines.push("private controlling terminal".to_owned());
     } else if c.new_session {
-        "; the command runs in its own session, without a controlling terminal"
-    } else {
-        ""
-    };
-    format!(
-        "{line}{capture}{drops}{contacts}{on_drop}{}{session}{}",
-        sockets_clause(c, !args.without_landlock),
-        start_notes(c)
-    )
+        lines
+            .push("the command runs in its own session, without a controlling terminal".to_owned());
+    }
+    lines.extend(sockets_clauses(c, args));
+    let mut out = lines.remove(0);
+    for line in lines {
+        let _ = write!(out, "\n{CLAUSE_PREFIX}{line}");
+    }
+    out.push_str(&start_notes(c));
+    out
+}
+
+/// The prefix of each start-line clause after the first line.
+const CLAUSE_PREFIX: &str = "playpen:   ";
+
+/// The cloud instance metadata addresses (AWS, GCP, Azure and others use the
+/// IPv4 one; AWS also serves the IPv6 one).
+const METADATA_ADDRS: [IpAddr; 2] = [
+    IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254)),
+    IpAddr::V6(std::net::Ipv6Addr::new(
+        0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254,
+    )),
+];
+
+/// The NOTE for each cloud metadata address that a grant covers.
+///
+/// A grant covers the address when its network contains it and it allows
+/// TCP on some port. `--allow` takes link-local addresses because the
+/// operator typed them; a pass does not (docs/DESIGN.md).
+fn metadata_notes(approval: &Approval) -> Vec<String> {
+    METADATA_ADDRS
+        .into_iter()
+        .filter(|a| {
+            approval
+                .rules()
+                .iter()
+                .any(|r| r.proto == crate::approval::Proto::Tcp && r.covers_addr(*a))
+        })
+        .map(|a| {
+            format!(
+                "NOTE: the allow list includes {a}, the cloud instance metadata address; a command that reaches it may read this machine's cloud credentials"
+            )
+        })
+        .collect()
 }
 
 /// The NOTE lines that follow the start line, each starting with a newline.
 fn start_notes(c: &Checked) -> String {
     let mut out = String::new();
+    for note in metadata_notes(&c.approval) {
+        let _ = write!(out, "\nplaypen: {note}");
+    }
     for note in c.from_pass.iter().flat_map(pass::unenforced_notes) {
         let _ = write!(out, "\nplaypen: NOTE: {note}");
     }
@@ -1136,7 +1179,9 @@ fn start_notes(c: &Checked) -> String {
     out
 }
 
-fn start_line_net(c: &Checked, network: bool) -> String {
+/// The first line (the grant summary, the end time and what is dropped),
+/// then the pass identity, the names and the end-of-egress clauses.
+fn start_line_net(c: &Checked, network: bool) -> Vec<String> {
     let until = c.approval.ends_at.map_or_else(
         || "with no time limit".to_owned(),
         |e| format!("until {}", e.to_rfc3339()),
@@ -1151,25 +1196,35 @@ fn start_line_net(c: &Checked, network: bool) -> String {
         let _ = write!(names, "; --host {} replaces {r}", r.entry.name);
     }
     names.push_str("; lookups recorded");
-    if network {
-        let list: Vec<String> = c.approval.rules().iter().map(ToString::to_string).collect();
-        let (under, hint) = c.from_pass.as_ref().map_or_else(Default::default, |p| {
-            let hint = if c.pass_hosts.is_some() {
-                // The notes below say why a name is not mapped.
-                String::new()
-            } else {
-                hostname_hint(&p.named, &c.hosts, true)
-            };
-            (format!("under {}: ", pass::describe(&p.identity)), hint)
-        });
-        format!(
-            "playpen: {under}allowing only {} {until} ({names}); everything else is dropped{}{hint}",
-            list.join(", "),
-            ends_clause(c)
-        )
-    } else {
-        format!("playpen: no network, loopback only, {until} ({names})")
+    if !network {
+        return vec![
+            format!("playpen: no network, loopback only, {until}"),
+            names,
+        ];
     }
+    let list: Vec<String> = c.approval.rules().iter().map(ToString::to_string).collect();
+    let mut lines = vec![format!(
+        "playpen: allowing only {} {until}; everything else is dropped",
+        list.join(", ")
+    )];
+    if let Some(p) = &c.from_pass {
+        lines.push(format!("under {}", pass::describe(&p.identity)));
+    }
+    lines.push(names);
+    if let Some(p) = &c.from_pass {
+        // With --pass-hosts the notes below say why a name is not mapped.
+        if c.pass_hosts.is_none() {
+            let hint = hostname_hint(&p.named, &c.hosts, true);
+            if let Some(hint) = hint.strip_prefix("; ") {
+                lines.push(hint.to_owned());
+            }
+        }
+    }
+    let ends = ends_clause(c);
+    if let Some(ends) = ends.strip_prefix("; ") {
+        lines.push(ends.to_owned());
+    }
+    lines
 }
 
 /// What the start line says about the end of egress in the firewall: from

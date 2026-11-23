@@ -1582,15 +1582,16 @@ fn the_time_rule_is_read_back_in_any_time_zone() {
         .output()
         .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(out.status.code(), Some(0), "{zone}: {}", text(&out.stderr));
-        // The clause follows the DNS parenthesis and precedes the sockets.
+        // The clause follows the DNS line and precedes the sockets.
         let err = text(&out.stderr);
-        let line = err.lines().next().unwrap_or("");
+        let lines: Vec<&str> = err.lines().collect();
         assert!(
-            line.starts_with("playpen: allowing only 192.0.2.1:9101/tcp until ")
-                && line.contains(" (no DNS; lookups recorded); everything else is dropped; from ")
-                && line.ends_with(
-                    " the firewall itself refuses all traffic but loopback; host Unix sockets: none reachable"
-                ),
+            lines[0].starts_with("playpen: allowing only 192.0.2.1:9101/tcp until ")
+                && lines[0].ends_with("; everything else is dropped")
+                && lines[1] == "playpen:   no DNS; lookups recorded"
+                && lines[2].starts_with("playpen:   from ")
+                && lines[2].ends_with(" the firewall itself refuses all traffic but loopback")
+                && lines[3] == "playpen:   host Unix sockets: none reachable",
             "{zone}: {err}"
         );
     }
@@ -2304,4 +2305,127 @@ fn json_run_uses_one_report_stream_and_preserves_child_exit_status() {
         serde_json::from_slice(&std::fs::read(file).expect("report")).expect("JSON");
     assert_eq!(saved["exit_code"], 7);
     assert!(saved["advice"].is_array());
+}
+
+/// A playpen started inside playpen cannot make its mounts private; the
+/// message says why.
+#[test]
+fn playpen_inside_playpen_says_it_cannot_run_there() {
+    require_sandbox!();
+    let out = run(&[
+        "run",
+        "--no-network",
+        "--",
+        BIN,
+        "run",
+        "--no-network",
+        "--",
+        "true",
+    ]);
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("cannot make mounts private: EPERM")
+            && err.contains(
+                "; playpen cannot run inside playpen, or inside another sandbox that locks its mounts; nothing was run"
+            ),
+        "{err}"
+    );
+    assert_ne!(out.status.code(), Some(0), "{err}");
+}
+
+/// The first line is short; each further clause group has its own line
+/// with the `playpen:   ` prefix, hidden paths included.
+#[test]
+fn the_start_line_is_a_short_first_line_and_one_line_per_clause() {
+    require_sandbox!();
+    let dir = tmpdir("start-lines");
+    let hidden = dir.join("secret");
+    let _ = std::fs::create_dir_all(&hidden);
+    let report = dir.join("report.json");
+    let out = run(&[
+        "run",
+        "--lo-addr",
+        "192.0.2.1",
+        "--allow",
+        "192.0.2.1:9101/tcp",
+        "--host",
+        "a.test=192.0.2.1",
+        "--hide",
+        hidden.to_str().unwrap_or(""),
+        "--report-contacts",
+        "--report",
+        report.to_str().unwrap_or(""),
+        "--",
+        "true",
+    ]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(
+        lines[0],
+        "playpen: allowing only 192.0.2.1:9101/tcp with no time limit; everything else is dropped",
+        "{err}"
+    );
+    assert_eq!(
+        lines[1..5],
+        [
+            "playpen:   no DNS, names a.test=192.0.2.1; lookups recorded",
+            "playpen:   contacted destinations recorded",
+            "playpen:   host Unix sockets: none reachable",
+            &format!("playpen:   hidden: {}", hidden.display()),
+        ],
+        "{err}"
+    );
+}
+
+/// A grant that covers a cloud metadata address gets a NOTE; others do not.
+#[test]
+fn an_allow_that_covers_the_cloud_metadata_address_prints_a_note() {
+    require_sandbox!();
+    let note = |a: &str| {
+        format!(
+            "playpen: NOTE: the allow list includes {a}, the cloud instance metadata address; a command that reaches it may read this machine's cloud credentials"
+        )
+    };
+    let v6 = run(&["run", "--allow", "[fd00:ec2::/32]:80/tcp", "--", "true"]);
+    assert!(
+        text(&v6.stderr).contains(&note("fd00:ec2::254")),
+        "{}",
+        text(&v6.stderr)
+    );
+    for (spec, expected) in [
+        ("169.254.169.254:80/tcp", true),
+        ("169.254.0.0/16:80/tcp", true),
+        ("169.254.169.254:1-65535/tcp", true),
+        ("169.254.169.254:80/udp", false),
+        ("169.254.169.253:80/tcp", false),
+        ("192.0.2.1:80/tcp", false),
+    ] {
+        let out = run(&["run", "--allow", spec, "--", "true"]);
+        let err = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{spec}: {err}");
+        assert_eq!(
+            err.contains(&note("169.254.169.254")),
+            expected,
+            "{spec}: {err}"
+        );
+    }
+}
+
+/// Brackets around an IPv4 address are refused in `--host`; IPv6 keeps them.
+#[test]
+fn host_refuses_brackets_around_ipv4() {
+    let out = run(&[
+        "run",
+        "--allow",
+        "192.0.2.1:9101/tcp",
+        "--host",
+        "a.test=[192.0.2.1]",
+        "--",
+        "true",
+    ]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("write a.test=192.0.2.1"), "{err}");
+    assert!(err.contains("nothing was run"), "{err}");
 }

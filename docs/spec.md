@@ -299,6 +299,16 @@ message saying why:
   broadcast address, or IPv6 link-local (`fe80::/10`) addresses;
 - anything with whitespace, control characters or non-ASCII.
 
+IPv4 link-local addresses (`169.254.0.0/16`) are accepted, because the
+operator typed them; a pass refuses them. A pass is an owner's written
+approval and is held to the hallpass rules, while `--allow` is the
+operator's own choice. When an allowed grant covers a cloud instance
+metadata address (169.254.169.254 or fd00:ec2::254) on some TCP port, the
+start line is followed by `playpen: NOTE: the allow list includes ADDR, the
+cloud instance metadata address; a command that reaches it may read this
+machine's cloud credentials`. A grant covers the address when its network
+contains it, so `169.254.0.0/16:80/tcp` does.
+
 **`--no-network`**. No pasta: the sandbox has only `lo`. Cannot be combined
 with `--allow`.
 
@@ -311,7 +321,8 @@ lookups" below). `NAME` is a host name (labels of
 letters, digits and `-`, not starting or ending with `-`, at most 63
 characters per label and 253 in all, not all digits); it is lower-cased.
 `ADDR` is a literal address, as strict as in `--allow`, with or without
-brackets for IPv6. `ADDR` must be covered by some `--allow` rule (any port
+brackets for IPv6. Brackets around an IPv4 address are refused: the message
+says to write `NAME=192.0.2.1`. `ADDR` must be covered by some `--allow` rule (any port
 or protocol), otherwise playpen refuses; the network and broadcast
 addresses of a listed network (section 6.1) are not covered. With `--pass`, `ADDR` must be in
 the address or network of a destination in use (after `--only`), for at
@@ -660,38 +671,52 @@ report in every format. Keep stdout and stderr separate when parsing JSON.
 
 The supervisor’s human-readable diagnostics on stderr include the following messages.
 
-- just before the command starts, one line: `allowing only SPECS until TIME
-  (no DNS[, names NAME=ADDR, ...]; lookups recorded); everything else is
-  dropped`, with
+- just before the command starts, the start line. The first line is short:
+  `allowing only SPECS until TIME; everything else is dropped`, with
   `with no time limit` when there is no `--until`; with `--no-network`:
-  `no network, loopback only, ...`. With `--pass` the line starts `under
-  pass ID ("NAME", owner "OWNER", sha256:DIGEST, window ends TIME,
-  destinations LABEL, ...): allowing only ...`. With network and an end
-  time, `; from END-SECOND the firewall itself refuses all traffic but
-  loopback` follows `everything else is dropped`, where END-SECOND is the
-  end time rounded down to the second (with `--pass`: `; from END-SECOND,
-  or once a re-read withdraws the pass, the firewall itself refuses all
-  traffic but loopback`). With `--pass` the line may continue with the
-  `hostname` hint above. With `--pass-hosts` the names include the entries
-  from the pass (`NAME=ADDR (pass: LABEL)`) and any `; --host NAME replaces
-  ...`. It says nothing about ceilings. Then, with `--capture`,
-  `; packet capture: PATH` (the absolute path). Then, with
-  `--live-drops`, `; dropped destinations printed while the command runs
-  (the first 8)`. Then, with `--report-contacts`, `; contacted
-  destinations recorded`. Then, with `--on-drop cut`, `; at the first
-  dropped packet the firewall itself refuses all traffic but loopback, and
-  the command runs on (--on-drop cut)`, or with `--on-drop stop` `...; at
-  the first dropped packet the firewall itself refuses all traffic but
-  loopback, and playpen stops the command (--on-drop stop)`: what is
-  recorded comes before what the first drop does. Then, always,
-  `; host Unix sockets: none reachable` (with `--without-landlock`: `;
-  host Unix sockets: hidden under /run, /tmp, /var/tmp and the runtime
-  directory only (--without-landlock); sockets elsewhere stay reachable`),
-  then `; exposed: PATH, ...` when `--expose` was given, `; display
-  exposed: PATH, ...` with `--display`, and `; the command runs in its own
-  session, without a controlling terminal` in detached mode, or
-  `; private controlling terminal` with `--private-tty`. The NOTE lines
-  about `names` and about `--pass-hosts` follow it, one per line;
+  `no network, loopback only, until TIME`. Each further clause group is on
+  its own line, prefixed `playpen:   ` (playpen, colon, three spaces), so
+  that a log filtered by the `playpen:` prefix keeps every line. The
+  clauses keep their wording. In this order:
+  - with `--pass`, `under pass ID ("NAME", owner "OWNER", sha256:DIGEST,
+    window ends TIME, destinations LABEL, ...)`;
+  - the names: `no DNS[, names NAME=ADDR, ...]; lookups recorded`. With
+    `--pass-hosts` the names include the entries from the pass
+    (`NAME=ADDR (pass: LABEL)`) and any `; --host NAME replaces ...`;
+  - with `--pass` and no `--pass-hosts`, the `hostname` hint above;
+  - with network and an end time, `from END-SECOND the firewall itself
+    refuses all traffic but loopback`, where END-SECOND is the end time
+    rounded down to the second (with `--pass`: `from END-SECOND, or once a
+    re-read withdraws the pass, the firewall itself refuses all traffic but
+    loopback`);
+  - with `--capture`, `packet capture: PATH` (the absolute path);
+  - with `--live-drops`, `dropped destinations printed while the command
+    runs (the first 8)`;
+  - with `--report-contacts`, `contacted destinations recorded`;
+  - with `--on-drop cut`, `at the first dropped packet the firewall itself
+    refuses all traffic but loopback, and the command runs on (--on-drop
+    cut)`, or with `--on-drop stop` `... and playpen stops the command
+    (--on-drop stop)`: what is recorded comes before what the first drop
+    does;
+  - `the command runs in its own session, without a controlling terminal`
+    in detached mode, or `private controlling terminal` with
+    `--private-tty`;
+  - always, `host Unix sockets: none reachable` (with `--without-landlock`:
+    `host Unix sockets: hidden under /run, /tmp, /var/tmp and the runtime
+    directory only (--without-landlock); sockets elsewhere stay
+    reachable`);
+  - `exposed: PATH, ...` when `--expose` was given;
+  - `hidden: PATH, ...` when `--hide` was given, the paths as typed. The
+    file of `--capture` is hidden too, but it is not listed here: the
+    `packet capture:` clause names it, and the operator did not ask to hide
+    it;
+  - `display exposed: PATH, ...` with `--display`.
+
+  The start line says nothing about ceilings. The NOTE lines follow it, one
+  per line, each starting `playpen: NOTE:`: the ceilings the pass sets and
+  playpen does not enforce, the `--pass-hosts` notes, and, when an allowed
+  grant covers a cloud metadata address, the note described under
+  `--allow`. The JSON report is unchanged;
 - when the end time is reached: `the approval ended at TIME; the firewall
   now refuses all traffic but loopback; sending SIGTERM to the command
   (SIGKILL in 3 s)`. When egress could not be closed: `the approval ended
@@ -1894,7 +1919,9 @@ Not guarded against, or known limits:
   an address on its own. A local service has to listen on an address the
   sandbox does not have (DESIGN.md, "The host's own addresses");
 - playpen does not run inside playpen: Landlock refuses the inner one's
-  mounts;
+  mounts. The inner playpen stops with `cannot make mounts private: EPERM:
+  Operation not permitted; playpen cannot run inside playpen, or inside
+  another sandbox that locks its mounts; nothing was run`;
 - when the command shares its caller's terminal process group, a signal
   sent by PID to playpen and to its witness process, and not to the
   sandbox's init, does not reach the command (section 5);

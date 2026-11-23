@@ -462,8 +462,9 @@ fn the_first_unapproved_packet_closes_egress_to_every_destination() {
     assert_eq!(report["refused_after_end"], 0, "{context}");
 
     // playpen said so while the command ran, naming the destination.
+    assert!(err.contains("everything else is dropped\n"), "{err}");
     assert!(
-        err.contains("everything else is dropped; at the first dropped packet the firewall itself refuses all traffic but loopback, and the command runs on (--on-drop cut)"),
+        err.contains("\nplaypen:   at the first dropped packet the firewall itself refuses all traffic but loopback, and the command runs on (--on-drop cut)"),
         "{err}"
     );
     let at = f.line_at(
@@ -540,7 +541,7 @@ fn contacts_are_recorded_until_the_tripwire_closes_egress() {
 
     // The start line has the record, then the tripwire.
     assert!(
-        err.contains("; contacted destinations recorded; at the first dropped packet the firewall itself refuses all traffic but loopback, and the command runs on (--on-drop cut)"),
+        err.contains("\nplaypen:   contacted destinations recorded\nplaypen:   at the first dropped packet the firewall itself refuses all traffic but loopback, and the command runs on (--on-drop cut)"),
         "{err}"
     );
     assert!(
