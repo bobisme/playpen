@@ -21,6 +21,7 @@ pub mod pasta;
 pub mod probe;
 pub mod qualification;
 pub mod report;
+pub mod report_file;
 pub mod resolver;
 pub mod routes;
 pub mod ruleset;

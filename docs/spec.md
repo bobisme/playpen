@@ -65,6 +65,16 @@ If you used v0.1, these will be different:
   pasta's interface, for the same reason (step 8). When playpen cannot add
   the route, it prints a NOTE, the report has the new field `uncounted`,
   and `--fail-on-drop` says `unknown`.
+- **The pass, its ledger and the report file are `/dev/null` inside the
+  sandbox**, as the capture file already was. A command or tool inside
+  that read the pass (`hallpass permits`, `hallpass spend`) or that wrote,
+  renamed or removed a file at the `--report` path no longer can. A
+  `--report` file that the command replaced is written again at the end,
+  and playpen then exits 1 instead of 0. With `--pass`, a NOTE follows the
+  start line when the pass's directory is not hidden, and a re-read stops
+  the run when that directory was moved or replaced (section 4.1). The
+  plan and the report have no new fields; the report's `message` is set,
+  with `outcome: "ran"`, when the report file was replaced.
 
 ## 1. Purpose and non-goals
 
@@ -236,7 +246,8 @@ instead (`| cat`, `< /dev/null`).
 - The pass's `[ceilings]` are not used and not shown. playpen limits where
   packets go, not how many, so it does not spend from the ledger and never
   writes beside the pass. A tool that counts calls or requests must spend
-  itself (hallpass's `spend`).
+  itself (hallpass's `spend`), outside the sandbox: inside, the pass and
+  its ledger are `/dev/null` (see "The pass inside the sandbox" below).
 - Times are judged against the real clock. hallpass's
   `HALLPASS_UNSAFE_TEST_CLOCK` belongs to the hallpass command and has no
   effect on playpen.
@@ -258,6 +269,8 @@ grace of 3 seconds, then SIGKILL to the whole PID namespace; see
 
 - cannot be read or no longer validates (deleted, moved, made a symbolic
   link, made writable by others, a syntax error, a half-written file);
+- is in a directory that was moved or replaced (see "The pass's
+  directory" below);
 - is revoked, expired, or not yet valid (for example `valid_from` moved
   later, or `valid_until` moved earlier and passed: the stop then comes
   within one interval of the new end, not at it);
@@ -281,6 +294,40 @@ keeps the names written at start. The notice then says ``the hostname of
 destination `LABEL` changed``. If the pass is rejected by the
 re-read just before the command starts, the run stops with `nothing was
 run` (exit 1, like an end time that passes during set-up).
+
+**The pass inside the sandbox.** The pass, and the hallpass ledger
+`PASS.ledger` when it is a regular file at start, are `/dev/null` inside
+the sandbox, as with `--hide`. The command reads nothing there. It cannot
+rename, remove or replace either file (`EBUSY`) or hard-link it (`EXDEV`),
+and what it writes goes to `/dev/null`. A tool inside the sandbox that
+reads the pass (for example `hallpass permits`) reads nothing either.
+
+This lasts until the file is replaced on the host. An edit that writes a
+new file and renames it over the pass (most editors, `sed -i`) leaves the
+new file visible inside. A command that can
+write the pass's directory can then read the new pass, or rename another
+file over it before the next re-read. Only a directory the command cannot
+reach closes this: keep the pass in a directory of its own, outside the
+working directory, and give `--hide DIR`. When the pass's directory is not
+hidden, a NOTE follows the start line: `the directory of the pass, DIR, is
+not hidden from the command. Inside, the pass is /dev/null until it is
+replaced: ... hide that directory with --hide`. The directory counts as
+hidden when it is, or is inside, a `--hide` directory or a directory the
+mount layer replaces (section 7); that directory is not the working
+directory and does not hold it (a process keeps reaching the real
+directory it started in through relative paths); and no `--expose` path
+is at or above the pass's directory.
+
+**The pass's directory.** playpen opens the pass's directory at start
+(`O_PATH`) and reads the pass through it, by name, at start and on every
+re-read. A pass replaced in that directory, as the owner's edit does, is
+read as before. After each re-read playpen checks that the path to the
+directory, as given, still leads to the directory opened at start (same
+device and inode). If not, the re-read withdraws the pass: `the directory
+of the pass, DIR, was moved or replaced: the path now leads to another
+directory, so the owner's edits would no longer reach the file playpen
+reads`, or `the directory of the pass, DIR, was moved or removed (ERRNO)`.
+A directory moved away and back between two re-reads is not seen.
 
 **`--allow SPEC`** (repeatable). Grammar:
 
@@ -399,7 +446,8 @@ destination in use lists names, a second start line says so: `playpen:
 NOTE: the pass approves these destinations only for the listed host names:
 LABEL (NAME, NAME). … it does NOT enforce this; the command must send only
 those names`. Keeping to the names is the job of the tool that writes the
-request (`hallpass permits --name`). A change to `names` alone changes no
+request (`hallpass permits --name`), run outside the sandbox, where the
+pass can be read. A change to `names` alone changes no
 rule, so the running command is not stopped.
 
 **`--until RFC3339`**. The approval ends at this moment. It must be an RFC
@@ -512,7 +560,41 @@ playpen runs again.
 
 **`--report FILE`**. Write the JSON report to `FILE`, for every outcome,
 refusals by policy included. The file is created (truncated) before
-anything else; if that fails, playpen refuses.
+anything else, so it exists, empty, before the command starts; a symbolic
+link at `FILE` is followed. If that fails, playpen refuses. When `FILE` is
+a regular file:
+
+- Inside the sandbox `FILE` is `/dev/null`, as with `--hide`. The command
+  cannot read the report or change it, and cannot rename, remove or
+  replace the file at that path (`EBUSY`) or hard-link it (`EXDEV`). Keep
+  `FILE` outside the directories the command works in: a build that
+  writes, renames or removes a file at that path gets `/dev/null` or
+  `EBUSY` there.
+- playpen writes the report last, after every process in the sandbox is
+  gone, through the file it created. First it checks that the path still
+  leads to that file (same device and inode), in the directory the path
+  led into at start. The command can break this only by moving a
+  directory above `FILE` and putting something new at the path.
+- When the check fails, playpen writes the report through the file it
+  created and also to a new file at the path: a temporary file in the
+  directory the path now leads into, created with `O_EXCL|O_NOFOLLOW` and
+  the first file's mode, then renamed over whatever is at the path. A
+  symbolic link there is replaced, not followed. playpen prints
+  `playpen: WARNING: the report file FILE was replaced while the command
+  ran (WHY); playpen wrote its report there again, and exits with status
+  N`, where WHY is `its directory was moved or replaced`, `the path now
+  leads to another file` or `the path no longer leads to a file: ERRNO`.
+  The report's `message` says the same, and playpen's exit status is 1
+  where it would have been 0 (section 4.2).
+- When the new file cannot be written, playpen removes what is at the
+  path, so that no forged report is left there, prints the error
+  `report-write-failed`, and exits 1 where it would have exited 0.
+- A playpen that is killed writes no report: the file stays empty, or,
+  after the move above, the path keeps what the command put there. Trust
+  the report only when playpen's own exit status agrees with it.
+
+A report to a pipe or a terminal (`/dev/stdout`) is not hidden and not
+checked.
 
 **`--capture FILE`**. pasta writes a pcap file (Ethernet link type) of every
 frame on the sandbox's outside interface, in both directions, to `FILE`
@@ -724,14 +806,18 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   - `hidden: PATH, ...` when `--hide` was given, the paths as typed. The
     file of `--capture` is hidden too, but it is not listed here: the
     `packet capture:` clause names it, and the operator did not ask to hide
-    it;
+    it. Nor are the pass, its ledger and the `--report` file, which playpen
+    always hides (section 7): the list stays what the operator typed, as in
+    the plan;
   - `display exposed: PATH, ...` with `--display`.
 
   The start line says nothing about ceilings. The NOTE lines follow it, one
   per line, each starting `playpen: NOTE:`: the ceilings the pass sets and
-  playpen does not enforce, the `--pass-hosts` notes, and, when an allowed
+  playpen does not enforce, the `--pass-hosts` notes, when an allowed
   grant covers a cloud metadata address, the note described under
-  `--allow`. The JSON report is unchanged;
+  `--allow`, and, with `--pass`, when the pass's directory is not hidden,
+  the note described under "The pass inside the sandbox". The JSON report
+  is unchanged;
 - when packets to other hosts fail at routing in this sandbox (section 5,
   steps 6 and 8), once, after the start line: `NOTE: WHY. The drop counts
   of this run are incomplete: --fail-on-drop says unknown, and --on-drop
@@ -798,6 +884,10 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   `Each was answered "no such name". If the command needs one, map it
   with --host NAME=ADDR (ADDR must be approved).` When the record could
   not be read: `could not read the names the command looked up: WHY`.
+- last, when the `--report` file was replaced while the command ran:
+  `WARNING: the report file FILE was replaced while the command ran (WHY);
+  playpen wrote its report there again, and exits with status N` (see
+  `--report`).
 
 ### 4.2 Exit status of `run`
 
@@ -806,7 +896,13 @@ The supervisor’s human-readable diagnostics on stderr include the following me
 | the command's own status | the command ran and exited |
 | 128 + N | the command was killed by signal N (including SIGTERM 15 or SIGKILL 9 sent because the approval ended, the pass withdrew it, or a dropped packet tripped `--on-drop stop`) |
 | 2 | refused by policy before anything was built; nothing was run |
-| 1 | the sandbox could not be built (nothing was run), or something failed after the command started; or the command exited 0 and `--fail-on-drop` failed, or `--on-drop stop` had tripped |
+| 1 | the sandbox could not be built (nothing was run), or something failed after the command started; or the command exited 0 and `--fail-on-drop` failed, or `--on-drop stop` had tripped, or the `--report` file was replaced while the command ran, or the report could not be written |
+
+When the `--report` file was replaced while the command ran (see
+`--report`), playpen writes the report at its path again and exits 1 where
+it would have exited 0. Any other status is kept: a command that exited 3
+gives 3, and one killed by SIGTERM 143. The report's `playpen_exit_status`
+holds the status playpen exits with.
 
 With `--on-drop stop`, a run whose cut tripped never exits 0. That covers
 a command that catches SIGTERM and exits 0 in its grace, and one that
@@ -1124,7 +1220,7 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `playpen_version` | string | version of playpen |
 | `outcome` | `"ran"`, `"refused"`, `"not_started"`, `"error"` | see 4.2 |
 | `startup_evidence` | `"not_started"`, `"exec_and_exit"`, `"unknown"` | evidence available for deciding whether a retry is safe |
-| `message` | string or null | why, for anything but `"ran"` |
+| `message` | string or null | why, for anything but `"ran"`; with `"ran"`, says so when the `--report` file was replaced while the command ran, and is null otherwise |
 | `command` | array of strings | the command line |
 | `allowed` | array of strings | approved specs (canonical form once parsed; as typed when refused; with `--pass`, the rules from the pass once loaded) |
 | `hosts` | array of strings | `--host` entries as given; then, with `--pass-hosts` and once the pass is loaded, each entry taken from the pass as `NAME=ADDR (pass: LABEL[, LABEL]...)` |
@@ -1528,7 +1624,9 @@ Each step either succeeds or stops the run with a message that ends
    parse every spec, `--host` and `--until`, check every `--expose` path
    and find the display sockets for `--display`, check standard input,
    output and error; apply the refusals in 4.1. Then create the
-   `--capture` file. Policy failures exit 2.
+   `--capture` file. Policy failures exit 2. (The `--report` file was
+   created before this step. With `--pass`, the pass's directory is opened
+   here and held for the re-reads.)
 2. **Find the tools**: `nft`, and `pasta` unless `--no-network`.
 3. **Check the process**: exactly one thread (required for creating a user
    namespace) and not root; Landlock ABI 9 unless `--without-landlock`.
@@ -1600,7 +1698,10 @@ Each step either succeeds or stops the run with a message that ends
    `/etc/resolv.conf` and `/etc/nsswitch.conf` read-only over the host's;
    replaces the directories of section 7 with private ones and mounts a
    fresh `/dev/mqueue`; covers the sockets found; binds every exposed path
-   that is now hidden back into place; and applies `--hide`.
+   that is now hidden back into place; and applies `--hide`, then hides
+   playpen's own files the same way: the `--capture` file, the pass, its
+   `.ledger` when there is one, and the `--report` file when it is a
+   regular file.
 9. **X: drop privileges.** I forks X. X unshares a nested user namespace,
    maps the caller's uid and gid to the outer root, sets uid and gid,
    clears all capability sets, sets `no_new_privs`, and verifies: all of
@@ -1699,7 +1800,10 @@ and `cut`, and with `--report-contacts` the `contacted` counter and the
 reports them, and exits. P stops pasta
 if it is still running (pasta also exits when the namespace's process is
 gone; it looks once a second), removes pasta's PID file and its private
-directory, prints the summary, writes the report, and exits. With
+directory, prints the summary, writes the report, and exits. Before it
+writes the report P checks that the `--report` path still leads to the
+file it created, and writes the report there again when not (section
+4.1, `--report`). With
 `--capture`, P first waits up to 2 seconds for pasta to exit by itself,
 sends SIGTERM only after that, and reads the capture's size and digest
 once pasta is gone.
@@ -1882,6 +1986,10 @@ directory, reached through the descriptor playpen holds for it.
   `/var/tmp` found at start has `/dev/null` bound over it.
 - Exposed paths: bound back at their own path.
 - `--hide` paths: `/dev/null` or an empty read-only tmpfs.
+- playpen's own files, as with `--hide`: the `--capture` file, the pass
+  and its `.ledger` (with `--pass`), and the `--report` file when it is a
+  regular file. Each is `/dev/null`. The pass stays `/dev/null` only until
+  an edit on the host replaces the file (section 4.1).
 
 Inside, the command's uid and gid are the caller's; other users and groups
 show as `nobody`.
@@ -1893,7 +2001,9 @@ resolution to unapproved places, attempts that would fail at routing (with
 `--no-network`, or in a family this host has no default route for: they
 are refused and counted), the command's children and daemons, the
 command trying to change the firewall, interfaces, addresses or routes, open raw
-sockets, or join another network namespace, and the command reaching the
+sockets, or join another network namespace, the command reading or
+replacing the pass, its ledger, the `--report` file or the `--capture`
+file (within the limits below), and the command reaching the
 host's network through a host daemon's Unix socket, an inherited
 descriptor, a socket on standard input or output, host IPC, the display
 server (unless `--display`) or the terminal's input queue.
@@ -1932,8 +2042,14 @@ Not guarded against, or known limits:
   spoolers, named pipes), and network file systems;
 - an approved destination that forwards traffic further;
 - volume, content and covert channels within approved flows;
-- the report file can be overwritten by the command while it runs (same
-  user); playpen writes it last, through the file it opened at start;
+- the `--report` file: inside it is `/dev/null`, so the command cannot
+  change it or replace it at its path. It can move a directory above the
+  file and put a forged report at the path; playpen finds that at the end,
+  writes the real report there again, warns and exits 1 instead of 0
+  (section 4.1). A playpen that is killed before it writes the report
+  leaves the empty file, or what the command put at the path, so the
+  report counts only together with playpen's own exit status. A report
+  to a pipe or a terminal is neither hidden nor checked;
 - the capture file (`--capture`) holds what the command sent, credentials
   sent in clear included. It is mode 0600 and is `/dev/null` inside the
   sandbox, but every other process of the caller can read it. The capture
@@ -2004,8 +2120,12 @@ Not guarded against, or known limits:
 - with `--pass`: a revocation or edit takes effect when a scheduled re-read observes it
   (normally every 2 seconds); traffic until then is still allowed. From
   that re-read on, the cut refuses all but loopback before the notice and
-  during the grace. Who can write the pass file can also restore it
-  between two re-reads.
+  during the grace. A process that can write the pass's directory can
+  restore the pass between two re-reads: any process outside playpen, and
+  the command itself when the pass's directory is not hidden and an edit
+  has replaced the pass's file (it is `/dev/null` inside only until then;
+  playpen prints a NOTE at the start, section 4.1). A directory of the
+  pass that is moved away and back between two re-reads is not seen.
   Ceilings are not enforced by playpen.
 
 DESIGN.md has the full list with the reasons.

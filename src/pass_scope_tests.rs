@@ -122,6 +122,7 @@ fn selected(pass: &Pass, labels: &[String]) -> FromPass {
         Digest::of(b"finite-fixture"),
         labels,
         NOW,
+        super::tests::dir_of(Path::new("finite-fixture")),
     )
     .expect("valid packet scope")
 }

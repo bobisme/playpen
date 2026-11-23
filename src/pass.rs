@@ -9,16 +9,24 @@
 //!
 //! The pass is loaded with hallpass's own loader ([`hallpass::load`]): no
 //! symbolic links, no file writable by group or others, full validation.
-//! Ceilings are not used: playpen limits where packets go, not how many, so
-//! it never spends from the ledger.
+//! It is read through its directory, held open from the first read
+//! ([`PassDir`]), so a re-read reads the file in that directory and
+//! nowhere else, and a path that now leads to another directory stops the
+//! run. Ceilings are not used: playpen limits where packets go, not how
+//! many, so it never spends from the ledger.
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fmt::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr};
+use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use hallpass::{Destination, Digest, Pass};
+use nix::fcntl::OFlag;
+use nix::sys::stat::{Mode, fstat};
 use time::OffsetDateTime;
 
 use crate::approval::{AllowRule, Approval, EndsAt, Net, Ports, Proto, ipv4_edges};
@@ -215,8 +223,131 @@ impl FromPass {
 /// revoked), names an unknown label in `only`, or holds a destination
 /// playpen cannot enforce.
 pub fn load(path: &Path, only: &[String], now: OffsetDateTime) -> Result<FromPass, String> {
-    let loaded = hallpass::load(path).map_err(|e| load_error(path, &e))?;
-    from_pass(path, &loaded.pass, loaded.digest, only, now)
+    let dir = PassDir::open(path).map_err(|e| load_error(path, &e))?;
+    let loaded = dir.load(path).map_err(|e| load_error(path, &e))?;
+    from_pass(path, &loaded.pass, loaded.digest, only, now, dir)
+}
+
+/// The directory of the pass, held open from the first read.
+///
+/// Every read of the pass goes through it, so it reads the file of that
+/// name in that directory, wherever the directory has been moved since.
+/// [`PassDir::moved`] says when the pass's path no longer leads to it: the
+/// owner's edits, made through the path, would then go somewhere playpen
+/// does not read.
+#[derive(Debug, Clone)]
+pub struct PassDir {
+    /// The directory, opened `O_PATH`.
+    fd: Arc<OwnedFd>,
+    /// Its path: the parent of the pass's path made absolute, symbolic
+    /// links not resolved.
+    path: PathBuf,
+    /// The pass's name in it.
+    name: OsString,
+}
+
+impl PassDir {
+    /// Opens the directory of the pass at `path`.
+    ///
+    /// # Errors
+    /// hallpass's `io` error when the directory cannot be opened, and
+    /// `not-regular-file` when `path` names no file in a directory (`/`).
+    pub fn open(path: &Path) -> Result<Self, hallpass::Error> {
+        let io = |e: &dyn fmt::Display| hallpass::Error::Io {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        };
+        let absolute = std::path::absolute(path).map_err(|e| io(&e))?;
+        let (Some(name), Some(dir)) = (absolute.file_name(), absolute.parent()) else {
+            return Err(hallpass::Error::NotRegular {
+                path: path.to_path_buf(),
+            });
+        };
+        let fd = nix::fcntl::open(
+            dir,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| match e {
+            nix::errno::Errno::ENOENT => io(&"no such file; check the path"),
+            e => io(&format!("cannot open its directory {}: {e}", dir.display())),
+        })?;
+        Ok(Self {
+            fd: Arc::new(fd),
+            path: dir.to_path_buf(),
+            name: name.to_owned(),
+        })
+    }
+
+    /// The directory's path (absolute, as given).
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The pass's path: the directory's path and the pass's name.
+    #[must_use]
+    pub fn file(&self) -> PathBuf {
+        self.path.join(&self.name)
+    }
+
+    /// Reads the pass with hallpass's own loader, through the held
+    /// directory. Errors name `shown`, the path as the operator gave it,
+    /// exactly as `hallpass::load(shown)` would.
+    ///
+    /// # Errors
+    /// Every error of [`hallpass::load`].
+    pub fn load(&self, shown: &Path) -> Result<hallpass::LoadedPass, hallpass::Error> {
+        // The kernel resolves /proc/self/fd/N to the held directory, and the
+        // loader inspects and opens NAME in it without following a link.
+        let mut through = PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()));
+        through.push(&self.name);
+        hallpass::load(&through).map_err(|e| naming(e, shown))
+    }
+
+    /// Why the pass's path no longer leads into the held directory, or
+    /// `None` when it still does (same device and inode).
+    #[must_use]
+    pub fn moved(&self) -> Option<String> {
+        let shown = self.path.display();
+        let held = match fstat(&*self.fd) {
+            Ok(st) => st,
+            Err(e) => {
+                return Some(format!(
+                    "the directory of the pass, {shown}, cannot be inspected ({e})"
+                ));
+            }
+        };
+        match nix::sys::stat::stat(&self.path) {
+            Ok(now) if now.st_dev == held.st_dev && now.st_ino == held.st_ino => None,
+            Ok(_) => Some(format!(
+                "the directory of the pass, {shown}, was moved or replaced: the path now leads to another directory, so the owner's edits would no longer reach the file playpen reads"
+            )),
+            Err(e) => Some(format!(
+                "the directory of the pass, {shown}, was moved or removed ({e})"
+            )),
+        }
+    }
+}
+
+/// `e`, about `shown` instead of the path it was read through.
+fn naming(e: hallpass::Error, shown: &Path) -> hallpass::Error {
+    use hallpass::Error as E;
+    let path = shown.to_path_buf();
+    match e {
+        E::Io { message, .. } => E::Io { path, message },
+        E::Symlink { .. } => E::Symlink { path },
+        E::NotRegular { .. } => E::NotRegular { path },
+        E::TooLarge { limit, .. } => E::TooLarge { path, limit },
+        E::Insecure { mode, who, fix, .. } => E::Insecure {
+            path,
+            mode,
+            who,
+            fix,
+        },
+        E::Invalid { problems, .. } => E::Invalid { path, problems },
+        other => other,
+    }
 }
 
 fn from_pass(
@@ -225,6 +356,7 @@ fn from_pass(
     digest: Digest,
     only: &[String],
     now: OffsetDateTime,
+    dir: PassDir,
 ) -> Result<FromPass, String> {
     pass.check_window(now, time::Duration::ZERO)
         .map_err(|r| format!("--pass {}: {}: {r}", path.display(), r.code.as_str()))?;
@@ -283,6 +415,7 @@ fn from_pass(
     };
     let watch = PassWatch {
         path: path.to_path_buf(),
+        dir,
         id: pass.id.clone(),
         owner: pass.approval.owner.clone(),
         digest,
@@ -465,7 +598,10 @@ pub enum Recheck {
 /// run, never widen it.
 #[derive(Debug, Clone)]
 pub struct PassWatch {
+    /// The pass file as given.
     path: PathBuf,
+    /// Its directory, held open since the first read.
+    dir: PassDir,
     id: String,
     owner: String,
     digest: Digest,
@@ -484,9 +620,21 @@ pub struct PassWatch {
 }
 
 impl PassWatch {
-    /// Re-reads the file and judges it at `now`.
+    /// The directory the pass is read from.
+    #[must_use]
+    pub const fn dir(&self) -> &PassDir {
+        &self.dir
+    }
+
+    /// Re-reads the file through its directory and judges it at `now`. A
+    /// path that no longer leads to that directory stops the run, whatever
+    /// the file says.
     pub fn recheck(&mut self, now: OffsetDateTime) -> Recheck {
-        match hallpass::load(&self.path) {
+        let read = self.dir.load(&self.path);
+        if let Some(why) = self.dir.moved() {
+            return Recheck::Stop(why);
+        }
+        match read {
             Ok(loaded) => self.judge(&loaded.pass, loaded.digest, now),
             Err(e) => Recheck::Stop(format!(
                 "the pass can no longer be read ({}: {e})",
@@ -676,6 +824,7 @@ calls = 6
         let edge_addresses = pass_edges(&pass);
         PassWatch {
             path: PathBuf::from("unused"),
+            dir: dir_of(Path::new("unused")),
             id: pass.id,
             owner: pass.approval.owner,
             digest: Digest::of(text.as_bytes()),
@@ -690,6 +839,117 @@ calls = 6
 
     fn judge(w: &mut PassWatch, text: &str, now: OffsetDateTime) -> Recheck {
         w.judge(&parse(text), Digest::of(text.as_bytes()), now)
+    }
+
+    /// The held directory of a pass at `path` (which need not exist).
+    pub(super) fn dir_of(path: &Path) -> PassDir {
+        PassDir::open(path).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// A new, empty directory for one test, mode 0700.
+    fn tmpdir(name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("playpen-pass-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|e| panic!("{e}"));
+        dir
+    }
+
+    /// Writes `text` to `path`, mode 0600, as a new file renamed over the
+    /// old one (as `sed -i` and most editors do).
+    fn replace_file(path: &Path, text: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, text).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::rename(&tmp, path).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn the_pass_is_read_through_its_directory_and_a_moved_directory_stops_the_run() {
+        let root = tmpdir("moved");
+        let sub = root.join("eng");
+        std::fs::create_dir(&sub).unwrap_or_else(|e| panic!("{e}"));
+        let path = sub.join("p.pass.toml");
+        replace_file(&path, PASS);
+        let only = ["web".to_owned()];
+        let loaded = load(&path, &only, NOW).unwrap_or_else(|e| panic!("{e}"));
+        let mut w = loaded.watch;
+        assert_eq!(w.dir().file(), path);
+        assert_eq!(w.dir().moved(), None);
+        // The owner's edit writes a new file in the same directory: no
+        // tampering, the re-read judges what it says.
+        replace_file(&path, &PASS.replace("revoked = false", "revoked = true"));
+        assert_eq!(w.dir().moved(), None);
+        let Recheck::Stop(m) = w.recheck(NOW) else {
+            panic!("a revoked pass must stop")
+        };
+        assert!(m.contains("revoked"), "{m}");
+        replace_file(&path, PASS);
+        assert_eq!(w.recheck(NOW), Recheck::Unchanged);
+
+        // The directory moved away, and a new one with a valid pass in its
+        // place: the edits of the owner would go to the new one.
+        std::fs::rename(&sub, root.join("eng.moved")).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::create_dir(&sub).unwrap_or_else(|e| panic!("{e}"));
+        replace_file(&path, PASS);
+        let Recheck::Stop(m) = w.recheck(NOW) else {
+            panic!("a replaced directory must stop")
+        };
+        assert!(
+            m.contains(&format!(
+                "the directory of the pass, {}, was moved or replaced",
+                sub.display()
+            )),
+            "{m}"
+        );
+        // Still read through the held directory, now at its new path.
+        assert!(w.dir().load(&path).is_ok());
+        std::fs::remove_dir_all(&sub).unwrap_or_else(|e| panic!("{e}"));
+        let Recheck::Stop(m) = w.recheck(NOW) else {
+            panic!("a removed directory must stop")
+        };
+        assert!(m.contains("was moved or removed"), "{m}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn errors_name_the_path_as_given_not_the_one_read_through() {
+        let root = tmpdir("errors");
+        let missing = root.join("missing.pass.toml");
+        let e = load(&missing, &[], NOW).err().unwrap_or_default();
+        assert_eq!(
+            e,
+            format!(
+                "--pass {}: io: {}: no such file; check the path",
+                missing.display(),
+                missing.display()
+            )
+        );
+        let target = root.join("real.pass.toml");
+        replace_file(&target, PASS);
+        let link = root.join("link.pass.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap_or_else(|e| panic!("{e}"));
+        let e = load(&link, &[], NOW).err().unwrap_or_default();
+        assert!(
+            e.starts_with(&format!(
+                "--pass {}: symlink: {} is a symbolic link",
+                link.display(),
+                link.display()
+            )),
+            "{e}"
+        );
+        assert!(!e.contains("/proc/"), "{e}");
+        let e = load(&root.join("nodir").join("p.toml"), &[], NOW)
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("no such file"), "{e}");
+        let e = load(Path::new("/"), &[], NOW).err().unwrap_or_default();
+        assert!(e.contains("not-regular-file"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -899,6 +1159,7 @@ calls = 6
             Digest::of(text.as_bytes()),
             &only,
             NOW,
+            dir_of(Path::new("p.toml")),
         )
         .unwrap_or_else(|e| panic!("{e}"))
         .named

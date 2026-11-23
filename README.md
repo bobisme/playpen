@@ -51,9 +51,23 @@ below gives curl that name for that address. Substitute the pass from your
 own engagement.
 
 ```sh
-playpen run --pass engagement.pass.toml --pass-hosts \
+playpen run --pass ~/passes/engagement.pass.toml --hide ~/passes --pass-hosts \
   -- curl -sS https://app.example.test/
 ```
+
+Keep the pass in a directory of its own, outside the directory the command
+works in, and hide that directory with `--hide`, as above. Inside the
+sandbox the pass, and its `.ledger`, are `/dev/null` in any case. But most
+editors and `sed -i` save a new file, and the new file is visible inside.
+A command that can write the pass's directory could then read it, or put
+back an unrevoked pass before playpen's next check. Without `--hide` on
+that directory playpen prints a NOTE at the start. A tool that reads the
+pass, such as `hallpass permits` or `hallpass spend`, must run outside the
+sandbox.
+
+playpen reads the pass through the directory it opened at start. If that
+directory is moved or replaced while the command runs, playpen stops the
+run as for a revocation.
 
 playpen refuses to start (exit 2, "nothing was run") when the pass is
 invalid, unreadable, a symbolic link, writable by others, not yet valid,
@@ -253,7 +267,8 @@ For CI, fail a successful command if it tried to reach a host nobody
 approved:
 
 ```sh
-playpen run --allow 192.0.2.1:443/tcp --fail-on-drop --report report.json -- ./check
+out=$(mktemp -d)
+playpen run --allow 192.0.2.1:443/tcp --fail-on-drop --report "$out/report.json" -- ./check
 playpen run --no-network --fail-on-drop --report report.json -- ./build
 ```
 
@@ -270,6 +285,15 @@ An incomplete count also fails the assertion, as `unknown`: the counters
 could not be read (`dropped_error`), or playpen could not give an address
 family a route (`uncounted`; a NOTE at the start says so). The report
 keeps the child status separately from playpen's exit status.
+
+Inside the sandbox the report path is `/dev/null`, so the command cannot
+change or replace the report. Keep the report outside the directory the
+command works in, as above: a build that writes, renames or removes a file
+at that path would get `/dev/null` or an error (`EBUSY`) there. If the
+command moves a directory above the report and puts another file at its
+path, playpen finds that at the end, writes the real report there again,
+says so on stderr and exits 1 instead of 0. A playpen that is killed writes
+no report, so check playpen's exit status too.
 
 ### Learn of a refused destination while the command runs
 
@@ -548,7 +572,13 @@ playpen guards against:
   sandbox and are killed when the command exits;
 - the command trying to undo the guard: it cannot change the firewall,
   add addresses or interfaces, change routes, open raw sockets, or join
-  another network namespace (each is tested);
+  another network namespace. It cannot read the pass or its ledger, and
+  cannot read or replace the `--report` or `--capture` file: inside, each
+  is `/dev/null`. A report replaced by moving a directory above it is
+  found and written again, and playpen exits 1 (each is tested). The pass
+  is protected only until the owner's next edit, unless its directory is
+  hidden (see [Run under a Hallpass
+  approval](#run-under-a-hallpass-approval));
 - attempts that would fail before the firewall: with `--no-network`, or
   over an address family this host has no default route for, a packet to
   another host still reaches the firewall and is refused and counted. If
@@ -592,8 +622,13 @@ playpen does not guard against:
   what was sent; it does not inspect or stop it;
 - traffic to approved destinations before playpen [detects a
   revocation](#how-a-pass-backed-run-ends) (up to one check interval, or
-  longer while playpen is stopped), or someone who can restore the pass
-  file between checks.
+  longer while playpen is stopped);
+- a process that restores the pass file between two checks: any process
+  outside playpen, and the command itself when the pass's directory is not
+  hidden and the owner's edit saved a new file. A pass directory moved away
+  and back between two checks is not noticed;
+- a report forged while playpen was killed: trust the report only together
+  with playpen's own exit status.
 
 ## License
 

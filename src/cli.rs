@@ -8,7 +8,6 @@ use event_pipe::EventPipe;
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::fs::File;
 use std::io::Write as _;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -25,6 +24,7 @@ use crate::pass::{
     self, FromPass, MIN_RECHECK_INTERVAL, NamedDestination, PassHosts, RECHECK_INTERVAL,
 };
 use crate::report::{Outcome, PassReport, Report, StartupEvidence, text_summary};
+use crate::report_file::ReportFile;
 use crate::resolver::{HostEntry, check_hosts, parse_host};
 use crate::ruleset::Instrumentation;
 use crate::sandbox::{self, CommandStatus, Events, Plan, RunError};
@@ -1070,7 +1070,10 @@ fn paths(list: &[PathBuf]) -> String {
 ///
 /// `--capture` adds its file to the hidden paths, but that file is not
 /// listed under `hidden:`. The `packet capture:` clause already names it,
-/// and the operator did not ask to hide it.
+/// and the operator did not ask to hide it. The same holds for the pass,
+/// its ledger and the `--report` file: playpen always hides them, the
+/// operator did not ask, and `hidden:` stays the list the operator typed,
+/// as in the plan.
 fn sockets_clauses(c: &Checked, args: &RunArgs) -> Vec<String> {
     let mut out = vec![if args.without_landlock {
         String::from(
@@ -1135,7 +1138,7 @@ fn start_line(c: &Checked, args: &RunArgs, capture: Option<&Path>) -> String {
     for line in lines {
         let _ = write!(out, "\n{CLAUSE_PREFIX}{line}");
     }
-    out.push_str(&start_notes(c));
+    out.push_str(&start_notes(c, &args.hide));
     out
 }
 
@@ -1174,7 +1177,7 @@ fn metadata_notes(approval: &Approval) -> Vec<String> {
 }
 
 /// The NOTE lines that follow the start line, each starting with a newline.
-fn start_notes(c: &Checked) -> String {
+fn start_notes(c: &Checked, hide: &[PathBuf]) -> String {
     let mut out = String::new();
     for note in metadata_notes(&c.approval) {
         let _ = write!(out, "\nplaypen: {note}");
@@ -1185,7 +1188,50 @@ fn start_notes(c: &Checked) -> String {
     for note in c.pass_hosts.iter().flat_map(|p| &p.notes) {
         let _ = write!(out, "\nplaypen: NOTE: {note}");
     }
+    if let Some(note) = pass_dir_note(c, hide) {
+        let _ = write!(out, "\nplaypen: NOTE: {note}");
+    }
     out
+}
+
+/// The NOTE for a pass whose directory the command can reach; `None`
+/// without a pass, and when its directory is hidden.
+fn pass_dir_note(c: &Checked, hide: &[PathBuf]) -> Option<String> {
+    let dir = c.from_pass.as_ref()?.watch.dir().path();
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let mut hidden: Vec<PathBuf> = hide.to_vec();
+    hidden.extend(
+        sockets::covers(nix::unistd::getuid(), runtime_dir.as_deref())
+            .into_iter()
+            .map(|c| c.path),
+    );
+    let cwd = std::env::current_dir().ok();
+    if dir_hidden(dir, &hidden, &c.exposed, cwd.as_deref()) {
+        return None;
+    }
+    Some(format!(
+        "the directory of the pass, {}, is not hidden from the command. Inside, the pass is /dev/null until it is replaced: an edit that writes a new file (sed -i and most editors do) makes the new pass visible there, and a command that can write that directory can read it and put another in its place before the next re-read. Keep the pass in a directory of its own, outside the working directory, and hide that directory with --hide",
+        dir.display()
+    ))
+}
+
+/// Whether the command cannot reach `dir`: it is at or below a directory in
+/// `hidden` (`--hide`, or one the mount layer replaces) that is not the
+/// working directory `cwd` and does not hold it, and no `exposed` path at
+/// or above it brings it back. A process that starts in a hidden directory,
+/// or below it, keeps reaching the real one through relative paths.
+fn dir_hidden(dir: &Path, hidden: &[PathBuf], exposed: &[PathBuf], cwd: Option<&Path>) -> bool {
+    let canonical = |p: &Path| std::fs::canonicalize(p).ok();
+    let Some(dir) = canonical(dir) else {
+        return false;
+    };
+    let cwd = cwd.and_then(canonical);
+    let covered = hidden
+        .iter()
+        .filter_map(|h| canonical(h))
+        .filter(|h| h.is_dir())
+        .any(|h| dir.starts_with(&h) && !cwd.as_ref().is_some_and(|c| c.starts_with(&h)));
+    covered && !exposed.iter().any(|e| dir.starts_with(e))
 }
 
 /// The first line (the grant summary, the end time and what is dropped),
@@ -1321,19 +1367,10 @@ fn new_session(args: &RunArgs) -> bool {
     !args.private_tty && (args.new_session || sandbox::tiocsti_allowed())
 }
 
-fn write_report(
-    file: Option<&mut File>,
-    report: &Report,
-    shareable: bool,
-    stdout_report: bool,
-) -> std::io::Result<()> {
-    let mut sink: Box<dyn std::io::Write + '_> = match file {
-        Some(file) => Box::new(file),
-        None if stdout_report => Box::new(std::io::stdout().lock()),
-        None => return Ok(()),
-    };
-    if shareable {
-        serde_json::to_writer_pretty(&mut sink, &crate::report::ShareableReport::from(report))?;
+/// The report as written to the file or stdout: pretty JSON and a newline.
+fn render_report(report: &Report, shareable: bool) -> std::io::Result<Vec<u8>> {
+    let mut out = if shareable {
+        serde_json::to_vec_pretty(&crate::report::ShareableReport::from(report))?
     } else {
         let mut value = serde_json::to_value(report)?;
         value["advice"] = if report.startup_evidence == StartupEvidence::Unknown {
@@ -1341,10 +1378,79 @@ fn write_report(
         } else {
             serde_json::json!([])
         };
-        serde_json::to_writer_pretty(&mut sink, &value)?;
+        serde_json::to_vec_pretty(&value)?
+    };
+    out.push(b'\n');
+    Ok(out)
+}
+
+/// Writes the report: to the `--report` file, or to stdout with
+/// `stdout_report`. When the command replaced the report file (see
+/// [`ReportFile::replaced`]), playpen's exit status becomes 1 if it was 0,
+/// `message` says so, and the report is written to the path again.
+fn write_report(
+    file: Option<&mut ReportFile>,
+    report: &mut Report,
+    shareable: bool,
+    stdout_report: bool,
+) -> Result<(), String> {
+    let replaced = file.as_deref().and_then(|f| {
+        f.replaced()
+            .map(|why| (why, f.shown().display().to_string()))
+    });
+    if let Some((why, _)) = &replaced {
+        if report.playpen_exit_status == 0 {
+            report.playpen_exit_status = EXIT_ERROR;
+        }
+        let note = format!(
+            "the report file was replaced while the command ran ({why}); playpen wrote this report to its path again"
+        );
+        report.message = Some(match report.message.take() {
+            Some(m) => format!("{m}; {note}"),
+            None => note,
+        });
     }
-    sink.write_all(b"\n")?;
-    sink.flush()
+    let written = render_report(report, shareable).and_then(|bytes| match file {
+        Some(f) if replaced.is_some() => f.write_again(&bytes),
+        Some(f) => f.write(&bytes),
+        None if stdout_report => {
+            let mut out = std::io::stdout().lock();
+            out.write_all(&bytes)?;
+            out.flush()
+        }
+        None => Ok(()),
+    });
+    match (written, replaced) {
+        (Ok(()), None) => Ok(()),
+        (Ok(()), Some((why, shown))) => {
+            eprintln!(
+                "playpen: WARNING: the report file {shown} was replaced while the command ran ({why}); playpen wrote its report there again, and exits with status {}",
+                report.playpen_exit_status
+            );
+            Ok(())
+        }
+        (Err(e), None) => Err(format!("could not write the final report: {e}")),
+        (Err(e), Some((why, shown))) => Err(format!(
+            "the report file {shown} was replaced while the command ran ({why}), and playpen could not write its report there again: {e}"
+        )),
+    }
+}
+
+/// playpen's own files besides the capture, which the command must not
+/// read or replace: the pass, its ledger when it exists, and the report
+/// when it is a regular file. Inside the sandbox each is `/dev/null`.
+fn own_files(from_pass: Option<&pass::FromPass>, report: Option<&ReportFile>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(p) = from_pass {
+        let file = p.watch.dir().file();
+        let ledger = hallpass::ledger_path(&file);
+        out.push(file);
+        if std::fs::symlink_metadata(&ledger).is_ok_and(|m| m.is_file()) {
+            out.push(ledger);
+        }
+    }
+    out.extend(report.and_then(ReportFile::hidden).map(Path::to_path_buf));
+    out
 }
 
 #[expect(
@@ -1376,7 +1482,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         }
     };
     let mut report = base_report(args);
-    let finish = |file: Option<&mut File>, report: &mut Report| {
+    let finish = |file: Option<&mut ReportFile>, report: &mut Report| {
         if let Err(e) = write_report(file, report, args.shareable_report, stdout_report) {
             if report.playpen_exit_status == 0 {
                 report.playpen_exit_status = EXIT_ERROR;
@@ -1384,7 +1490,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
             discovery::error(
                 format,
                 "report-write-failed",
-                &format!("could not write the final report: {e}"),
+                &e,
                 report.playpen_exit_status,
             );
         }
@@ -1395,7 +1501,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         report.drop_assertion = Some(crate::report::DropAssertion::Unknown);
     }
     let mut report_file = match &args.report {
-        Some(p) => match File::create(p) {
+        Some(p) => match ReportFile::create(p) {
             Ok(f) => Some(f),
             Err(e) => {
                 let message = format!(
@@ -1466,7 +1572,7 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     if let Some(p) = &checked.from_pass {
         report.pass = Some(pass_report(&p.identity));
     }
-    let fail = |report: &mut Report, file: Option<&mut File>, outcome, msg: String| {
+    let fail = |report: &mut Report, file: Option<&mut ReportFile>, outcome, msg: String| {
         eprintln!("playpen: {msg}");
         report.outcome = outcome;
         if outcome == Outcome::Error {
@@ -1526,6 +1632,8 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     let mut hide = args.hide.clone();
     // The command cannot open the capture: inside it is /dev/null.
     hide.extend(capture.as_deref().map(|c| c.path().to_path_buf()));
+    // Nor the pass, its ledger or the report.
+    hide.extend(own_files(checked.from_pass.as_ref(), report_file.as_ref()));
     let plan = Plan {
         fixture: checked.fixture,
         approval: checked.approval,
@@ -1685,5 +1793,61 @@ fn explicitly_missing(path: &Path) -> bool {
             matches!(std::fs::metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory tree for [`dir_hidden`]: `root/sealed/pass`,
+    /// `root/work` and a link `root/link` to `sealed`.
+    fn tree(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("playpen-cli-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["sealed/pass", "work"] {
+            std::fs::create_dir_all(root.join(d)).unwrap_or_else(|e| panic!("{e}"));
+        }
+        std::os::unix::fs::symlink(root.join("sealed"), root.join("link"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        root
+    }
+
+    #[test]
+    fn a_pass_directory_is_hidden_only_below_a_hidden_directory_that_does_not_hold_the_cwd() {
+        let root = tree("hidden");
+        let pass = root.join("sealed/pass");
+        let work = root.join("work");
+        let hide = |h: &[&str]| -> Vec<PathBuf> { h.iter().map(|p| root.join(p)).collect() };
+        // Nothing hidden.
+        assert!(!dir_hidden(&pass, &[], &[], Some(&work)));
+        // The directory itself, or one above it, through a link or not.
+        assert!(dir_hidden(&pass, &hide(&["sealed/pass"]), &[], Some(&work)));
+        assert!(dir_hidden(&pass, &hide(&["sealed"]), &[], Some(&work)));
+        assert!(dir_hidden(&pass, &hide(&["link"]), &[], Some(&work)));
+        // A sibling is not enough.
+        assert!(!dir_hidden(&pass, &hide(&["work"]), &[], Some(&work)));
+        // A hidden directory that holds the working directory is still
+        // reachable through relative paths.
+        assert!(!dir_hidden(&pass, &hide(&["sealed"]), &[], Some(&pass)));
+        assert!(!dir_hidden(
+            &pass,
+            &hide(&["sealed"]),
+            &[],
+            Some(&root.join("sealed"))
+        ));
+        assert!(!dir_hidden(&pass, &hide(&[""]), &[], Some(&work)));
+        // An exposed path at or above it brings it back.
+        let exposed = [std::fs::canonicalize(root.join("sealed")).unwrap_or_default()];
+        assert!(!dir_hidden(
+            &pass,
+            &hide(&["sealed/pass"]),
+            &exposed,
+            Some(&work)
+        ));
+        // A hidden file is not a hidden directory.
+        std::fs::write(root.join("file"), "").unwrap_or_else(|e| panic!("{e}"));
+        assert!(!dir_hidden(&pass, &hide(&["file"]), &[], Some(&work)));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -824,7 +824,8 @@ fn a_pass_that_limits_names_is_enforced_by_address_only_and_playpen_says_so() {
         &valid_pass(&[WEB, SIP]).replace("[ceilings]\ncalls = 6\n", ""),
     );
     let (_, out) = reach(&["--pass", s(&plain)], &["192.0.2.1:9101/tcp"]);
-    assert!(!text(&out.stderr).contains("NOTE"));
+    let err = text(&out.stderr);
+    assert!(pass_notes(&err).is_empty(), "{err}");
 }
 
 #[test]
@@ -1198,6 +1199,16 @@ fn getent(stdout: &str, name: &str) -> Vec<String> {
         .collect()
 }
 
+/// The NOTE lines on stderr, without the one about the pass's directory:
+/// every pass here is in a directory the command can reach, so every run
+/// gets that one (it is tested in `tests/own_files.rs`).
+fn pass_notes(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|l| l.contains("NOTE") && !l.contains("is not hidden from the command"))
+        .collect()
+}
+
 /// The start line without its NOTE lines: the first line and the
 /// `playpen:   ` clause lines after it.
 fn start_line(stderr: &str) -> String {
@@ -1568,7 +1579,7 @@ fn the_start_line_has_one_ceiling_note_naming_every_ceiling() {
     let (_, out) = reach(&["--pass", s(&pass)], &["192.0.2.1:9101/tcp"]);
     let err = text(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{err}");
-    let notes: Vec<&str> = err.lines().filter(|l| l.contains("NOTE")).collect();
+    let notes = pass_notes(&err);
     assert_eq!(notes.len(), 1, "{err}");
     assert!(notes[0].contains("(calls, requests)"), "{err}");
 
@@ -1577,7 +1588,8 @@ fn the_start_line_has_one_ceiling_note_naming_every_ceiling() {
         &valid_pass(&[WEB]).replace("[ceilings]\ncalls = 6\n", ""),
     );
     let (_, out) = reach(&["--pass", s(&plain)], &["192.0.2.1:9101/tcp"]);
-    assert!(!text(&out.stderr).contains("NOTE"), "{}", text(&out.stderr));
+    let err = text(&out.stderr);
+    assert!(pass_notes(&err).is_empty(), "{err}");
 }
 
 #[test]

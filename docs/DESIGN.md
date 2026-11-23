@@ -724,6 +724,67 @@ the supervisor requests SIGKILL if needed. A delayed supervisor or init and
 kernel signal delivery affect when the command actually stops. The hidden
 `--pass-recheck-ms` may shorten the poll interval in tests.
 
+**The command and the pass file.** The command runs as the operator, who
+owns the pass, so nothing in file permissions keeps it from the pass. An
+evaluation showed the result: a command copied its pass at start and put
+the copy back 17 ms after the owner set `revoked = true`, and the run went
+on. Two measures follow, and a limit that only the operator can close.
+
+- *The pass is `/dev/null` inside*, as the capture is: its path joins the
+  hidden paths. Inside, reading it gives nothing. A bind mount is attached
+  to the file's directory entry, so in the sandbox's mount namespace a
+  rename or removal of that entry, and a rename over it, fail with
+  `EBUSY`, and a hard link fails with `EXDEV`. The directory stays
+  writable: it is often the working directory or next to it, and a
+  read-only bind of it would break builds. The evaluation's command now
+  copies an empty file, so its "restore" writes an empty pass, which no
+  longer validates, and the run stops.
+- *The limit.* An owner who edits the pass with an editor or `sed -i`
+  writes a new file and renames it over the old one. On the host that
+  rename detaches the bind mount, in every namespace, so the new pass is
+  visible inside. A command that can write the directory can then read
+  the new pass, or rename an unrevoked one over it before the next
+  re-read. Measured: a command that rewrites `revoked = true` to `false`
+  whenever it sees it kept a revoked run alive. A changed inode of the
+  pass cannot count as tampering, because every such edit by the owner
+  changes it. A watch on the directory (inotify, fanotify) was considered
+  and rejected: a restore inside one re-read interval looks the same as
+  an edit, writes through a shared `mmap` raise no modify event, and an
+  unprivileged fanotify does not say which process wrote. While the
+  command can write the pass's directory there is no sound fix. The sound
+  setup is the pass in a directory of its own, outside the working
+  directory, hidden with `--hide`: the same command then cannot even see
+  the pass (measured), and the revocation stops the run. playpen prints a
+  NOTE at the start when the pass's directory is not hidden that way.
+  Hiding the working directory, or a directory above it, does not count:
+  a process keeps reaching the real directory it started in through
+  relative paths and `..` (measured).
+- *The directory is held.* playpen opens the pass's directory (`O_PATH`)
+  at start and reads the pass through it on every re-read, with
+  hallpass's loader on `/proc/self/fd/N/NAME`, so the rules for links and
+  mode are unchanged and the messages name the path as given. After each
+  read it checks that the path to the directory still leads to the
+  directory it holds (device and inode). If not, it stops the run: "the
+  directory of the pass ... was moved or replaced". Without this a
+  command could move the directory (a directory with a mount point in it
+  can be renamed) and put a new one with a forged pass at the path; the
+  owner's edits would then go to the forged pass, or, with reads by path,
+  playpen would read the forged one. A pass replaced inside the held
+  directory, as the owner's edit does, is read as before. Not seen: a
+  directory moved away and back between two re-reads. With the pass's
+  directory hidden, the command can still do that with a directory above
+  it, but it cannot see when playpen re-reads, and a re-read in between
+  stops the run.
+- *The ledger.* Neither playpen nor `hallpass::load` reads the hallpass
+  ledger (`PASS.ledger`); hallpass's `spend` and `permits` do. playpen
+  hides it too when it is a regular file at start, so that the command
+  cannot rewind the record of what was spent under the pass. A ledger
+  first created during the run is not hidden, nor is hallpass's witness
+  under `~/.local/state/hallpass`, which playpen does not read. The price:
+  a tool inside the sandbox can no longer read the pass or spend from the
+  ledger. Such a tool is in the command's hands anyway, so a ceiling it
+  enforces from inside is not one the owner can rely on.
+
 ## Ending egress in the firewall
 
 Before this, the command could reach its approved destinations until it
@@ -1181,10 +1242,10 @@ goes on without a capture, and still exits 0.
   somewhere else. The run then stops before the command starts.
 
 **The command cannot touch it.** The capture's path is added to the hidden
-paths, so inside the sandbox it is `/dev/null`. The report file is written
-once, at the end, through the file playpen opened; the capture is written
+paths, so inside the sandbox it is `/dev/null`. The capture is written
 while the command runs, so without this the command (the same user) could
-change it the whole time.
+change it the whole time. The report file is hidden the same way (see
+"The report file").
 
 **A complete file when pasta stops.** pasta writes each packet as it goes,
 with two system calls (a `write` of the 16-byte record header, then the
@@ -1207,6 +1268,51 @@ during the run changes the difference between them.
 released, the file holds at most pasta's header and address resolution,
 and it would make a second run with the same name fail. playpen removes
 it, but only when the name still leads to the file it created.
+
+## The report file (`--report`)
+
+A CI job reads the report to decide whether the command misbehaved, and
+the command runs as the same user. An evaluation showed the attack: the
+command sent packets nobody approved, then renamed a clean-looking report
+over the `--report` file. playpen wrote its report through the file it
+had opened, which the rename had unlinked, and the path held the forgery
+(`drop_assertion: "pass"`).
+
+**Hidden.** When the report file is a regular file, its path joins the
+hidden paths: inside it is `/dev/null`, so the command cannot read or
+change it, rename or remove it, rename a file over it (`EBUSY`) or
+hard-link it (`EXDEV`). A pipe or a terminal (`--report /dev/stdout`) is
+neither hidden nor checked: binding `/dev/null` over a terminal would take
+it from the command. The report is created at its path before anything
+else, as before, so it exists before the command starts. Unlike the
+capture, playpen does not refuse a report in a directory others can write
+to, or one that exists: reports are commonly written into the working
+directory, and playpen writes the report only at the end, when it can
+check the path.
+
+**Checked at the end.** The command can still move a directory above the
+report (a directory with a mount point in it can be renamed) and put a
+forged report at the path in a new directory. So when every process in
+the sandbox is gone, P checks that the path's directory is the one the
+path led into at start (device and inode of an `O_PATH` descriptor taken
+at start) and that the path leads to the file it created (`fstat` of its
+descriptor against `stat` of the path). When either differs, P writes the
+report through its own file as before, and also to a new file at the
+path: a temporary file in the directory the path now leads into, created
+with `O_EXCL|O_NOFOLLOW` and the first file's mode, then renamed over the
+path. The rename replaces a forged file or a symbolic link and never
+writes through a link. It prints a warning, sets `message`, and exits 1
+where it would have exited 0. A run whose report was replaced shows a
+command working against the guard, so a CI job must not pass it. A
+non-zero status is kept, so the command's own failure still shows. When
+the new file cannot be written, P removes what is at the path, so no
+forgery is left, and reports `report-write-failed`.
+
+**Not closed.** A playpen killed before it writes the report leaves the
+file empty, or, after such a move, the command's file at the path. The
+path is `/dev/null` inside, so a build that owns a file of that name
+breaks; the README's CI example therefore writes the report into a new
+directory from `mktemp -d`.
 
 ## Drops while the command runs
 
@@ -1656,6 +1762,10 @@ less.
 | A pass swapped for a symbolic link, or made writable by others | hallpass's loader refuses both, at start and on every re-read | yes, at start (symlink, mode 0666) and during the run (renamed over by a symlink; mode 0620 and 0602) |
 | `--allow` adding a destination beside a pass | refused | yes |
 | The command reading or changing the packet capture while it runs | the capture's path is `/dev/null` inside, as with `--hide` | yes: the command finds a character device at the path |
+| The command reading its pass, or restoring a copy over the owner's revocation (the evaluation's attack) | the pass and its ledger are `/dev/null` inside; the copy is empty, and restoring it makes the pass invalid | yes (`the_restore_loop_of_the_evaluation_is_stopped_and_never_read_the_pass`, `the_pass_and_its_ledger_are_dev_null_inside_and_cannot_be_linked_moved_or_removed`: link `EXDEV`, rename and removal `EBUSY`) |
+| The command rewriting the pass after the owner's edit replaced the file | only when the pass's directory is hidden with `--hide` (a NOTE says so otherwise); not closed without it | yes (`with_its_directory_hidden_the_pass_cannot_be_seen_or_replaced`); without `--hide`, measured by hand to succeed |
+| The command moving the pass's directory and putting a forged pass at the path | the pass is read through the directory opened at start; a path that leads elsewhere stops the run | yes (`a_moved_pass_directory_with_a_forged_pass_in_its_place_stops_the_run`) |
+| The command replacing the `--report` file with a forged report | the report is `/dev/null` inside; a directory moved above it is found at the end, the report written again at the path, exit 1 | yes (`the_report_forgery_of_the_evaluation_leaves_the_real_report`, `a_moved_report_directory_with_a_forged_report_is_found_and_rewritten`, `a_symbolic_link_at_the_report_path_is_replaced_and_not_followed`) |
 | pasta writing the capture through a link put in place of the file | playpen creates the file (`O_EXCL`, `O_NOFOLLOW`) in a directory where no other user can replace it, starts pasta there by descriptor, and checks that its own file got pasta's header | yes: an existing file, a link, an unwritable and a group-writable directory are refused; a pasta that writes no capture stops the run before the command starts |
 | A capture cut by stopping pasta in the middle of a packet | P waits for pasta to exit by itself before SIGTERM | yes: a run stopped by its end time during continuous traffic leaves a file that parses to the last record, with the digest the report gives |
 
@@ -1722,18 +1832,22 @@ less.
   and cookies sent in clear. It is mode 0600 and hidden from the command,
   but every other process of the caller can read it. Treat it like the
   pass.
-- **Report file tampering.** The command runs as the same user and could
-  write to the `--report` path while it runs. playpen writes the report
-  through the file it opened before starting, after the command and every
-  process it started are gone, so the final content is playpen's, unless
-  the command replaced the path with another file. Put the report in a
-  directory the command is not expected to touch.
+- **Report file tampering.** Closed while playpen runs to the end (see
+  "The report file"). A playpen that is killed before it writes the
+  report leaves an empty file, or a forgery the command put at the path
+  after moving a directory above it. Trust the report only together with
+  playpen's own exit status. A report to a pipe or a terminal is not
+  protected.
 - **The re-read gap.** A revoked pass closes egress at the next re-read
   (up to 2 s); the command can still send until then. During the grace
-  after it, only loopback works. Anyone who can write the pass file can also put the old
-  content back between two re-reads, or edit it before the run starts;
-  hallpass's own threat model applies (it does not protect against a
-  writer of the engagement directory).
+  after it, only loopback works. Any process outside playpen that can
+  write the pass file can put the old content back between two re-reads,
+  or edit it before the run starts; hallpass's own threat model applies
+  (it does not protect against a writer of the engagement directory). The
+  command can do the same when the pass's directory is not hidden and an
+  edit has replaced the file (see "The command and the pass file"); and a
+  directory of the pass moved away and back between two re-reads is not
+  seen.
 
 ## Things that did not work rootless, and what was done instead
 
