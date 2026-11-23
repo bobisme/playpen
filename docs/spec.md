@@ -1215,12 +1215,28 @@ server (unless `--display`) or the terminal's input queue.
 
 Not guarded against, or known limits:
 
-- host-specific non-IP transports, including AF_VSOCK. The nft table filters
-  IPv4 and IPv6, and Landlock separately guards pathname Unix sockets. Playpen
+- non-IP socket families, including AF_VSOCK. The nft table filters IPv4
+  and IPv6, and Landlock separately guards pathname Unix sockets. Playpen
   checks inherited descriptors but does not impose a family allowlist on new
-  sockets. VM socket isolation depends on the kernel, transport and namespace
-  mode. A missing VSOCK sysctl establishes no general isolation guarantee.
-  See the [kernel VSOCK namespace documentation](https://docs.kernel.org/admin-guide/sysctl/net.html#ns-mode);
+  sockets. An AF_VSOCK socket of the command reaches the hypervisor host
+  from a VM, and the machine's VMs and VSOCK listeners from a host, unless
+  the sandbox's network namespace has VSOCK mode `local`
+  ([`ns_mode`](https://docs.kernel.org/admin-guide/sysctl/net.html#ns-mode),
+  Linux 7.0 and later). The command can also act as a VM through
+  `/dev/vhost-vsock`, which systemd's udev rules make mode 0666. A new
+  namespace takes its mode from the creator's
+  [`child_ns_mode`](https://docs.kernel.org/admin-guide/sysctl/net.html#child-ns-mode).
+  Playpen does not set it, so the sandbox has the caller's, which is
+  `global` unless an administrator wrote `local`. A namespace that exists
+  when the `vsock` module is loaded is `global`. Without
+  `/proc/sys/net/vsock/` (Linux before 7.0, or `vsock` not loaded) there is
+  no isolation: the command can load `vsock`, and its namespace is then
+  `global`. Before Linux 7.2 (measured on 7.1.4), AF_QIPCRTR sockets also
+  reach the machine's QRTR ports from the sandbox. DESIGN.md ("Socket
+  families") has the measurements;
+- a `socket()` call for a family whose module is not loaded makes the
+  kernel load the module, also when the command makes it; the module stays
+  loaded;
 - kernel exploits; bugs in nftables, pasta or Landlock;
 - processes started outside playpen;
 - what the daemon behind an exposed socket (`--expose`, `--display`) does

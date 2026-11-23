@@ -85,6 +85,8 @@ one by one with `--expose`.
 | The terminal: `TIOCSTI` (pushing input into the terminal, read by the host shell after playpen exits) | only where the kernel allows it | closed: refused by the kernel when `dev.tty.legacy_tiocsti` is 0; elsewhere the default runs the command in a new session without a controlling terminal, and `TIOCSTI` needs one | `the_command_cannot_type_into_the_terminal` (both modes; on this machine the kernel refuses in both, so the new-session layer is shown only by `/dev/tty` being unavailable) |
 | Other terminals of the same user (`/dev/pts/N`) | the command can open them: write text, read keystrokes | open; not a network path (`TIOCSTI` on them needs them to be the controlling terminal) | none |
 | The display server (X11, Wayland) | yes: an X11 client can type into any other window, for example a host terminal | closed by default (the sockets are refused and hidden); `--display` opens it, and the start line says so | `display_exposes_the_wayland_socket_and_is_off_by_default`; `display_works_with_a_real_x_server_and_is_off_by_default` (a private headless X server with a cookie, a real client, with and without Landlock) |
+| VM sockets (AF_VSOCK) the command creates | yes, in the kernel's default `global` mode: to the hypervisor host, to the machine's VMs, and to vsock listeners on the machine (also by acting as a VM through `/dev/vhost-vsock`) | open; see "Socket families" | `tests/socket_families.py` in disposable guests (see "Socket families"); not an automated test |
+| Qualcomm IPC router sockets (AF_QIPCRTR) the command creates | before 7.2: yes, to QRTR ports of the machine; from 7.2 the family exists in the initial namespace only | open before 7.2 | same; 7.1.4 and 7.2.8 |
 
 ### The default: Landlock plus a mount layer
 
@@ -160,6 +162,186 @@ numbers for directory users). Each can be brought back with `--expose`
 (for example `--expose "$SSH_AUTH_SOCK"`). The environment is not changed:
 variables such as `DBUS_SESSION_BUS_ADDRESS` still point at the hidden
 paths, and programs fail to connect as they would with the daemon down.
+
+## Socket families
+
+The nft table sees IPv4 and IPv6, and host Unix sockets are covered above.
+playpen installs no filter on `socket()`. The command can create a socket
+of any other family that the kernel offers to an unprivileged process in a
+new network namespace. This section records what each family did in a
+default sandbox and what it reaches. It was measured on 2026-11-22.
+
+**How it was measured.** `tests/socket_families.py sweep` calls `socket()`
+for every family number from 0 to 63, with types 1 to 5 and protocol 0 and
+the protocols in its `EXTRA` table. It prints the errno and the modules that
+appeared in `/proc/modules`. It ran as uid 1000 inside `playpen run
+--no-network` and inside `playpen run --allow 203.0.113.1:9/tcp`, with the
+same results in both. A sweep can load modules, so it ran in disposable QEMU
+guests (KVM, no NIC, no host file system). The guests booted Linux
+7.2.8-arch1-2 (the host's kernel image) and 7.1.4-arch1-1, with nftables
+1.1.7, pasta 2026_09_25.df90211 and Python 3.14.7. Every program, library
+and kernel module in the guests came from a cached Arch package whose
+signature `gpg` verified against pacman's keyring with full trust. The rest
+was the release build of playpen at `b8f760f`, the probe, the test
+scripts and a minimal `/etc`.
+
+On the host the sweep ran only for families that are built in or already
+loaded (`sweep --families 1,2,10,17,31,44,45`). The results matched the
+7.2.8 guest, and the host's module list did not change. The host's
+`modules.alias` equals the guest's apart from out-of-tree NVIDIA entries.
+Of the modules in the table, `aead`, `bluetooth`, `llc` and `rfkill` are
+loaded on the host. A command on the host would load the others as it did
+in the guest.
+
+### What each family does in the sandbox
+
+The kernel loads a family's module on the first `socket()` call for it. It
+does so for a process in any namespace, without privilege, and also when
+the call then fails. In the sandbox the sweep loaded 48 modules for 18
+families on 7.2.8, and 51 modules for 19 families on 7.1.4. Opening
+`/dev/vhost-vsock` loads 3 more (see "VM sockets").
+
+Every row comes from `P sweep` (see "Commands") on both kernels, and the
+results are the same on both except where a row says otherwise. The
+comparison with the initial namespace is the same sweep as uid 1000 without
+playpen.
+
+| Family (number) | `socket()` in the sandbox | Modules the attempt loaded | What the command reaches with it |
+|---|---|---|---|
+| Unix (1) | created | none (built in) | see "Host Unix sockets" |
+| IPv4 (2), IPv6 (10) | stream and datagram created. Raw sockets are denied; `playpen doctor` checks this | none (built in) | what the nft table accepts |
+| Netlink (16) | 14 of the 32 protocols created, the same as in the initial namespace | `crypto_user`, `ib_core`, `scsi_transport_iscsi`, `xfrm_user` | the kernel, and processes in the same namespace. `playpen doctor` checks that address and link changes are denied |
+| PF_KEY (15), packet (17), LLC (26), Phonet (35), XDP (44) | `EPERM` | `af_key`, `aead`, `xfrm_algo` (15); `llc2`, and `llc` on 7.2.8 (26); `phonet` (35) | nothing |
+| AppleTalk (5), ATM (8, 20), Bluetooth (31), IEEE 802.15.4 (36), NFC (39) | `EAFNOSUPPORT`. uid 1000 creates them in the initial namespace only. 7.2.8 has no AppleTalk module, and family 20 fails in its initial namespace too | `appletalk`, `llc`, `psnap` (7.1.4); `atm`; `bluetooth`, `rfkill`; `ieee802154`, `ieee802154_socket`; `nfc` | nothing |
+| MPLS (28) | `EAFNOSUPPORT`: MPLS has no sockets | `mpls_router`, `ip_tunnel` | nothing |
+| Qualcomm IPC router (42) | 7.1.4: datagram created. 7.2.8: `EAFNOSUPPORT`; `af_qrtr.c` at v7.2 allows the family in the initial namespace only, and v7.1 does not | `qrtr` | 7.1.4: the machine's QRTR ports, which all namespaces share. A datagram from the sandbox reached a root listener in the initial namespace. 7.2.8: nothing |
+| RDS (21) | seqpacket created | `rds` | not tested. RDS carries messages over TCP in the namespace (the nft table applies) or over RDMA devices (the guests had none) |
+| PPPoX (24) | created (PPPoE, L2TP, PPTP) | `pppox`, `pppoe`, `l2tp_ppp`, `pptp` and 7 modules they need | PPPoE frames go out on an interface of the namespace: `lo`, or pasta's tap. pasta forwards only ARP, IPv4 and IPv6 frames (`tap_add_packet` in its source). L2TP runs over UDP and PPTP over GRE in the namespace, where the nft table applies. Not tested by sending |
+| CAN (29) | created (raw, BCM, ISO-TP, J1939) | `can` and its 4 protocol modules | nothing: the namespace has no CAN interface, and the command cannot add one |
+| RxRPC (33) | datagram created | `rxrpc`, `krb5` and ciphers (`libdes` on 7.2.8; `fcrypt`, `pcbc` on 7.1.4) | UDP in the namespace, where the nft table applies. Not tested by sending |
+| ALG (38) | seqpacket created | `af_alg` | the kernel's crypto code; no peer |
+| VSOCK (40) | stream, datagram and seqpacket created | `vsock`, `vsock_loopback`, `vmw_vsock_vmci_transport`, `vmw_vmci`, `vmw_vsock_virtio_transport_common` | outside the nft table: see "VM sockets" |
+| KCM (41) | datagram and seqpacket created | `kcm` | the TCP sockets the command attaches to it, where the nft table applies |
+| SMC (43) | stream created | `smc`, `dibs` | TCP in the namespace, where the nft table applies. SMC-R and SMC-D need RDMA or ISM devices (the guests had none; not tested) |
+| MCTP (45) | datagram created | none (built in) | nothing: the namespace has no MCTP interface, and the command cannot add one |
+| TIPC (30) | `EAFNOSUPPORT` | none: `tipc` has no `net-pf-30` alias | not tested with `tipc` loaded |
+| every other number from 0 to 63 | `EAFNOSUPPORT` | none | nothing |
+
+In egress mode the namespace has `lo` and pasta's tap, which pasta names
+after the host's uplink (`dummy0` in the guests).
+
+### VM sockets (AF_VSOCK)
+
+Linux 7.0 added a VSOCK mode to each network namespace. It is in
+`/proc/sys/net/vsock/`, which exists only while the `vsock` module is
+loaded:
+
+- `ns_mode`: `global` or `local`. It is read-only and is fixed when the
+  namespace is created. The initial namespace is `global`.
+- `child_ns_mode`: `global` or `local`. A namespace that a process in this
+  namespace creates gets it as its `ns_mode`. It starts equal to `ns_mode`.
+  The first write locks it: a different value later fails with `EBUSY`. A
+  `local` namespace cannot write `global` (`EPERM`). Root in the user
+  namespace that owns the network namespace can write it; no privilege on
+  the host is needed.
+- `g2h_fallback` (7.1 and later; default 1): whether a connection to a CID
+  that no local VM has goes to the hypervisor.
+
+A `global` socket reaches the hypervisor, and the VMs and sockets of every
+`global` namespace. A `local` socket reaches only the VMs and sockets of
+its own namespace. The guest-to-host transports (virtio, VMCI, Hyper-V)
+refuse it, so it does not reach the hypervisor. A vhost device belongs to
+the namespace of the process that opened `/dev/vhost-vsock`. Before 7.0
+there is no mode, and every socket behaves as `global`. Sources: the [kernel
+documentation](https://docs.kernel.org/admin-guide/sysctl/net.html#ns-mode),
+and `net/vmw_vsock/af_vsock.c`, `virtio_transport.c`, `vsock_loopback.c`
+and `drivers/vhost/vsock.c` at v7.1 and v7.2.
+
+playpen creates the sandbox's namespace while it is in the caller's
+namespace, so the sandbox's `ns_mode` is the caller's `child_ns_mode`.
+That is `global` unless an administrator wrote `local` in the initial
+namespace.
+
+The paths below were measured on 7.1.4 and 7.2.8, with the same results on
+both. The command ran in a default sandbox, and the other side ran as root
+in the initial namespace. CID 2 is the host and CID 3 the guest.
+"Connected" means that a message and its reply went through. For `local`,
+root wrote `local` to the initial namespace's `child_ns_mode` before the
+sandbox started. The `local` runs used port 7001 and guest CID 43 in place
+of 7000 and 42.
+
+| Path | `global` (the default) | `local` | Command side; other side |
+|---|---|---|---|
+| In a VM with a vsock device, the command connects to the hypervisor host (CID 2) | connected | `ENETUNREACH` | L2: `P vsock-connect 2 1234`; L1: `P vsock-listen 1234` |
+| The hypervisor host connects to a listener of the command in the VM (CID 3) | connected | `ECONNRESET` | L2: `P vsock-listen 7000`; L1: `P vsock-connect 3 7000` |
+| On a host that runs a VM, the command connects to the VM (CID 3) | connected | `ENODEV` | L1: `P vsock-connect 3 5000`; L2: `P vsock-listen 5000` |
+| The command connects to a listener on its own machine over loopback: CID 1, and CID 2 where no guest-to-host transport is loaded | connected | `ECONNRESET` | `P vsock-connect 1 1234`, `P vsock-connect 2 1234`; `P vsock-listen 1234` |
+| The command opens `/dev/vhost-vsock`, acts as guest CID 42 and connects to a listener on its own machine | connected | reset by the kernel | `P vhost-guest 1234 --guest-cid 42`; `P vsock-listen 1234` |
+
+The VM rows used two nested guests on the same kernel. L1 played the
+hypervisor host and ran L2 with `-device vhost-vsock-pci,guest-cid=3`. The
+vhost module was never loaded on the real host. The loopback and
+`/dev/vhost-vsock` rows ran in L1 and in a single guest without a vsock
+device.
+
+Also measured, on both kernels:
+
+- Any user can read `ns_mode` and `child_ns_mode`, and so can the command
+  in the sandbox (`P vsock-mode`). The command cannot write its
+  `child_ns_mode` (`EACCES`).
+- A namespace that exists when `vsock` is loaded gets `global`. In a guest
+  without `vsock`, the command loaded it (`P sweep --families 40`), and its
+  `ns_mode` was `global`. Root then wrote `local` to the initial
+  namespace's `child_ns_mode`. The running sandbox stayed `global`, and a
+  sandbox started after the write was `local`.
+- A `local` namespace needs no privilege. As uid 1000 (the last command in
+  "Commands"): a user and network namespace of one's own, `local` written
+  to its `child_ns_mode`, then a child network namespace. The child's
+  `ns_mode` was `local`. From it, in a VM the hypervisor host was
+  unreachable (`ENETUNREACH`), and on the hypervisor host the VM was
+  unreachable (`ENODEV`). This also worked after root had locked the
+  initial namespace's `child_ns_mode` to `global`.
+- The command can load the modules. An AF_VSOCK `socket()` loads `vsock`
+  and 4 transport modules. Opening `/dev/vhost-vsock` loads `vhost_vsock`,
+  `vhost` and `vhost_iotlb`. systemd's `50-udev-default.rules` gives
+  `/dev/vhost-vsock` mode 0666 before the module is loaded, and the sandbox
+  on the host sees it with that mode. A VM's vsock driver needs `vsock`,
+  and a host loads `vhost_vsock` when it starts a VM with a vsock device.
+  On the development host neither module is loaded.
+- On the host, `--hide /dev/vhost-vsock` made the path `/dev/null` (1:3) in
+  the sandbox.
+
+### Landlock
+
+No Landlock right restricts which sockets a process creates. At ABI 9
+(Linux 7.1), Landlock covers file access, including lookups of pathname
+Unix sockets (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, new in ABI 9). It also
+covers binding and connecting TCP ports, abstract Unix sockets and
+signals. ABI 10 (7.2) adds binding UDP sockets to ports and setting their
+remote ports. The
+source for both is `/usr/include/linux/landlock.h` from linux-api-headers
+7.2-1. In the kernel sources, ABI 11 (7.3) adds only
+`LANDLOCK_RESTRICT_SELF_NO_NEW_PRIVS`, and ABI 12 (7.4-rc4) adds namespace
+and capability permissions. `LANDLOCK_ACCESS_FS_IOCTL_DEV` (ABI 5) can
+refuse the vhost ioctls on `/dev/vhost-vsock`. But opening the device
+still loads `vhost_vsock`, and `--hide` does both. There was nothing to
+test.
+
+### Commands
+
+`P` is `python3 -I tests/socket_families.py`. The command side ran as uid
+1000 in `playpen run --allow 203.0.113.1:9/tcp -- P ...`. The sweep and
+the VM-to-host row also ran with `--no-network` in place of `--allow`, and
+the test of a namespace that loaded `vsock` ran only with `--no-network`.
+
+| What | Command side | Other side (root, initial namespace) |
+|---|---|---|
+| Family table | `P sweep`; on the host `P sweep --families 1,2,10,17,31,44,45`; for the initial namespace, `P sweep` as uid 1000 without playpen | none |
+| QRTR reach | `P qrtr-send 20000` | `P qrtr-listen 20000` |
+| VSOCK paths | as in the VSOCK table | as in the VSOCK table |
+| Modes | `P vsock-mode` | `echo local > /proc/sys/net/vsock/child_ns_mode` |
+| Mode of a namespace that loaded `vsock` | `bash -c 'P sweep --families 40; sleep 3; P vsock-mode'` | the same `echo`, while the command sleeps |
+| Unprivileged `local` (uid 1000, without playpen) | in L2: `unshare --user --map-root-user --net bash -c 'echo local > /proc/sys/net/vsock/child_ns_mode && unshare --net P vsock-connect 2 1234'`; in L1 the same with `P vsock-connect 3 5000` | `P vsock-listen 1234` in L1; `P vsock-listen 5000` in L2 |
 
 ## The terminal, job control and inherited descriptors
 
@@ -827,6 +1009,19 @@ it, but only when the name still leads to the file it created.
   sandbox is frozen by its init after 5 seconds without a sign of P; for
   those 5 seconds the end time and the pass re-read are not enforced. The
   kernel's filter keeps working.
+- **VM sockets (AF_VSOCK).** The nft table does not see them. In the
+  kernel's default `global` mode the command reaches the hypervisor host
+  from a VM with a vsock device, and the machine's VMs and vsock listeners
+  from the host, also by acting as a VM through `/dev/vhost-vsock`. From
+  Linux 7.0, the kernel keeps the sockets of a `local` namespace inside it.
+  playpen does not create the sandbox's namespace in `local` mode. See
+  "Socket families".
+- **Kernel modules the command loads.** A `socket()` call for a family
+  whose module is not loaded makes the kernel load the module, for any
+  user and from any namespace. In the sandbox this loaded 48 modules on
+  7.2.8, and opening `/dev/vhost-vsock` loads 3 more. They stay loaded
+  after the run, and a bug in any of them can be reached by the command.
+  playpen does not stop this.
 - **The approved destination.** If it is a proxy, a VPN endpoint or a
   jump host, traffic continues from there. playpen cannot see it.
 - **Names resolved elsewhere.** A client that brings its own resolver (DNS

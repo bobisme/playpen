@@ -370,9 +370,19 @@ playpen guards against:
 
 playpen does not guard against:
 
-- non-IP transports provided by the host or hypervisor. In particular,
-  VM sockets (AF_VSOCK) have their own namespace rules and fall outside
-  playpen's IP filter and drop counts;
+- VM sockets (AF_VSOCK). playpen's IP filter and drop counts do not see
+  them. In the kernel's default mode the command reaches the hypervisor
+  host from inside a VM, and the machine's VMs and VM-socket listeners on
+  a host. Linux 7.0 and later can keep them inside a network namespace;
+  playpen does not ask it to;
+- other non-IP socket families. playpen does not restrict which families
+  the command creates. Before Linux 7.2 (measured on 7.1.4) this includes
+  the Qualcomm IPC router (AF_QIPCRTR), whose ports every namespace shares.
+  DESIGN.md ("Socket families") has what each family reaches, and what was
+  not tested;
+- kernel modules loaded by the command: creating a socket of a family
+  whose module is not loaded makes the kernel load it, for any user. The
+  module stays loaded;
 - a kernel exploit, or a bug in nftables, pasta or Landlock;
 - processes started outside playpen;
 - whatever the daemon behind a socket you exposed does for the command;
