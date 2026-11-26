@@ -426,6 +426,20 @@ message saying why:
   broadcast address, or IPv6 link-local (`fe80::/10`) addresses;
 - anything with whitespace, control characters or non-ASCII.
 
+There is no keyword for "every address". A prefix written outside the
+brackets (`[::]/0:443/tcp`) is refused with `the prefix is outside the
+brackets; put it inside the brackets: [::/0]:443/tcp` (the address and
+prefix are the ones given; the corrected spec can itself be refused, as
+this one is). A network that includes an unapprovable range and has a
+prefix shorter than /8 is refused with a pointer to the README's lines for
+"every public address on one port". Those lines are 51 IPv4 networks
+that together are `1.0.0.0` to `223.255.255.255` without `127.0.0.0/8`,
+the private networks (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`),
+shared address space (`100.64.0.0/10`) and link-local addresses
+(`169.254.0.0/16`, with the metadata address), and `2000::/3` for IPv6. A
+unit test reads them from the README and checks that they cover exactly
+that set and do not overlap.
+
 IPv4 link-local addresses (`169.254.0.0/16`) are accepted, because the
 operator typed them; a pass refuses them. A pass is an owner's written
 approval and is held to the hallpass rules, while `--allow` is the
@@ -1162,9 +1176,68 @@ releases the workload. Normal expiry and revocation checks apply throughout.
 If the digest differs, the refusal says so and prints the current plan's
 fields on one line, each value cut at 160 characters. The digest is all that
 was reviewed, so playpen cannot say which field differs; compare that line,
-or `playpen plan --format json`, with the reviewed plan. The digest describes configuration. Program and filesystem contents, the
-environment inherited by the child, and later pass edits have their own
-lifetimes.
+or `playpen plan --format json`, with the reviewed plan. The digest describes configuration.
+
+The digest binds exactly the keys of the plan object. Always present:
+`schema`, `fixture`, `fail_on_drop`, `instrumented_grants` (with
+`--report-grant-use`), `require_enforced`, `command`, `cwd`, `pass`
+(file, id, digest, labels, recheck interval, name limits, coverage),
+`allowed`, `hosts`, `until`, `network`, `dns_stub`, `loopback_addresses`,
+`hide`, `expose`, `display`, `display_paths`, `socket_guard` and
+`new_session`. Present only when given, so that older digests stay valid:
+`private_tty`, `pass_hosts`, `capture`, `live_drops`, `report_contacts`,
+`on_drop` and `pass_dir_writable`.
+
+The digest does not bind: the environment the command inherits (`PATH`,
+`LD_PRELOAD`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and
+every other variable); the program the first argument names, which is not
+resolved to a path and whose contents, like those of every file the command
+reads, are not hashed; `--report` and `--shareable-report`; `--format`;
+`--expect-plan`; helper availability, namespace setup and the firewall,
+which are checked at launch; and later pass edits. Program and filesystem
+contents, the environment and pass edits have their own lifetimes.
+
+The resolved executable path and the proxy variables are not bound, by
+decision. Egress is limited by the grants, which the digest binds: a proxy
+variable can only direct the command to an address a grant already allows,
+and another program meets the same grants. A path is not the program's
+contents, so binding it would suggest more than it checks. A binding would
+also need a new option, because a key that is always present changes every
+existing digest.
+
+### Resolving names for `--allow` and `--host`
+
+```text
+playpen resolve NAME... [--port PORT] [--ipv4] [--format text|pretty|json]
+```
+
+Run outside the sandbox. For each `NAME` (a host name as `--host` takes
+it, lower-cased) it calls the system resolver (`getaddrinfo`, through the
+standard library) and prints the options that approve the addresses it
+returned. It sends nothing to them, starts no helper, reads no pass and
+writes no file. `--port` (default 443, 1 to 65535) is the TCP port of the
+`--allow` lines; `--ipv4` leaves out IPv6 addresses.
+
+Text and pretty output print on stdout, one per line, first `--allow
+ADDR:PORT/tcp` (IPv6 as `[ADDR]:PORT/tcp`) for each distinct address,
+sorted with IPv4 first, then `--host NAME=ADDR` for each name in the order
+given and each of its addresses, sorted. Each printed option is parsed by
+the parser of `run` first; an address that is refused (loopback, link-local
+IPv6, unspecified) is left out and named on stderr. So
+`playpen run $(playpen resolve NAME...) -- COMMAND` works; an IPv6 line
+contains `[` and `]`, so run `set -f` before such a substitution. stderr
+carries the notes, a line for each name that gave no address that can be
+approved, and `playpen: caution: these are the addresses the names have
+now, from this host's resolver. They change, and the resolver is trusted:
+check that they belong to the service before you approve them.`
+
+JSON: `{"allow": [SPEC...], "hosts": ["NAME=ADDR"...], "unresolved":
+[NAME...], "advice": [...]}`. The first advice has type `changes` and the
+caution; each note is an advice of type `lookup`.
+
+Exit 0 means every name gave an approvable address. Exit 1 means at least
+one name gave none (the others are still printed). Exit 2 means an invalid
+name or port, with nothing on stdout.
 
 ### 4.3 `playpen rules`
 

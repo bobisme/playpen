@@ -216,6 +216,9 @@ impl Net {
                         "; loopback inside the sandbox is always allowed and the host's loopback cannot be approved"
                     }
                     "IPv4-mapped IPv6" => "; write the IPv4 address instead",
+                    _ if self.prefix < 8 => {
+                        "; to allow every other address, list the ranges around it (README: \"Allow every public address on one port\")"
+                    }
                     _ => "",
                 };
                 return Err(SpecError::new(format!(
@@ -375,6 +378,7 @@ fn parse_allow_inner(spec: &str) -> Result<AllowRule, SpecError> {
     let (rest, proto) = spec
         .rsplit_once('/')
         .ok_or_else(|| SpecError::new("missing /PROTO at the end (for example :443/tcp)"))?;
+    let proto_text = proto;
     let proto = match proto {
         "tcp" => Proto::Tcp,
         "udp" => Proto::Udp,
@@ -388,9 +392,15 @@ fn parse_allow_inner(spec: &str) -> Result<AllowRule, SpecError> {
         let (inner, tail) = after
             .split_once(']')
             .ok_or_else(|| SpecError::new("missing ] after the IPv6 address"))?;
-        let ports = tail
-            .strip_prefix(':')
-            .ok_or_else(|| SpecError::new("missing :PORT after the ]"))?;
+        let ports = tail.strip_prefix(':').ok_or_else(|| {
+            // `[::]/0:443` has the prefix outside the brackets.
+            match tail.strip_prefix('/').and_then(|t| t.split_once(':')) {
+                Some((prefix, ports)) if plain_decimal(prefix) => SpecError::new(format!(
+                    "the prefix is outside the brackets; put it inside the brackets: [{inner}/{prefix}]:{ports}/{proto_text}"
+                )),
+                _ => SpecError::new("missing :PORT after the ]"),
+            }
+        })?;
         (inner, ports, true)
     } else {
         let (net, ports) = rest
@@ -759,6 +769,90 @@ mod tests {
             mapped.contains("includes IPv4-mapped IPv6 addresses, which cannot be approved; write the IPv4 address instead"),
             "{mapped}"
         );
+    }
+
+    #[test]
+    fn a_prefix_outside_the_brackets_gets_a_hint() {
+        let err = parse_allow("[::]/0:443/tcp").map_or_else(|e| e.to_string(), |r| r.to_string());
+        assert!(
+            err.contains("put it inside the brackets: [::/0]:443/tcp"),
+            "{err}"
+        );
+        let err =
+            parse_allow("[2000::]/3:80-90/udp").map_or_else(|e| e.to_string(), |r| r.to_string());
+        assert!(err.contains("[2000::/3]:80-90/udp"), "{err}");
+        let err = parse_allow("[::1]443/tcp").map_or_else(|e| e.to_string(), |r| r.to_string());
+        assert!(err.contains("missing :PORT after the ]"), "{err}");
+    }
+
+    /// The README's lines for every public address on a port: exactly the
+    /// IPv4 addresses 1.0.0.0 to 223.255.255.255 except loopback, the
+    /// private networks, shared address space and link-local addresses.
+    #[test]
+    fn documented_sets_for_every_address_are_exact() {
+        // The networks of the README's "Allow every public address" loop.
+        let readme = include_str!("../README.md");
+        let section = readme
+            .split("### Allow every public address on one port")
+            .nth(1)
+            .expect("README section");
+        let loop_text = section
+            .split("for net in")
+            .nth(1)
+            .and_then(|t| t.split("; do").next())
+            .expect("README loop");
+        let rules: Vec<AllowRule> = loop_text
+            .split_whitespace()
+            .filter(|w| *w != "\\")
+            .map(|n| parse_allow(&format!("{n}:443/tcp")).expect("documented line parses"))
+            .collect();
+        // Each network as the range [first, last] of its addresses.
+        let span = |addr: Ipv4Addr, prefix: u8| {
+            let first = u64::from(u32::from(addr));
+            (first, first + (1u64 << (32 - u32::from(prefix))) - 1)
+        };
+        let listed: Vec<(u64, u64)> = rules
+            .iter()
+            .map(|r| match r.net.addr() {
+                IpAddr::V4(a) => span(a, r.net.prefix()),
+                IpAddr::V6(_) => panic!("{r} is not IPv4"),
+            })
+            .collect();
+        let excluded: Vec<(u64, u64)> = [
+            ("10.0.0.0", 8),
+            ("100.64.0.0", 10),
+            ("127.0.0.0", 8),
+            ("169.254.0.0", 16),
+            ("172.16.0.0", 12),
+            ("192.168.0.0", 16),
+        ]
+        .iter()
+        .map(|(a, p)| span(a.parse().expect("address"), *p))
+        .collect();
+        let apart = |a: (u64, u64), b: (u64, u64)| a.1 < b.0 || b.1 < a.0;
+        let (low, high) = (
+            span(Ipv4Addr::new(1, 0, 0, 0), 8).0,
+            span(Ipv4Addr::new(223, 0, 0, 0), 8).1,
+        );
+        for (i, &n) in listed.iter().enumerate() {
+            // Inside 1.0.0.0 to 223.255.255.255, outside every excluded
+            // network, and apart from every other line.
+            assert!(n.0 >= low && n.1 <= high, "{}", rules[i]);
+            for &e in &excluded {
+                assert!(apart(n, e), "{} overlaps an excluded network", rules[i]);
+            }
+            for (j, &m) in listed.iter().enumerate().skip(i + 1) {
+                assert!(apart(n, m), "{} overlaps {}", rules[i], rules[j]);
+            }
+        }
+        // Disjoint, so the sizes add up to exactly the public set.
+        let size = |r: &(u64, u64)| r.1 - r.0 + 1;
+        let public = (high - low + 1) - excluded.iter().map(size).sum::<u64>();
+        assert_eq!(listed.iter().map(size).sum::<u64>(), public);
+        let v6 = parse_allow("[2000::/3]:443/tcp").expect("documented IPv6 line parses");
+        assert!(v6.net.contains("2606:4700::1".parse().expect("ip")));
+        assert!(!v6.net.contains("fe80::1".parse().expect("ip")));
+        assert!(!v6.net.contains("fc00::1".parse().expect("ip")));
     }
 
     #[test]

@@ -26,6 +26,77 @@ For a quick run, supply destinations directly with `--allow`.
 - [docs/DESIGN.md](docs/DESIGN.md): why it is built this way, and the leaks
   considered and how each is closed or not.
 
+## Recipes
+
+Allow a package registry or a forge by name. Build playpen first (next
+section). There is no DNS inside the sandbox, so each name needs the
+addresses it has now: `playpen resolve` looks the names up on the host,
+outside the sandbox, and prints the `--allow` and `--host` lines. It sends
+nothing to those addresses and changes nothing. `--ipv4` keeps the output
+short. `set -f` stops the shell from reading `[` and `]` in an IPv6 line
+as a file name pattern.
+
+Addresses change. A CDN or a forge moves its names between addresses, so
+a literal line that works today can fail next month. Run `playpen resolve`
+again, and check that the addresses belong to the service before you
+approve them: it trusts this host's resolver.
+
+Each recipe below was run as written on 2026-11-26 (UTC), with both the
+`resolve` form and the literal fallback, and installed one package or
+cloned one small public repository. The fallbacks show one address of the
+many that `resolve` prints; the addresses are the ones of that day.
+Run from a directory the command can write.
+
+PyPI (pip):
+
+```sh
+playpen run $(playpen resolve --ipv4 pypi.org files.pythonhosted.org) \
+  -- python3 -m pip download --no-cache-dir --no-deps six==1.16.0 -d out
+# the literal form
+playpen run --allow 151.101.0.223:443/tcp \
+  --host pypi.org=151.101.0.223 --host files.pythonhosted.org=151.101.0.223 \
+  -- python3 -m pip download --no-cache-dir --no-deps six==1.16.0 -d out
+```
+
+npm. `--cache ./cache` keeps npm's cache in the working directory:
+
+```sh
+playpen run $(playpen resolve --ipv4 registry.npmjs.org) \
+  -- npm install --cache ./cache --no-audit --no-fund is-odd
+# the literal form
+playpen run --allow 104.16.0.34:443/tcp --host registry.npmjs.org=104.16.0.34 \
+  -- npm install --cache ./cache --no-audit --no-fund is-odd
+```
+
+GitHub (read-only clone of a public repository):
+
+```sh
+playpen run $(playpen resolve --ipv4 github.com) \
+  -- git clone --depth 1 https://github.com/octocat/Hello-World.git
+# the literal form
+playpen run --allow 140.82.112.3:443/tcp --host github.com=140.82.112.3 \
+  -- git clone --depth 1 https://github.com/octocat/Hello-World.git
+```
+
+crates.io (cargo, from a directory with a `Cargo.toml`; `CARGO_HOME` keeps
+the registry cache in the working directory):
+
+```sh
+CARGO_HOME=$PWD/cargo-home \
+playpen run $(playpen resolve --ipv4 index.crates.io static.crates.io) -- cargo fetch
+# the literal form
+CARGO_HOME=$PWD/cargo-home \
+playpen run --allow 151.101.2.137:443/tcp \
+  --host index.crates.io=151.101.2.137 --host static.crates.io=151.101.2.137 \
+  -- cargo fetch
+```
+
+`playpen resolve NAME... [--port PORT] [--ipv4]` prints one `--allow
+ADDR:PORT/tcp` line for each address and one `--host NAME=ADDR` line for
+each name and address, on stdout, and a caution on stderr. A name that
+gives no address that can be approved is listed on stderr and the exit
+status is 1. With `--format json` it prints `allow`, `hosts` and
+`unresolved`.
 ## Two-minute example
 
 ```console
@@ -237,6 +308,45 @@ leaves it out. A name is shown lower-cased, with every byte in a label
 other than a letter, digit, `-` or `_` escaped (`\027` for ESC); a name
 longer than 253 bytes is cut and ends in `...`.
 
+### Allow every public address on one port
+
+There is no keyword for "any address". `0.0.0.0/0` and `::/0` are refused
+because they include addresses that cannot be approved (0.0.0.0/8,
+127.0.0.0/8, 224.0.0.0/4, ::, ::1, and the others in the spec). These lines
+allow every public IPv4 address on TCP port 443: 1.0.0.0 to 223.255.255.255
+except loopback (127.0.0.0/8) and the networks that are not on the internet,
+which are the private networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16),
+shared address space (100.64.0.0/10) and link-local addresses
+(169.254.0.0/16, which holds the cloud metadata address). The last line adds
+the IPv6 global unicast block 2000::/3:
+
+```bash
+allow=()
+for net in 1.0.0.0/8 2.0.0.0/7 4.0.0.0/6 8.0.0.0/7 11.0.0.0/8 12.0.0.0/6 \
+          16.0.0.0/4 32.0.0.0/3 64.0.0.0/3 96.0.0.0/6 100.0.0.0/10 \
+          100.128.0.0/9 101.0.0.0/8 102.0.0.0/7 104.0.0.0/5 112.0.0.0/5 \
+          120.0.0.0/6 124.0.0.0/7 126.0.0.0/8 128.0.0.0/3 160.0.0.0/5 \
+          168.0.0.0/8 169.0.0.0/9 169.128.0.0/10 169.192.0.0/11 \
+          169.224.0.0/12 169.240.0.0/13 169.248.0.0/14 169.252.0.0/15 \
+          169.255.0.0/16 170.0.0.0/7 172.0.0.0/12 172.32.0.0/11 \
+          172.64.0.0/10 172.128.0.0/9 173.0.0.0/8 174.0.0.0/7 176.0.0.0/4 \
+          192.0.0.0/9 192.128.0.0/11 192.160.0.0/13 192.169.0.0/16 \
+          192.170.0.0/15 192.172.0.0/14 192.176.0.0/12 192.192.0.0/10 \
+          193.0.0.0/8 194.0.0.0/7 196.0.0.0/6 200.0.0.0/5 208.0.0.0/4; do
+  allow+=(--allow "$net:443/tcp")
+done
+allow+=(--allow '[2000::/3]:443/tcp')
+playpen run "${allow[@]}" -- curl -sS https://example.com/
+```
+
+The start line and the report list each of these grants. This is not a
+narrow approval: a command that can reach every public address can send
+data anywhere on that port. To reach a private network as well, add its own
+`--allow` line. In an IPv6 grant the prefix goes inside the brackets:
+`[2000::/3]:443/tcp`, not `[2000::]/3:443/tcp`; the second form is refused
+with that hint. A test reads these lines from this file and checks that they
+cover exactly the set above and do not overlap.
+
 To see the firewall rules without running anything:
 
 ```console
@@ -274,10 +384,41 @@ digest=$(playpen plan --format json --no-network -- printf hello | jq -er .diges
 playpen run --expect-plan "$digest" --no-network -- printf hello
 ```
 
-The digest binds the reviewed arguments and effective settings, including
-the pass bytes when present. The command reads executable and file contents
-at run time. If the digest differs, `run` prints the current plan's fields.
-It cannot say which one differs, because only the digest was reviewed.
+The digest is the SHA-256 of the plan that `playpen plan --format json`
+prints. It binds exactly the fields of that `plan` object:
+
+- the command's arguments, byte for byte, and the working directory;
+- the grants (in canonical order), the `--host` entries, `--until`, and
+  the pass's id, file, digest, labels and recheck interval when a pass is
+  used (so the pass bytes);
+- `--no-network`, `--hide`, `--expose`, `--display`, `--without-landlock`,
+  `--new-session`, `--fail-on-drop`, `--require-enforced`;
+- when given, `--private-tty`, `--pass-hosts`, `--capture` (the path),
+  `--live-drops`, `--report-contacts`, `--report-grant-use`, `--on-drop`
+  and `--pass-dir-writable`.
+
+It does not bind:
+
+- the environment the command inherits: `FOO=bar playpen plan ...` gives
+  the same digest. That includes `PATH`, `LD_PRELOAD`, `HTTP_PROXY`,
+  `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY`;
+- the program the first argument names: it is not resolved to a path, so
+  a different `PATH` can run a different program, and the contents of
+  that program and of every file the command reads are not hashed;
+- `--report` and `--shareable-report` (where the report goes and how it
+  is redacted), `--format`, and `--expect-plan` itself;
+- the host: helper availability, namespace setup and the firewall are
+  checked at launch, and later edits to a pass.
+
+The firewall does not depend on those unbound inputs. A proxy variable can
+only point the command at an address the grants already allow, and a
+different program still meets the same grants. So playpen does not bind the
+resolved path or the proxy variables. Doing so would need an opt-in option,
+to keep existing digests valid, and a digest of a path says nothing about
+what the program does. If you need the program fixed, give the command as
+an absolute path and check its hash yourself. If the digest differs, `run` prints the
+current plan's fields. It cannot say which one differs, because only the
+digest was reviewed.
 
 ### Check dropped traffic in CI
 

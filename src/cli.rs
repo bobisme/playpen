@@ -4,6 +4,7 @@ pub(crate) mod discovery;
 mod event_pipe;
 mod policy_test;
 mod preview;
+mod resolve;
 use event_pipe::EventPipe;
 
 use std::ffi::OsString;
@@ -63,6 +64,9 @@ enum Cmd {
     /// Compare two full reports without executing either command.
     #[command(display_order = 6, after_help = discovery::COMPARE)]
     Compare { before: PathBuf, after: PathBuf },
+    /// Print the --allow and --host options for what host names resolve to now.
+    #[command(display_order = 8, after_help = discovery::RESOLVE)]
+    Resolve(resolve::ResolveArgs),
     /// Print the narrowest --allow and --host options for what one run contacted.
     #[command(display_order = 7, after_help = discovery::SUGGEST)]
     Suggest {
@@ -113,7 +117,7 @@ enum Cmd {
         mode: crate::doctor::Mode,
     },
     /// Run native sandbox qualification scenarios and report what executed.
-    #[command(display_order = 8, after_help = discovery::QUALIFY)]
+    #[command(display_order = 9, after_help = discovery::QUALIFY)]
     Qualify {
         /// List scenario IDs and prerequisites without executing any probes or tests.
         #[arg(long, conflicts_with_all = ["source", "required"])]
@@ -126,10 +130,10 @@ enum Cmd {
         required: Vec<String>,
     },
     /// Show usage, examples and the suggested workflow for a public command.
-    #[command(display_order = 9, after_help = discovery::HELP)]
+    #[command(display_order = 10, after_help = discovery::HELP)]
     Help { command: Option<String> },
     /// Print the installed Playpen version.
-    #[command(display_order = 10, after_help = discovery::VERSION)]
+    #[command(display_order = 11, after_help = discovery::VERSION)]
     Version,
     /// Checks run inside the sandbox by doctor and the tests.
     #[command(hide = true)]
@@ -391,6 +395,7 @@ fn dispatch(cmd: Cmd, format: Format) -> i32 {
         Cmd::Run(args) => run(&args, format),
         Cmd::PolicyTest(args) => policy_test::run(&args, format),
         Cmd::Plan(args) => preview::print(&args, format),
+        Cmd::Resolve(args) => resolve::run(&args, format),
         Cmd::Compare { before, after } => crate::compare::run_formatted(&before, &after, format),
         Cmd::Suggest { report } => crate::suggest::run_formatted(&report, format),
         Cmd::Rules {

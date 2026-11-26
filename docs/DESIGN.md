@@ -2210,3 +2210,37 @@ less.
   counters instead. It holds 1024 destinations per address family; beyond
   that the total is still exact and the report says the list is
   truncated.
+
+## What the plan digest binds, and why not the environment
+
+The plan digest covers the fields of the `playpen plan` object (spec,
+"Previewing a run"). It leaves out the inherited environment, the
+resolution of the program name to a path, the contents of programs and
+files, and the report options. This is on purpose: the firewall limits what
+the command can reach, and the digest binds the grants that set that limit.
+A proxy variable can only point the command at an address a grant allows,
+and another program or a different `PATH` meets the same grants. A bound
+path would say nothing about the program's contents, and a key that is
+always present would change every existing digest, so playpen binds neither
+the resolved path nor the proxy variables. A later opt-in option could add
+them as keys that exist only when given, as `--live-drops` does.
+
+## Names for a registry or a forge, and every address on a port
+
+`playpen resolve` exists because there is no DNS inside the sandbox, and a
+user would otherwise run `getent`, pick addresses and write one `--host`
+for each name. It runs outside the sandbox, uses the system resolver and
+prints only. It prints every address a name has, because the stub answers
+a name with all of its `--host` addresses, and approving one address of a
+CDN name would fail when the client picks another. It trusts the host's
+resolver, and says so.
+
+A keyword for "every public address" was not added: the expansion is 51
+IPv4 networks, which would be long on the start line, and an operator who
+wants this should see what they approve. The README gives the 51 networks
+and `2000::/3` instead. They leave out the private networks, shared
+address space and link-local addresses (with the metadata address),
+because a user who asks for "any host on 443" means the internet, not the
+machines on their own network; a private network needs its own `--allow`.
+A unit test reads the networks from the README and checks the set is
+exact.

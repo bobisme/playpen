@@ -73,6 +73,14 @@ pub(super) const SUGGEST: &str = "Examples
 Agent workflow
   Supply one full private report of a run with --report-contacts. Text output prints one option per line on stdout, ready for playpen run, and the caution on stderr. In JSON, read source, allow, hosts and no_network: each allow entry is one contacted address, port and protocol, never wider than the run's own grants. With source pass the entries are destinations for a narrower pass from its owner, not --allow options. One quiet run does not show that a later run needs less: review the list before narrowing an approval.
   Exit 0 means printed. Exit 2 means the report's outcome is not ran, the record is missing, truncated or unavailable, or the report is invalid.";
+pub(super) const RESOLVE: &str = "Examples
+  playpen resolve pypi.org files.pythonhosted.org
+  playpen resolve --ipv4 github.com --format json
+  playpen run $(playpen resolve --ipv4 pypi.org files.pythonhosted.org) -- pip download six
+
+Agent workflow
+  Run it outside the sandbox: it looks the names up with this host's resolver (getaddrinfo) and prints one --allow ADDR:PORT/tcp line for each address (--ipv4: only IPv4 ones) and one --host NAME=ADDR line for each name and address. It sends nothing to those addresses and changes nothing. Text output has only the options on stdout, so it can be given to run; an IPv6 spec contains [ and ], so run set -f before such a substitution. The addresses change and the resolver is trusted: review them, and run it again when a lookup in the sandbox fails.
+  Exit 0 means every name gave an approvable address. Exit 1 means a name gave none (the rest are still printed). Exit 2 means an invalid name or port.";
 pub(super) const DOCTOR: &str = "Examples
   playpen doctor --mode offline --format json
   playpen doctor --mode egress

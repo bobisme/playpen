@@ -528,3 +528,44 @@ fn an_unknown_command_is_not_matched_to_a_hidden_one() {
         assert!(!err.contains("\n\n\n"), "{err:?}");
     }
 }
+
+#[test]
+fn resolve_is_a_public_command_that_prints_only_and_refuses_bad_input() {
+    let root = json(&invoke(&["--help", "--json"], None).stdout);
+    assert!(
+        root["commands"]
+            .as_array()
+            .expect("commands")
+            .iter()
+            .any(|c| c["name"] == "resolve")
+    );
+    // Loopback cannot be approved, so a name that resolves only there
+    // gives nothing: exit 1, the name listed, nothing on stdout.
+    let local = invoke(&["resolve", "localhost", "--format", "text"], None);
+    assert_eq!(local.status.code(), Some(1));
+    assert_eq!(local.stdout, b"");
+    let stderr = String::from_utf8(local.stderr).expect("stderr");
+    assert!(
+        stderr.contains("localhost gave no address that can be approved"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("caution: these are the addresses"),
+        "{stderr}"
+    );
+    let local = json(&invoke(&["resolve", "--json", "localhost"], None).stdout);
+    assert_eq!(local["unresolved"][0], "localhost");
+    assert_eq!(local["allow"], serde_json::json!([]));
+    for bad in [
+        &["resolve", "-1", "x"][..],
+        &["resolve", "a b"],
+        &["resolve", "1.2.3.4"],
+    ] {
+        let out = invoke(bad, None);
+        assert_eq!(out.status.code(), Some(2), "{bad:?}");
+        assert_eq!(out.stdout, b"", "{bad:?}");
+    }
+    let port = invoke(&["resolve", "--port", "0", "example.test"], None);
+    assert_eq!(port.status.code(), Some(2));
+    assert_eq!(port.stdout, b"");
+}
