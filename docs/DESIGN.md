@@ -989,7 +989,12 @@ on. Three measures follow.
 - *That lasts only until the owner's edit.* An owner who edits the pass
   with an editor or `sed -i` writes a new file and renames it over the old
   one. On the host that rename detaches the bind mount, in every
-  namespace, so the new pass is visible inside. A command that can write
+  namespace, so the new pass is visible inside. The kernel detaches the
+  bind before it moves the new file into the name, so for that instant a
+  lookup inside can find the old pass, unmasked; measured outside
+  playpen with a plain bind mount, 4 lookups of 1,000 under heavy CPU
+  load, none of 2,000 without. That shows only the pass the owner is
+  replacing, and changes nothing. A command that can write
   the directory can then read the new pass and rename an unrevoked one
   over it before the next re-read. Measured: a command that rewrites
   `revoked = true` to `false` whenever it sees it kept a revoked run

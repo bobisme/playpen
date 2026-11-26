@@ -701,7 +701,11 @@ fn a_pass_in_or_above_the_working_directory_or_exposed_is_refused() {
 /// the start line, a NOTE, the plan and the report say that its directory
 /// is writable. The documented risk, shown without a race: after the
 /// owner's edit saved a new pass, the command reads it and puts its own in
-/// its place.
+/// its place. The command waits for the owner's text, not for a regular
+/// file: the kernel detaches the `/dev/null` bind before it moves the new
+/// file into the name, so under load a lookup can briefly find the old
+/// pass, unmasked (`docs/DESIGN.md`, "That lasts only until the owner's
+/// edit").
 #[test]
 fn with_pass_dir_writable_the_command_can_replace_an_edited_pass() {
     require_sandbox!();
@@ -711,7 +715,7 @@ fn with_pass_dir_writable_the_command_can_replace_an_edited_pass() {
     let script = r#"P=$1
 echo ready
 i=0
-until [ -f "$P" ]; do i=$((i+1)); [ $i -gt 500 ] && exit 9; sleep 0.02; done
+until grep -q "^reference = .the owner's edit" "$P" 2>/dev/null; do i=$((i+1)); [ $i -gt 500 ] && exit 9; sleep 0.02; done
 grep '^reference' "$P"
 sed 's/^reference = .*/reference = "the command'"'"'s"/' "$P" > p.t && chmod 600 p.t && mv -f p.t "$P" && echo replaced
 sleep 0.5"#;
