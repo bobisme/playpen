@@ -1255,7 +1255,7 @@ matter for safety:
    of `cut`. It normalizes the
    supported numeric and symbolic spellings (and reads the time, listed
    with `TZ=UTC0`, as UTC) and ignores handles, counter values and the
-   elements of the drop sets. Unknown material
+   elements of the drop sets and the per-address sets. Unknown material
    objects or expressions fail closed. A real-load test adapter reports a
    narrower port range while preserving the rule count and confirms that
    the workload never starts. This check trusts Linux and the selected
@@ -1744,6 +1744,10 @@ system CPU time.
 | `nft --json list table inet playpen` (`TZ=UTC0`) | 1.9 ms, 1.9 ms, 6.7 KB | 31 ms, 31 ms, 209 KB (37 ms in an earlier run) |
 | `NFT_MSG_GETOBJ` for `dropped` over `NETLINK_NETFILTER`, in-process | 4 µs | 4 µs (6 µs with a new socket each time) |
 
+These figures are from before the per-address sets; with them, a full
+listing is 36 ms and 407 KB with all four sets full ("Drop records under a
+flood").
+
 So the step taken every 2 seconds costs about 1.2 ms of CPU: 0.06% of one
 CPU. A run that keeps sending to known destinations moves the counter at
 every reading and has C list the table each time: with both sets full,
@@ -1766,18 +1770,25 @@ repository) that sends `NFT_MSG_GETOBJ` with `NFTA_OBJ_TABLE`,
 `NFTA_COUNTER_PACKETS` from the answer.
 
 **Each destination once, kept in C.** `LiveDrops` in C keeps the set of
-destinations (address, protocol, port) it has sent. A destination's
+destinations (address, protocol, port) it has sent, and the addresses and
+protocols those lines named. A destination's
 packet count grows, but it is sent once, with the count at the reading
 that found it. Keeping the set in C means a destination that is dropped
 the whole run costs one line on the pipe, not one per reading. The set
-holds at most the 2,048 elements of the drop sets. nft prints a protocol
+holds at most the 4,096 elements of the four sets. When a family's drop
+set is full, C also sends each entry of that family's per-address set
+whose address and protocol no line has named, with `port` null and
+`record` `"address"` ("Drop records under a flood"). It does not when the
+drop set has room: `nft` lists the sets one after the other, so a packet
+can reach the per-address set after the drop set was listed, and the next
+listing has its destination. nft prints a protocol
 by name when it knows it, else as a number ("6", "17"); both are
 normalized to the name before the comparison, as at teardown, so a
 destination is not sent twice under two names.
 
 **Wire format.** C writes `denied JSON` on the pipe it reports on, one
 line per destination, with the fields of the report's `dropped`
-destinations (`address`, `protocol`, `port`, `packets`), well under
+destinations (`address`, `protocol`, `port`, `packets`) and `record`, well under
 `PIPE_BUF`, so a line is never mixed with one from S or I. P parses it
 with the teardown readback's own types, and the record on `--events-fd`
 is the same object. A failed reading sends `deniederr WHY` once (cut to
@@ -1811,19 +1822,117 @@ make no `denied` record. The report counts them in `refused_after_end`.
 **What a reading does not see.** A destination first dropped after the
 last reading and before the command ends has no record: C does not make a
 reading at teardown for this. Its readback for the report comes at once,
-and P has the complete list there. A destination beyond 1,024 in its
-family's set moves `dropped` but is in no set, so it has no record either.
-The report's `destinations_truncated` says so.
+and P has the complete list there. An address beyond 1,024 in its
+family's per-address set moves `dropped` but is in no set, so it has no
+record either. The report's `addresses_truncated` and
+`addresses_unlisted` say so.
 
 **A cut request during a reading.** C answers P's `CUT` after the reading
-in flight: at most the time of one listing, about 40 ms with full sets,
-well inside P's 2-second limit.
+in flight: at most the time of one listing, about 40 ms with all four
+sets full, well inside P's 2-second limit.
 
 **Later: NFLOG.** A `log group N` rule beside the drop rule would hand
 each refused packet to a netlink listener at once, without polling, and
 with more than the destination (the source port, the first bytes). It
 needs a listener in C with its own netlink code and rate limits, and it
 duplicates what the sets already count. Not done.
+
+## Drop records under a flood
+
+**The problem.** The drop sets are keyed by address, protocol and port,
+and keep the first 1,024 of each family: a full dynamic set refuses new
+elements. The evaluation of 2026-11-25 sent UDP to ports 1 to 1024 of
+203.0.113.5, then connected to 198.51.100.66:443. The report had 1,025
+packets and 1,024 destinations, all of them decoys; the real target was
+nowhere (not in the report, the summary, or `--live-drops`), and the
+summary printed 1,024 lines. A command could choose what the record
+showed by sending first to ports nobody cares about.
+
+**A second record without the port.** Two more sets, `dropaddr4` and
+`dropaddr6`, keyed by address and protocol (`ipv4_addr . inet_proto`),
+with a counter per element, 1,024 elements each. Two more rules on the
+refusal path, after the four additions to the drop sets and before the
+tripwire and the `dropped` counter, add every refused packet to the set of
+its family. A port sweep of one address uses one element, so the next
+address is still recorded. The report has the list as `addresses`, the
+summary uses it past 20 destinations, and the live readings use it when a
+drop set is full.
+
+**Measured first.** nftables 1.1.7, Linux 7.2.8, in a throwaway `unshare
+--user --map-root-user --net` namespace with a dummy interface and default
+routes, so that packets reach the output chain:
+
+- The decoy flood with these sets: `dropaddr4` held `198.51.100.66 . tcp`
+  (1 packet) and `203.0.113.5 . udp` (1,024), and `dropped` read 1,025,
+  while `drop4` held 1,024 decoys and no entry for the target.
+- A full set refuses new elements, and the rule that adds to it ends
+  there; the next rules still run, so the packet is still counted and
+  rejected. An element already in a full set still counts its packets:
+  with a set of size 4 full, six more packets to an element in it moved
+  its counter from 3 to 9 (the kernel's `nft_dynset` checks the size only
+  for a new element).
+- `nft --json` prints a set's `"count"` only when it has elements, and
+  prints the additions without their `meta nfproto` matches, as in the
+  `contacted` chain. The readback expects that form.
+- Cost of `nft --json list table inet playpen` (`TZ=UTC0`, `playpen rules
+  --until`, 200 runs under bash's `time`, per run): 1.5 ms and 7.2 KB with
+  all sets empty; 19 ms and 210 KB with both drop sets full from a port
+  sweep of one IPv4 and one IPv6 address (the per-address sets then hold
+  one element each); 36 ms and 407 KB with all four sets full. Listing
+  only the `dropped` counter stays at 1.2 ms. A per-address set of 4,096
+  elements per family took 0.2 to 0.6 s to list, and of 65,536 about 4 s
+  and 320 MB of `nft` memory (one run each, on a loaded machine).
+
+**Sizes.** 1,024, as the drop sets. The listing runs every 2 seconds
+while the counter moves, so its cost bounds the size: 36 ms per 2 seconds
+is under 2% of one CPU, a size of 4,096 would be 10 to 30%. A larger set
+also would not close the gap. A command can send to more distinct
+addresses than any set holds (an IPv6 /64 has 2^64), as cheaply as to
+1,024. The per-address set defends against the cheap case, a sweep of
+ports, and the report says honestly what the other case leaves out.
+
+**When the per-address set fills too.** It keeps the first 1,024
+addresses of its family, like the drop set. The report's `full` names
+the full sets, `addresses_unlisted` counts the packets in no entry, and
+the summary says `N packet(s) have no address in the report either: the
+per-address record is full for ...`. A run where the first refused packet
+must be the one on record uses `--on-drop`, which closes egress at that
+packet, so no flood can follow it. Not done: keeping the last N distinct
+destinations as well. nftables has no eviction for a full dynamic set; a
+`timeout` on the elements would make room, but would also drop the
+evidence before teardown reads it.
+
+**The summary.** At most 20 lines (`report::SUMMARY_LINES`), then `and N
+more; the JSON report (--report FILE) lists every one`. A complete list of
+at most 20 destinations prints as before, one line per port. Past that,
+or when the list is incomplete, one line per address and protocol, with
+the number of ports the drop set has for it, or `port not recorded`. Then
+one line each for the packets with no port and with no address, and why:
+which set is full and what it keeps. The old line `(destination breakdown
+is incomplete or inconsistent)` is left for a breakdown that a full set
+does not explain.
+
+**Live records.** A `denied` record has `record`: `"destination"` or
+`"address"`. An address record has `port` null. It is sent only for a
+family whose drop set is full, and only for an address and protocol that
+no record has named; so a sweep's address gets no second record, and the
+decoy flood sends 1,024 destination records and one address record for
+the target. `--live-drops` prints it as `ADDR PROTO, port not recorded`.
+
+**A listing without the per-address sets.** `parse_counters` reads the
+drop sets as before and sets `addresses` to null and `addresses_truncated`
+to true; the summary then lists destinations as before (with the
+20-line cap). playpen always loads the sets, and the start check refuses
+a table without them, so this is a table from an older ruleset, or a test.
+
+**Tests.** `a_port_sweep_does_not_hide_the_real_target` (tests/live_drops.rs)
+runs the evaluation's flood with `--lo-addr` targets and checks the
+report, the summary, the `denied` records and the length of stderr. Unit
+tests cover the parse (`a_port_sweep_leaves_room_for_another_address`,
+`a_listing_without_the_address_record_reads_as_before`), the readback
+(`the_address_record_is_required`), the live records
+(`past_a_full_drop_set_a_new_address_is_sent_without_its_port`) and the
+summary's lines.
 
 ## The tripwire (`--on-drop`)
 
@@ -2243,10 +2352,11 @@ less.
   namespace (see "Single-id mappings").
 - **Kernel logging of dropped packets.** `log` statements do nothing in a
   non-initial network namespace by default (`nf_log_all_netns`), so
-  per-destination counts come from a dynamic nftables set with per-element
-  counters instead. It holds 1024 destinations per address family; beyond
-  that the total is still exact and the report says the list is
-  truncated.
+  per-destination counts come from dynamic nftables sets with per-element
+  counters instead: per address, protocol and port, and per address and
+  protocol. Each holds 1024 entries per address family; beyond that the
+  total is still exact and the report says which list is truncated and
+  how many packets it leaves out ("Drop records under a flood").
 
 ## What the plan digest binds, and why not the environment
 

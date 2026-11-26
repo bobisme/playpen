@@ -292,6 +292,21 @@ playpen:   198.51.100.7 udp port 53: 1 packet(s)
 playpen: ************************************************************
 ```
 
+The summary lists at most 20 lines. Past 20 destinations it has one line
+per address and protocol, so a sweep of many ports of one address does
+not hide another address:
+
+```text
+playpen:   203.0.113.5 udp, 1024 ports: 1024 packet(s)
+playpen:   198.51.100.66 tcp, port not recorded: 1 packet(s)
+playpen:   1 packet(s) have no port in the report: the per-port record is full for IPv4 (it keeps the first 1024 destinations of each family)
+```
+
+The firewall keeps the first 1024 destinations (address, protocol and
+port) and the first 1024 addresses (address and protocol) of each address
+family. The report's `dropped` has both lists, and says how many packets
+are in neither and which records are full.
+
 There is no DNS inside the sandbox. A stub on the sandbox's own loopback
 (127.0.0.1 port 53) answers the names given with `--host`, says every
 other name does not exist, and forwards nothing. A lookup of a name with no
@@ -476,9 +491,11 @@ playpen run --allow 192.0.2.10:443/tcp --live-drops --events-fd 3 -- ./scan 3> >
 
 While the command runs, playpen reads the drop counter every 2 seconds.
 With `--events-fd`, each new dropped destination gets one `denied` record
-(`address`, `protocol`, `port`, `packets`) within about 2 seconds of its
-first packet. With `--live-drops`, stderr also gets a line for each of the
-first 8:
+(`address`, `protocol`, `port`, `packets`, `record`) within about 2 seconds of its
+first packet. When the per-port record of a family is full, a new address
+gets a record with `port` null and `record` `"address"`. With `--live-drops`, stderr also gets a line for each of the
+first 8, and after that for each of the first 8 addresses not seen before,
+so a sweep of one address's ports does not hide another address:
 
 ```text
 playpen: dropped: 198.51.100.7 tcp port 80 (not approved)

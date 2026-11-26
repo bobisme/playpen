@@ -1,6 +1,9 @@
 # nftables table readbacks
 
 Recorded on Linux 7.2.8-arch1-2 with nftables 1.1.7 (JSON schema 1).
+All ten were recorded again on 2026-11-25, when the per-address sets
+`dropaddr4` and `dropaddr6` and their two rules were added; the
+commands below are the ones used.
 Playpen's generated rules were loaded into disposable unprivileged user
 and network namespaces with `unshare -Urn`. Only documentation addresses
 were granted. The JSON was reformatted without changing its values.
@@ -49,20 +52,21 @@ The comparator accepts the following expression vocabulary from these dumps.
 It checks connection state, interface, IP destination and prefix, IPv6 hop
 limit and ICMP type, transport protocol and inclusive ports, the packet
 mark against the `cut` set, the time, the four dynamic additions to the
-drop sets, the two to the `seen` sets, the four to the `answered` and `reset` sets and, with `--on-drop`, the addition
+drop sets, the two to the per-address sets `dropaddr4` and `dropaddr6`
+(printed without their `meta nfproto` matches), the two to the `seen` sets, the four to the `answered` and `reset` sets and, with `--on-drop`, the addition
 of the mark 0 to the `cut` set, the named counters, and accept, drop,
 `goto contacted` and ICMPx reject verdicts. Named and
 numeric spellings from the recorded dumps are equivalent, as are anonymous
 set member permutations and textual IP address spellings. Rule order and
 expression order are checked. Handles, counter values and the elements of
-the dynamic drop sets vary at runtime. The `cut`, `seen4`, `seen6`, `answered4`, `answered6`, `reset4` and `reset6` sets
+the dynamic drop sets and per-address sets vary at runtime. The `cut`, `seen4`, `seen6`, `answered4`, `answered6`, `reset4` and `reset6` sets
 must be empty. Unknown material objects and expressions are refused.
 
 Startup qualification used Playpen's normal `run` path on the same host
 with pasta 2026_09_25.df90211. A temporary forwarding adapter captured the
 real `nft` JSON at startup and teardown. Both `run --no-network -- true`
 and `run --allow 192.0.2.1:8000-8002/tcp -- true` succeeded. With the
-`cut` rule added since, the readbacks have 12 and 13 output rules
+`cut` rule and the two additions to the per-address sets added since, the readbacks have 14 and 15 output rules
 respectively, with four input rules and an empty forward chain; an end
 time adds one rule to each of the two chains. The integration suite separately checks rejection of
 a failing load, an empty readback and a narrower reported range. The

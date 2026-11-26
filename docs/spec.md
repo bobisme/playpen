@@ -50,6 +50,17 @@ If you used v0.1, these will be different:
   stderr (section 4.1). The report has the new field `live_drops`, and
   the plan has `live_drops` when the option is given. The report's
   `dropped` is read at the end, as before.
+- **A port sweep no longer hides other dropped destinations.** The
+  ruleset has two more sets, `dropaddr4` and `dropaddr6`, keyed by
+  address and protocol without the port, and two more rules on the
+  refusal path (section 6.1, item 8). A command that sends to many ports
+  of one address fills the per-port drop set, but uses one entry here, so
+  a later packet to another address is still named. The report's
+  `dropped` has the new fields `destinations_unlisted`, `addresses`,
+  `addresses_truncated`, `addresses_unlisted` and `full` (section 4.5).
+  The summary lists at most 20 lines of destinations, and says how many
+  packets have no port or no address in the report, and why. A `denied`
+  record has the new field `record`.
 - **The first refused packet can close all egress.** With
   `--on-drop cut|stop`, the ruleset closes all egress by itself at the
   first packet it drops, and with `stop` playpen also stops the command
@@ -749,10 +760,14 @@ events" below); `--live-drops` prints a line; `--on-drop` learns of the
 trip (below). Without these options the counter is read only at teardown,
 as before.
 
-- Only destinations in the drop sets are reported: at most 1024 per
-  address family (section 6.1). A packet to a destination beyond that is
-  counted in `dropped`, but gets no record or line; the report then has
-  `destinations_truncated`.
+- Each destination in the drop sets is reported: at most 1024 per
+  address family (section 6.1), with `record` `"destination"`. When a
+  family's drop set is full, each address and protocol in the
+  per-address set of that family that no record has named is reported
+  once, with `port` null and `record` `"address"`: at most 1024 more per
+  family. A packet to an address beyond both is counted in `dropped`,
+  but gets no record or line; the report then has
+  `destinations_truncated` and `addresses_truncated`.
 - After the approval ended, and once the cut is in place (section 6.1),
   every packet but loopback is refused by the time rule or the cut and
   counted in `refused_after_end`, not in `dropped`. It makes no `denied`
@@ -769,9 +784,11 @@ the command runs, as the readings above find it:
 
 ```text
 playpen: dropped: 198.51.100.7 tcp port 80 (not approved)
+playpen: dropped: 198.51.100.66 tcp, port not recorded (not approved)
 ```
 
-`port N` is there for TCP and UDP only. The first 8 destinations get a
+`port N` is there for TCP and UDP only. `, port not recorded` marks a
+record from the per-address set (`record` `"address"`). The first 8 destinations get a
 line each (`live_drops::SHOWN`). The 9th gets `playpen: dropped: more
 than 8 destinations; see the summary at the end`, and later ones get
 nothing; the summary at the end and the report list them. The first
@@ -967,9 +984,14 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   all traffic but loopback; sending SIGTERM to the command (SIGKILL in 3
   s)`, or the same SIGKILL-at-once ending as at the end time;
 - with `--live-drops`, while the command runs: `dropped: ADDR PROTO port
-  N (not approved)` (no `port N` for other protocols) for each of the
+  N (not approved)` (no `port N` for other protocols; `dropped: ADDR
+  PROTO, port not recorded (not approved)` for a record from the
+  per-address set) for each of the
   first 8 new dropped destinations, then once `dropped: more than 8
-  destinations; see the summary at the end`, and once at most `could not
+  destinations; see the summary at the end`; after that, the same line with
+  `(not approved; a new address)` for each of the first 8 addresses and
+  protocols not seen before, then once `dropped: more than 8 further
+  addresses; see the summary at the end`; and once at most `could not
   read the drop counter while the command runs: ...` (see
   `--live-drops`);
 - with `--on-drop`, once, when a reading finds that a dropped packet has
@@ -980,7 +1002,30 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   the command ended; then either `no packets to
   unapproved destinations were dropped`, or a block between lines of
   asterisks starting `WARNING: N packet(s) to UNAPPROVED destinations were
-  dropped.` listing each destination with protocol, port and packet count;
+  dropped.` and `The command tried to reach places nobody approved:`.
+  When `destinations` is complete and has at most 20 entries, the block
+  has one line per destination: `ADDR PROTO port N: N packet(s)` (no
+  `port N` for protocols other than TCP and UDP). Else it has one line per
+  entry of `addresses`: `ADDR PROTO port N: N packet(s)` when one port has
+  all its packets, `ADDR PROTO, K ports: N packet(s)` when K ports have
+  all its packets, `ADDR PROTO, K ports and others not recorded: N
+  packet(s)`, `ADDR PROTO, port not recorded: N packet(s)`, or `ADDR
+  PROTO: N packet(s)` for other protocols; then a line for each
+  destination whose address and protocol are not in `addresses`. A
+  report without `addresses` has one line per destination. At most 20
+  of these lines are printed, largest packet count first; then `and N
+  more; the JSON report (--report FILE) lists every one`. Then, when
+  `destinations_unlisted` is above 0 and a drop set is full: `N packet(s)
+  have no port in the report: the per-port record is full for IPv4|IPv6|IPv4
+  and IPv6 (it keeps the first 1024 destinations of each family)`; when
+  `addresses_unlisted` is above 0 and a per-address set is full: `N
+  packet(s) have no address in the report either: the per-address record
+  is full for ... (it keeps the first 1024 addresses of each family)`;
+  and `(destination breakdown is incomplete or inconsistent)` when packets
+  are missing from a list and no full set explains it, or the listing is
+  inconsistent. The block's line about a zero count with an incomplete
+  breakdown is `the drop counter reads zero, but the destination
+  breakdown is incomplete or inconsistent`;
   then, when `uncounted` is set, `the drop count is incomplete: WHY`;
   then, with `--on-drop`, when the cut tripped, `the firewall closed all
   egress at the first dropped packet (--on-drop cut|stop): DESTINATIONS;
@@ -1125,10 +1170,12 @@ cut before SIGTERM, false when the command is killed at once because it
 did not (section 4.1, `--until`). `denied` carries `address`, `protocol`,
 `port` (null for protocols other than TCP and UDP) and `packets` (the count
 at the reading that found it) of a destination the firewall dropped packets
-to: one record per destination, while the command runs, within about 2
-seconds of its first dropped packet ("Drops while the command runs", 4.1,
-says which destinations have none). A run has at most 2048 (the drop sets
-hold 1024 per address family). They come between `starting` and
+to, and `record`: `"destination"` from the per-port drop sets, or
+`"address"` from the per-address sets when the family's drop set is full
+(`port` is then null, for every protocol). One record per destination,
+while the command runs, within about 2 seconds of its first dropped
+packet ("Drops while the command runs", 4.1, says which destinations
+have none). A run has at most 4096 (each of the four sets holds 1024). They come between `starting` and
 `terminal`, and a `stopping` record can come before some of them. The
 report's `dropped` remains the complete record. With `--events-fd` the
 drop counter is read while the command runs; the records are the same
@@ -1449,7 +1496,7 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `pass` | object or null | null without `--pass`; else `{"file", "id", "name", "owner", "digest", "valid_until", "labels"}`: the file as given, the pass id, name, `approval.owner`, `sha256:` digest of the file at start, `valid_until` (RFC 3339 UTC), and the labels in use. When the pass could not be loaded, everything but `file` is null and `labels` is empty. A run that got past its checks also has `directory`: `"hidden"` (by `--hide`, the mount layer or playpen), `"read_only"`, or `"writable"` with `--pass-dir-writable` (4.1, "The pass inside the sandbox"); it is absent from a refusal and from `rules` |
 | `capture` | object or null | null without `--capture` and when nothing was run; else `{"file", "bytes", "sha256"}`: the capture file (absolute), its size, and the SHA-256 of its bytes in lower-case hex as `sha256sum` prints it, read through the descriptor playpen created it with, after pasta has exited. Also null when the file could not be read back; `message` then says why |
 | `playpen_exit_status` | integer | the status playpen exits with |
-| `dropped` | object or null | `{"packets": N, "destinations": [{"address", "protocol", "port", "packets"}], "destinations_truncated": bool}`; `port` is null for protocols other than TCP and UDP; destinations are sorted by packet count, largest first |
+| `dropped` | object or null | `{"packets": N, "destinations": [{"address", "protocol", "port", "packets"}], "destinations_truncated": bool, "destinations_unlisted": N or null, "addresses": [{"address", "protocol", "packets"}] or null, "addresses_truncated": bool, "addresses_unlisted": N or null, "full": [...]}`. `destinations` is the per-port record (the drop sets); `port` is null for protocols other than TCP and UDP. `addresses` is the per-address record (the sets `dropaddr4` and `dropaddr6`): the packets to each address and protocol, any port; null when the table has no such sets. Both lists are sorted by packet count, largest first. `destinations_truncated` and `addresses_truncated` are true when the list does not account for every packet in `packets`, or its consistency cannot be established (always true when `addresses` is null). `destinations_unlisted` and `addresses_unlisted` are the packets in `packets` that are in no entry of the list; null when the listing is inconsistent (and `addresses_unlisted` when `addresses` is null). `full` names each record that holds as many entries as its set's size (1024), so it took no new entry after that: `"destinations_ipv4"`, `"destinations_ipv6"`, `"addresses_ipv4"`, `"addresses_ipv6"`. Packets to a known entry of a full set are still counted there |
 | `drop_assertion` | `"pass"`, `"violated"`, or `"unknown"` | present only with `--fail-on-drop` |
 | `dropped_error` | string or null | why the counters could not be read |
 | `uncounted` | string or null | why packets to other hosts may have failed at routing in this run, before the output chain could count them: playpen could not give an address family a default route (section 5, steps 6 and 8). Null when every family had one. With it, `--fail-on-drop` gives `unknown` for a zero count, and `compare` calls the drop evidence incomplete. Not in the shareable report |
@@ -2029,12 +2076,18 @@ With `--events-fd`, `--live-drops` or `--on-drop`, C also reads the
 (`nft --json list counter inet playpen dropped`). When the count moved
 since its last listing, it lists the table and sends each destination it
 has not sent before on the pipe it reports on, as `denied JSON` (address,
-protocol, port and packets). A reading that fails sends `deniederr WHY`
+protocol, port, packets and record). When a family's drop set is full, it
+also sends each entry of that family's per-address set whose address and
+protocol no line has named, with `port` null and `record` `"address"`.
+It does not for a family whose drop set has room: an address entry there
+without its destination is a packet that came between the two sets'
+listings, and the next listing has its destination. A reading that fails
+sends `deniederr WHY`
 once, and C tries again at the next interval. P passes each new
 destination on as a `denied` record and, with `--live-drops`, a line
 (4.1, "Drops while the command runs"). A `CUT` byte that comes during a
-reading is answered when the reading ends: up to about 40 ms with full
-drop sets, well inside P's 2 seconds.
+reading is answered when the reading ends: up to about 40 ms with all
+four sets full, well inside P's 2 seconds.
 
 With `--on-drop`, C reads the counter on the same schedule, and C's
 readback at start expects the tripwire (section 6.1). The first reading
@@ -2059,7 +2112,7 @@ kernel kills every process left in the PID namespace. The moment P reads
 that status is the report's `ended_at`. C then closes D's
 control pipe; D stops and sends its record of names (within 2 seconds, or
 C kills it and reports why). C reports the record, lists the table again to
-read the counters (`dropped`, the drop sets, the grant counters, `late`
+read the counters (`dropped`, the drop sets, the per-address sets, the grant counters, `late`
 and `cut`, and with `--report-contacts` the `contacted` counter and the
 `seen4`, `seen6`, `answered4`, `answered6`, `reset4` and `reset6` sets),
 reports them, and exits. P stops pasta
@@ -2127,10 +2180,16 @@ In this order:
    `accept`. A full set makes its addition fail, which ends only that rule,
    so the packet is still accepted. The input chain gets four more rules
    (section 6.2);
-8. everything else: added to a per-destination set with a counter
-   (address, protocol, port; port 0 for protocols other than TCP and UDP),
-   counted in the `dropped` counter, and rejected with ICMP
-   administratively prohibited.
+8. everything else: added to the per-destination set of its family with a
+   counter (`drop4` or `drop6`: address, protocol, port; port 0 for
+   protocols other than TCP and UDP), added to the per-address set of its
+   family with a counter (`dropaddr4` or `dropaddr6`: address and
+   protocol, `meta nfproto ipv4 add @dropaddr4 { ip daddr . meta l4proto
+   }`), counted in the `dropped` counter, and rejected with ICMP
+   administratively prohibited. Each set holds 1024 entries. Each
+   addition is a rule of its own: a full set makes its addition fail,
+   which ends only that rule, so the packet is still counted and
+   rejected. An entry already in a full set still counts its packets.
 
 With `--on-drop` (either value), 8 differs, and nothing else but the
 declared size of the `cut` set (`size 65535`, the size nft gives a set a
@@ -2147,6 +2206,8 @@ prints:
 
 ```text
 		meta nfproto ipv6 meta l4proto != { tcp, udp } add @drop6 { ip6 daddr . meta l4proto . 0 }
+		meta nfproto ipv4 add @dropaddr4 { ip daddr . meta l4proto }
+		meta nfproto ipv6 add @dropaddr6 { ip6 daddr . meta l4proto }
 		# --on-drop: the first packet that gets here closes all egress, and is dropped.
 		add @cut { 0 }
 		counter name "dropped"
@@ -2351,9 +2412,15 @@ Not guarded against, or known limits:
   has the same snapshot limits as the drop lists below. It shows what one
   run did: a destination this run did not use can be needed by a later
   run;
-- per-destination drop lists hold 1024 destinations per address family;
-  `destinations_truncated` is true when the list is incomplete or its
-  consistency cannot be established. A non-null `dropped.packets` is the
+- per-destination drop lists hold 1024 destinations per address family,
+  and per-address drop lists 1024 addresses (with protocol) per family.
+  Each keeps the first ones the command sent to: a command that sends to
+  more than 1024 addresses of a family before it sends to the one that
+  matters hides that one from both lists, and `addresses_unlisted` then
+  counts its packets. A port sweep of one address uses one per-address
+  entry. Use `--on-drop` when the first refused packet must be the one on
+  record. `destinations_truncated` and `addresses_truncated` are true when
+  a list is incomplete or its consistency cannot be established. A non-null `dropped.packets` is the
   total counter observed in the dump; null means the snapshot was unavailable.
   The nft JSON dump does not establish an atomic snapshot of the total and
   individual set counters under concurrent traffic, so matching values alone
@@ -2366,8 +2433,8 @@ Not guarded against, or known limits:
 - drops reported while the command runs (`denied`, `--live-drops`) come
   from readings every 2 seconds, not from each packet: a destination is
   reported up to about 2 seconds after its first packet, one first dropped
-  in the last interval before the command ends can have no record, and a
-  destination beyond the 1024 of its family's set has none. The report's
+  in the last interval before the command ends can have no record, and an
+  address beyond the 1024 of its family's per-address set has none. The report's
   `dropped` is the complete record;
 - a packet to another host is counted only if it has a route to the
   output chain. playpen gives every address family one (section 5); when

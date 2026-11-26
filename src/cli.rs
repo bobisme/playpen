@@ -324,7 +324,8 @@ struct RunArgs {
     #[arg(help_heading = "Launch and reporting", long)]
     fail_on_drop: bool,
     /// Print each new dropped destination on stderr while the command runs
-    /// (read every 2 s; the first 8, then one line that says there are more).
+    /// (read every 2 s; the first 8, then one line that says there are more,
+    /// then the first 8 new addresses after that).
     /// --events-fd gets a denied record for each, with or without this option.
     #[arg(help_heading = "Launch and reporting", long)]
     live_drops: bool,
@@ -1102,6 +1103,10 @@ struct StderrEvents<'a> {
     ended_at: Option<OffsetDateTime>,
     /// With `--live-drops`: destinations printed so far.
     live_shown: usize,
+    /// With `--live-drops`: the addresses and protocols seen so far, and
+    /// how many new ones were printed past the first lines.
+    live_addresses: std::collections::BTreeSet<(String, String)>,
+    live_new_addresses: usize,
     /// The sandbox's VSOCK mode, once C has found it.
     vsock: Option<crate::vsock::Mode>,
 }
@@ -1170,26 +1175,49 @@ impl Events for StderrEvents<'_> {
         );
         sayln!("playpen: {reason}; {}", stopping(cut));
     }
-    fn denied(&mut self, dest: &crate::ruleset::DroppedDest) {
+    fn denied(&mut self, denied: &crate::live_drops::Denied) {
+        let dest = &denied.dest;
         self.pipe.send(
             "denied",
             &serde_json::json!({"address": dest.address, "protocol": dest.protocol,
-                "port": dest.port, "packets": dest.packets}),
+                "port": dest.port, "packets": dest.packets, "record": denied.record}),
         );
         if !self.args.live_drops {
             return;
         }
+        let shown = crate::live_drops::SHOWN;
+        let port = match denied.record {
+            crate::live_drops::RecordKind::Destination => "",
+            crate::live_drops::RecordKind::Address => ", port not recorded",
+        };
+        let new_address = self
+            .live_addresses
+            .insert((dest.address.clone(), dest.protocol.clone()));
         self.live_shown += 1;
-        if self.live_shown <= crate::live_drops::SHOWN {
+        if self.live_shown <= shown {
             sayln!(
-                "playpen: dropped: {} (not approved)",
+                "playpen: dropped: {}{port} (not approved)",
                 tripwire::destination(dest)
             );
-        } else if self.live_shown == crate::live_drops::SHOWN + 1 {
-            sayln!(
-                "playpen: dropped: more than {} destinations; see the summary at the end",
-                crate::live_drops::SHOWN
-            );
+            return;
+        }
+        if self.live_shown == shown + 1 {
+            sayln!("playpen: dropped: more than {shown} destinations; see the summary at the end");
+        }
+        // Past the first lines, a new address still gets one: a sweep of
+        // one address's ports cannot hide another address from stderr.
+        if new_address {
+            self.live_new_addresses += 1;
+            if self.live_new_addresses <= shown {
+                sayln!(
+                    "playpen: dropped: {}{port} (not approved; a new address)",
+                    tripwire::destination(dest)
+                );
+            } else if self.live_new_addresses == shown + 1 {
+                sayln!(
+                    "playpen: dropped: more than {shown} further addresses; see the summary at the end"
+                );
+            }
         }
     }
     fn denied_unreadable(&mut self, why: &str) {
@@ -1920,6 +1948,8 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         started_at: None,
         ended_at: None,
         live_shown: 0,
+        live_addresses: std::collections::BTreeSet::new(),
+        live_new_addresses: 0,
         vsock: None,
     };
     let grant_labels = if args.report_grant_use {
@@ -2069,7 +2099,10 @@ pub(crate) fn apply_drop_assertion(report: &mut Report, code: i32, enabled: bool
     }
     let assertion = match &report.dropped {
         Some(d) if d.packets > 0 => crate::report::DropAssertion::Violated,
-        Some(d) if d.destinations.iter().any(|entry| entry.packets > 0) => {
+        Some(d)
+            if d.destinations.iter().any(|entry| entry.packets > 0)
+                || d.addresses.iter().flatten().any(|entry| entry.packets > 0) =>
+        {
             crate::report::DropAssertion::Unknown
         }
         // Packets that failed at routing may have gone uncounted.

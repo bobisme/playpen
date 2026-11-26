@@ -338,9 +338,9 @@ pub trait Events {
     /// `cut` says, and the command is being stopped for this reason.
     fn pass_withdrawn(&mut self, reason: &str, cut: &Cut);
     /// With [`Plan::watch_drops`]: a reading while the command ran found
-    /// packets dropped to `dest`, a destination not reported before.
+    /// packets dropped to `denied`, a destination not reported before.
     /// `packets` is the count at that reading.
-    fn denied(&mut self, _dest: &ruleset::DroppedDest) {}
+    fn denied(&mut self, _denied: &live_drops::Denied) {}
     /// With [`Plan::watch_drops`]: the drop counter could not be read while
     /// the command ran, for the reason given. Said once; later readings are
     /// still tried.
@@ -1013,7 +1013,7 @@ struct ParentState {
     refused_after_end: Option<u64>,
     /// New dropped destinations from C's readings while the command runs,
     /// not yet reported.
-    denied: Vec<ruleset::DroppedDest>,
+    denied: Vec<live_drops::Denied>,
     /// Why C could not read the drop counter while the command ran, not yet
     /// reported.
     denied_error: Option<String>,
@@ -1041,17 +1041,14 @@ impl ParentState {
             "ready" => self.ready = true,
             "vsock" => self.vsock = crate::vsock::Mode::parse(rest),
             "denied" => {
-                if let Ok(d) = serde_json::from_str::<DroppedWire>(rest) {
-                    self.denied.push(d.into_dest());
+                if let Ok(d) = serde_json::from_str::<live_drops::Denied>(rest) {
+                    self.denied.push(d);
                 }
             }
             "deniederr" => self.denied_error = Some(rest.to_owned()),
             "tripped" if self.tripped.is_none() => {
-                let list: Vec<_> = serde_json::from_str::<Vec<DroppedWire>>(rest)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(DroppedWire::into_dest)
-                    .collect();
+                let list: Vec<ruleset::DroppedDest> =
+                    serde_json::from_str(rest).unwrap_or_default();
                 self.tripped = Some(list.clone());
                 self.trip_pending = Some(list);
             }
@@ -1086,8 +1083,7 @@ impl ParentState {
             "signal" => self.status = rest.parse().ok().map(CommandStatus::Signaled),
             "drops" => {
                 self.drops = Some(
-                    serde_json::from_str::<DropSummaryWire>(rest)
-                        .map(DropSummaryWire::into_summary)
+                    serde_json::from_str::<DropSummary>(rest)
                         .map_err(|e| format!("bad counter report: {e}")),
                 );
             }
@@ -1165,47 +1161,6 @@ impl ParentState {
         }
         if let Some(why) = self.denied_error.take() {
             events.denied_unreadable(&why);
-        }
-    }
-}
-
-/// The JSON form of [`DropSummary`] passed from C to P.
-#[derive(serde::Deserialize)]
-struct DropSummaryWire {
-    packets: u64,
-    destinations: Vec<DroppedWire>,
-    destinations_truncated: bool,
-}
-
-#[derive(serde::Deserialize)]
-struct DroppedWire {
-    address: String,
-    protocol: String,
-    port: Option<u16>,
-    packets: u64,
-}
-
-impl DropSummaryWire {
-    fn into_summary(self) -> DropSummary {
-        DropSummary {
-            packets: self.packets,
-            destinations_truncated: self.destinations_truncated,
-            destinations: self
-                .destinations
-                .into_iter()
-                .map(DroppedWire::into_dest)
-                .collect(),
-        }
-    }
-}
-
-impl DroppedWire {
-    fn into_dest(self) -> ruleset::DroppedDest {
-        ruleset::DroppedDest {
-            address: self.address,
-            protocol: self.protocol,
-            port: self.port,
-            packets: self.packets,
         }
     }
 }
@@ -2245,8 +2200,12 @@ fn read_drops_live(nft: &Path, live: &mut LiveDrops, up_w: &OwnedFd) {
         && live.tripped(packets)
     {
         let list = fresh.as_deref().unwrap_or_default();
-        let shown = &list[..list.len().min(live_drops::SHOWN)];
-        let json = serde_json::to_string(shown).unwrap_or_else(|_| "[]".into());
+        let shown: Vec<&ruleset::DroppedDest> = list
+            .iter()
+            .take(live_drops::SHOWN)
+            .map(|d| &d.dest)
+            .collect();
+        let json = serde_json::to_string(&shown).unwrap_or_else(|_| "[]".into());
         write_line(up_w, &format!("tripped {json}"));
     }
     if let Err(why) = fresh
@@ -3708,11 +3667,15 @@ mod tests {
         assert_eq!(st.private_tstp, Some(true));
         st.private_tstp = None;
         st.handle_line("exit 7");
-        st.handle_line(r#"drops {"packets":2,"destinations":[],"destinations_truncated":true}"#);
+        st.handle_line(
+            r#"drops {"packets":2,"destinations":[],"destinations_truncated":true,"destinations_unlisted":2,"addresses":[{"address":"192.0.2.9","protocol":"tcp","packets":2}],"addresses_truncated":false,"addresses_unlisted":0,"full":["destinations_ipv4"]}"#,
+        );
         assert!(st.ready && st.started);
         assert_eq!(st.init, Some(Pid::from_raw(4321)));
         assert_eq!(st.status, Some(CommandStatus::Exited(7)));
-        assert!(matches!(st.drops, Some(Ok(DropSummary { packets: 2, .. }))));
+        assert!(
+            matches!(&st.drops, Some(Ok(DropSummary { packets: 2, addresses: Some(a), full, .. })) if a.len() == 1 && full == &["destinations_ipv4"])
+        );
         st.handle_line("signal 15");
         assert_eq!(st.status, Some(CommandStatus::Signaled(15)));
         st.handle_line(
@@ -3755,7 +3718,7 @@ mod tests {
     /// Records what P passes on from C's readings while the command runs.
     #[derive(Default)]
     struct Seen {
-        denied: Vec<ruleset::DroppedDest>,
+        denied: Vec<live_drops::Denied>,
         unreadable: Vec<String>,
     }
 
@@ -3764,8 +3727,8 @@ mod tests {
         fn until_reached(&mut self, _cut: &Cut) {}
         fn pass_edited(&mut self, _message: &str) {}
         fn pass_withdrawn(&mut self, _reason: &str, _cut: &Cut) {}
-        fn denied(&mut self, dest: &ruleset::DroppedDest) {
-            self.denied.push(dest.clone());
+        fn denied(&mut self, denied: &live_drops::Denied) {
+            self.denied.push(denied.clone());
         }
         fn denied_unreadable(&mut self, why: &str) {
             self.unreadable.push(why.to_owned());
@@ -3778,6 +3741,7 @@ mod tests {
         st.receive(
             b"denied {\"address\":\"192.0.2.2\",\"protocol\":\"udp\",\"port\":9602,\"packets\":3}\n\
               denied {\"address\":\"2001:db8::2\",\"protocol\":\"ipv6-icmp\",\"port\":null,\"packets\":1}\n\
+              denied {\"address\":\"198.51.100.66\",\"protocol\":\"tcp\",\"port\":null,\"packets\":1,\"record\":\"address\"}\n\
               denied not json\n\
               deniederr nft could not list the drop counter\n",
         );
@@ -3786,19 +3750,33 @@ mod tests {
         let got: Vec<_> = seen
             .denied
             .iter()
-            .map(|d| (d.address.as_str(), d.protocol.as_str(), d.port, d.packets))
+            .map(|d| {
+                let r = &d.dest;
+                (
+                    r.address.as_str(),
+                    r.protocol.as_str(),
+                    r.port,
+                    r.packets,
+                    d.record,
+                )
+            })
             .collect();
+        let (dest, addr) = (
+            live_drops::RecordKind::Destination,
+            live_drops::RecordKind::Address,
+        );
         assert_eq!(
             got,
             [
-                ("192.0.2.2", "udp", Some(9602), 3),
-                ("2001:db8::2", "ipv6-icmp", None, 1)
+                ("192.0.2.2", "udp", Some(9602), 3, dest),
+                ("2001:db8::2", "ipv6-icmp", None, 1, dest),
+                ("198.51.100.66", "tcp", None, 1, addr)
             ]
         );
         assert_eq!(seen.unreadable, ["nft could not list the drop counter"]);
         // Passed on once: nothing is left for the next call.
         st.report_denied(&mut seen);
-        assert_eq!(seen.denied.len(), 2);
+        assert_eq!(seen.denied.len(), 3);
         assert_eq!(seen.unreadable.len(), 1);
     }
 

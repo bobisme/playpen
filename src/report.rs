@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use serde::Serialize;
 
 use crate::dns_stub::{self, Lookups};
-use crate::ruleset::DropSummary;
+use crate::ruleset::{DropSummary, DroppedDest};
 use crate::tripwire::{OnDropReport, ShareableOnDrop};
 
 /// What happened, in one word. Stable field values.
@@ -284,7 +284,10 @@ pub fn text_summary(r: &Report) -> String {
         (None, None) => {}
     }
     match (&r.dropped, &r.dropped_error) {
-        (Some(d), _) if d.packets == 0 && d.destinations_truncated => {
+        (Some(d), _)
+            if d.packets == 0
+                && (d.destinations_truncated || d.addresses.is_some() && d.addresses_truncated) =>
+        {
             out.push_str("playpen: the drop counter reads zero, but the destination breakdown is incomplete or inconsistent\n");
         }
         (Some(d), _) if d.packets == 0 => {
@@ -301,17 +304,7 @@ pub fn text_summary(r: &Report) -> String {
                 d.packets
             );
             out.push_str("playpen: The command tried to reach places nobody approved:\n");
-            for dest in &d.destinations {
-                let port = dest.port.map_or_else(String::new, |p| format!(" port {p}"));
-                let _ = writeln!(
-                    out,
-                    "playpen:   {} {}{port}: {} packet(s)",
-                    dest.address, dest.protocol, dest.packets
-                );
-            }
-            if d.destinations_truncated {
-                out.push_str("playpen:   (destination breakdown is incomplete or inconsistent)\n");
-            }
+            dropped_lines(&mut out, d);
             let _ = writeln!(
                 out,
                 "playpen: ************************************************************"
@@ -345,6 +338,105 @@ pub fn text_summary(r: &Report) -> String {
     contacts_summary(&mut out, r);
     lookups_summary(&mut out, r);
     out
+}
+
+/// Most lines the summary gives to dropped destinations. One more line
+/// says how many are left out; the report lists every one.
+pub const SUMMARY_LINES: usize = 20;
+
+/// The summary's lines for the dropped destinations, at most
+/// [`SUMMARY_LINES`], then why packets are missing from the breakdown.
+///
+/// One line per destination (address, protocol and port) when the
+/// per-destination list is complete and that many lines fit, or when the
+/// listing has no per-address record; else one line per address and
+/// protocol, with the destinations whose address is not in that record.
+fn dropped_lines(out: &mut String, d: &DropSummary) {
+    let mut lines = Vec::new();
+    let mut covered = std::collections::HashSet::new();
+    let by_port = !d.destinations_truncated && d.destinations.len() <= SUMMARY_LINES;
+    let addresses = d.addresses.iter().flatten().filter(|_| !by_port);
+    for a in addresses {
+        covered.insert((a.address.as_str(), a.protocol.as_str()));
+        let ports: Vec<&DroppedDest> = d
+            .destinations
+            .iter()
+            .filter(|x| x.address == a.address && x.protocol == a.protocol)
+            .collect();
+        let listed = ports
+            .iter()
+            .fold(0_u64, |sum, x| sum.saturating_add(x.packets));
+        let what = match ports.as_slice() {
+            _ if !matches!(a.protocol.as_str(), "tcp" | "udp") => String::new(),
+            [] => ", port not recorded".to_owned(),
+            [one] if listed >= a.packets => {
+                one.port.map_or_else(String::new, |p| format!(" port {p}"))
+            }
+            _ if listed >= a.packets => format!(", {} ports", ports.len()),
+            _ => format!(", {} ports and others not recorded", ports.len()),
+        };
+        lines.push(format!(
+            "playpen:   {} {}{what}: {} packet(s)",
+            a.address, a.protocol, a.packets
+        ));
+    }
+    for dest in &d.destinations {
+        if covered.contains(&(dest.address.as_str(), dest.protocol.as_str())) {
+            continue;
+        }
+        let port = dest.port.map_or_else(String::new, |p| format!(" port {p}"));
+        lines.push(format!(
+            "playpen:   {} {}{port}: {} packet(s)",
+            dest.address, dest.protocol, dest.packets
+        ));
+    }
+    let more = lines.len().saturating_sub(SUMMARY_LINES);
+    for line in lines.iter().take(SUMMARY_LINES) {
+        let _ = writeln!(out, "{line}");
+    }
+    if more > 0 {
+        let _ = writeln!(
+            out,
+            "playpen:   and {more} more; the JSON report (--report FILE) lists every one"
+        );
+    }
+    let full = |kind: &str| {
+        let has = |family: &str| d.full.iter().any(|f| *f == format!("{kind}_{family}"));
+        match (has("ipv4"), has("ipv6")) {
+            (true, true) => Some("IPv4 and IPv6"),
+            (true, false) => Some("IPv4"),
+            (false, true) => Some("IPv6"),
+            (false, false) => None,
+        }
+    };
+    let mut explained = true;
+    match (d.destinations_unlisted, full("destinations")) {
+        (Some(0), _) => {}
+        (Some(n), Some(families)) => {
+            let _ = writeln!(
+                out,
+                "playpen:   {n} packet(s) have no port in the report: the per-port record is full for {families} (it keeps the first {} destinations of each family)",
+                crate::ruleset::DROP_SET_SIZE
+            );
+        }
+        _ => explained = false,
+    }
+    if d.addresses.is_some() {
+        match (d.addresses_unlisted, full("addresses")) {
+            (Some(0), _) => {}
+            (Some(n), Some(families)) => {
+                let _ = writeln!(
+                    out,
+                    "playpen:   {n} packet(s) have no address in the report either: the per-address record is full for {families} (it keeps the first {} addresses of each family)",
+                    crate::ruleset::ADDRESS_SET_SIZE
+                );
+            }
+            _ => explained = false,
+        }
+    }
+    if !explained {
+        out.push_str("playpen:   (destination breakdown is incomplete or inconsistent)\n");
+    }
 }
 
 /// The line about the contacted destinations, with `--report-contacts`.
@@ -481,7 +573,6 @@ fn lookups_summary(out: &mut String, r: &Report) {
 mod tests {
     use super::*;
     use crate::dns_stub::LookedUp;
-    use crate::ruleset::DroppedDest;
 
     fn base() -> Report {
         Report {
@@ -539,6 +630,7 @@ mod tests {
             packets: 1,
             destinations: vec![dest.clone()],
             destinations_truncated: false,
+            ..DropSummary::default()
         });
         r.on_drop = Some(OnDropReport {
             on_drop: crate::tripwire::OnDrop::Stop,
@@ -726,6 +818,7 @@ mod tests {
             packets: 1,
             destinations: vec![],
             destinations_truncated: true,
+            ..DropSummary::default()
         });
         assert_eq!(crate::cli::apply_drop_assertion(&mut r, 0, true), 1);
         assert_eq!(r.drop_assertion, Some(DropAssertion::Violated));
@@ -750,6 +843,7 @@ mod tests {
             packets: 3,
             destinations: vec![],
             destinations_truncated: true,
+            ..DropSummary::default()
         });
         r.playpen_exit_status = crate::cli::apply_drop_assertion(&mut r, 0, true);
         assert_eq!(
@@ -810,6 +904,7 @@ mod tests {
             packets: 1,
             destinations: vec![],
             destinations_truncated: true,
+            ..DropSummary::default()
         });
         assert_eq!(crate::cli::apply_drop_assertion(&mut r, 0, true), 1);
         assert_eq!(r.drop_assertion, Some(DropAssertion::Violated));
@@ -838,6 +933,7 @@ mod tests {
                 port: Some(80),
                 packets: 1,
             }],
+            ..DropSummary::default()
         });
         assert_eq!(crate::cli::apply_drop_assertion(&mut r, 0, true), 1);
         assert_eq!(r.drop_assertion, Some(DropAssertion::Unknown));
@@ -967,6 +1063,7 @@ mod tests {
                 packets: 3,
             }],
             destinations_truncated: false,
+            ..DropSummary::default()
         });
         let t = text_summary(&r);
         assert!(t.contains("WARNING: 3 packet(s)"));
@@ -974,6 +1071,208 @@ mod tests {
         let json = serde_json::to_value(&r).unwrap_or_default();
         assert_eq!(json["outcome"], "ran");
         assert_eq!(json["dropped"]["destinations"][0]["port"], 80);
+    }
+
+    fn dest(address: &str, protocol: &str, port: Option<u16>, packets: u64) -> DroppedDest {
+        DroppedDest {
+            address: address.into(),
+            protocol: protocol.into(),
+            port,
+            packets,
+        }
+    }
+
+    fn addr(address: &str, protocol: &str, packets: u64) -> crate::ruleset::DroppedAddr {
+        crate::ruleset::DroppedAddr {
+            address: address.into(),
+            protocol: protocol.into(),
+            packets,
+        }
+    }
+
+    /// The summary's lines between the WARNING and the closing stars.
+    fn drop_lines(r: &Report) -> Vec<String> {
+        text_summary(r)
+            .lines()
+            .skip_while(|l| !l.contains("tried to reach"))
+            .skip(1)
+            .take_while(|l| !l.contains("*****"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn a_port_sweep_is_one_line_and_the_real_target_is_named() {
+        let mut r = base();
+        r.dropped = Some(DropSummary {
+            packets: 1025,
+            destinations: (1..=1024)
+                .map(|port| dest("203.0.113.5", "udp", Some(port), 1))
+                .collect(),
+            destinations_truncated: true,
+            destinations_unlisted: Some(1),
+            addresses: Some(vec![
+                addr("203.0.113.5", "udp", 1024),
+                addr("198.51.100.66", "tcp", 1),
+            ]),
+            addresses_truncated: false,
+            addresses_unlisted: Some(0),
+            full: vec!["destinations_ipv4".into()],
+        });
+        assert_eq!(
+            drop_lines(&r),
+            [
+                "playpen:   203.0.113.5 udp, 1024 ports: 1024 packet(s)",
+                "playpen:   198.51.100.66 tcp, port not recorded: 1 packet(s)",
+                "playpen:   1 packet(s) have no port in the report: the per-port record is full for IPv4 (it keeps the first 1024 destinations of each family)",
+            ]
+        );
+        let t = text_summary(&r);
+        assert!(t.contains("WARNING: 1025 packet(s)"), "{t}");
+        assert!(!t.contains("inconsistent"), "{t}");
+        let json = serde_json::to_value(&r).unwrap_or_default();
+        assert_eq!(json["dropped"]["addresses"][1]["address"], "198.51.100.66");
+        assert_eq!(json["dropped"]["destinations_unlisted"], 1);
+        assert_eq!(json["dropped"]["addresses_unlisted"], 0);
+        assert_eq!(json["dropped"]["full"][0], "destinations_ipv4");
+    }
+
+    #[test]
+    fn the_summary_lists_at_most_twenty_and_says_why_packets_are_missing() {
+        let mut r = base();
+        let addresses: Vec<_> = (0..1024)
+            .map(|i| addr(&format!("10.0.{}.{}", i / 256, i % 256), "udp", 1))
+            .collect();
+        let destinations = (0..1024)
+            .map(|i| dest(&format!("10.0.{}.{}", i / 256, i % 256), "udp", Some(53), 1))
+            .collect();
+        r.dropped = Some(DropSummary {
+            packets: 1030,
+            destinations,
+            destinations_truncated: true,
+            destinations_unlisted: Some(6),
+            addresses: Some(addresses),
+            addresses_truncated: true,
+            addresses_unlisted: Some(6),
+            full: FULL.iter().map(|f| (*f).to_owned()).collect(),
+        });
+        let lines = drop_lines(&r);
+        assert_eq!(lines.len(), SUMMARY_LINES + 3, "{lines:?}");
+        assert_eq!(lines[0], "playpen:   10.0.0.0 udp port 53: 1 packet(s)");
+        assert_eq!(
+            lines[SUMMARY_LINES],
+            "playpen:   and 1004 more; the JSON report (--report FILE) lists every one"
+        );
+        assert_eq!(
+            lines[SUMMARY_LINES + 1],
+            "playpen:   6 packet(s) have no port in the report: the per-port record is full for IPv4 and IPv6 (it keeps the first 1024 destinations of each family)"
+        );
+        assert_eq!(
+            lines[SUMMARY_LINES + 2],
+            "playpen:   6 packet(s) have no address in the report either: the per-address record is full for IPv4 and IPv6 (it keeps the first 1024 addresses of each family)"
+        );
+    }
+
+    const FULL: [&str; 4] = crate::ruleset::FULL_NAMES;
+
+    #[test]
+    fn ports_partly_recorded_and_other_protocols() {
+        let mut r = base();
+        r.dropped = Some(DropSummary {
+            packets: 9,
+            destinations: vec![
+                dest("192.0.2.1", "tcp", Some(80), 2),
+                dest("192.0.2.1", "tcp", Some(81), 1),
+                dest("192.0.2.3", "icmp", None, 1),
+            ],
+            destinations_truncated: true,
+            destinations_unlisted: Some(5),
+            addresses: Some(vec![
+                addr("192.0.2.1", "tcp", 8),
+                addr("192.0.2.3", "icmp", 1),
+            ]),
+            addresses_truncated: false,
+            addresses_unlisted: Some(0),
+            full: vec!["destinations_ipv4".into()],
+        });
+        assert_eq!(
+            drop_lines(&r)[..2],
+            [
+                "playpen:   192.0.2.1 tcp, 2 ports and others not recorded: 8 packet(s)",
+                "playpen:   192.0.2.3 icmp: 1 packet(s)",
+            ]
+        );
+        // Packets missing with no full record to explain them.
+        if let Some(d) = r.dropped.as_mut() {
+            d.full.clear();
+        }
+        assert_eq!(
+            drop_lines(&r).last().map(String::as_str),
+            Some("playpen:   (destination breakdown is incomplete or inconsistent)")
+        );
+    }
+
+    #[test]
+    fn a_complete_short_list_has_a_line_per_port() {
+        let mut r = base();
+        let mut summary = DropSummary {
+            packets: 3,
+            destinations: vec![
+                dest("192.0.2.1", "tcp", Some(80), 2),
+                dest("192.0.2.1", "tcp", Some(81), 1),
+            ],
+            addresses: Some(vec![addr("192.0.2.1", "tcp", 3)]),
+            ..DropSummary::default()
+        };
+        r.dropped = Some(summary.clone());
+        assert_eq!(
+            drop_lines(&r),
+            [
+                "playpen:   192.0.2.1 tcp port 80: 2 packet(s)",
+                "playpen:   192.0.2.1 tcp port 81: 1 packet(s)",
+            ]
+        );
+        // Past the cap, a line per address.
+        summary.destinations = (1..=21)
+            .map(|p| dest("192.0.2.1", "tcp", Some(p), 1))
+            .collect();
+        summary.packets = 21;
+        summary.addresses = Some(vec![addr("192.0.2.1", "tcp", 21)]);
+        r.dropped = Some(summary);
+        assert_eq!(
+            drop_lines(&r),
+            ["playpen:   192.0.2.1 tcp, 21 ports: 21 packet(s)"]
+        );
+    }
+
+    #[test]
+    fn without_the_address_record_the_summary_lists_destinations_as_before() {
+        let mut r = base();
+        r.dropped = Some(DropSummary {
+            packets: 3,
+            destinations: vec![
+                dest("192.0.2.9", "tcp", Some(80), 2),
+                dest("192.0.2.3", "icmp", None, 1),
+            ],
+            destinations_truncated: false,
+            destinations_unlisted: Some(0),
+            addresses: None,
+            addresses_truncated: true,
+            addresses_unlisted: None,
+            full: vec![],
+        });
+        assert_eq!(
+            drop_lines(&r),
+            [
+                "playpen:   192.0.2.9 tcp port 80: 2 packet(s)",
+                "playpen:   192.0.2.3 icmp: 1 packet(s)",
+            ]
+        );
+        if let Some(d) = r.dropped.as_mut() {
+            d.packets = 0;
+            d.destinations.clear();
+        }
+        assert!(text_summary(&r).contains("no packets to unapproved destinations were dropped"));
     }
 
     #[test]

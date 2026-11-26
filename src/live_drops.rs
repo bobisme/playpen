@@ -17,6 +17,8 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::ruleset::{self, DroppedDest};
 
 /// How often C reads the `dropped` counter while the command runs: the
@@ -26,6 +28,31 @@ pub const INTERVAL: Duration = crate::pass::RECHECK_INTERVAL;
 /// With `--live-drops`, stderr gets a line for each of the first this many
 /// destinations, then one line that says there are more.
 pub const SHOWN: usize = 8;
+
+/// Which record a `denied` line comes from. Values are stable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordKind {
+    /// The drop sets: address, protocol and port.
+    #[default]
+    Destination,
+    /// The per-address sets: address and protocol, with `port` null. Sent
+    /// only when the family's drop set is full and no line has named the
+    /// address and protocol.
+    Address,
+}
+
+/// One `denied` line: a dropped destination not sent before, and its
+/// record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Denied {
+    /// The destination; `port` is null for a [`RecordKind::Address`].
+    #[serde(flatten)]
+    pub dest: DroppedDest,
+    /// The record it comes from.
+    #[serde(default)]
+    pub record: RecordKind,
+}
 
 /// What C remembers between readings.
 #[derive(Debug, Default)]
@@ -37,6 +64,8 @@ pub struct LiveDrops {
     listed_at: u64,
     /// Destinations already sent, as address, protocol and port.
     sent: HashSet<(String, String, Option<u16>)>,
+    /// Addresses and protocols that a line sent has named.
+    named: HashSet<(String, String)>,
     /// A failed reading has been reported.
     failure_reported: bool,
     /// The ruleset has the tripwire (`--on-drop`).
@@ -76,23 +105,60 @@ impl LiveDrops {
 
     /// The destinations in `table`, a listing of the whole table made after
     /// the counter read `packets`, that were not sent before. Records them
-    /// as sent, and `packets` as the counter at this listing. Largest
-    /// packet count first.
+    /// as sent, and `packets` as the counter at this listing. First the
+    /// drop sets' destinations, largest packet count first; then, for a
+    /// family whose drop set is full, each per-address entry whose address
+    /// and protocol no line has named.
     ///
     /// # Errors
     /// When the listing does not parse; nothing is recorded then, so the
     /// next reading lists the table again.
-    pub fn fresh(&mut self, packets: u64, table: &str) -> Result<Vec<DroppedDest>, String> {
+    pub fn fresh(&mut self, packets: u64, table: &str) -> Result<Vec<Denied>, String> {
         let summary = ruleset::parse_counters(table)?;
         self.listed_at = packets;
-        Ok(summary
-            .destinations
-            .into_iter()
-            .filter(|d| {
-                self.sent
-                    .insert((d.address.clone(), d.protocol.clone(), d.port))
-            })
-            .collect())
+        let mut out: Vec<Denied> = Vec::new();
+        for d in summary.destinations {
+            self.named.insert((d.address.clone(), d.protocol.clone()));
+            if self
+                .sent
+                .insert((d.address.clone(), d.protocol.clone(), d.port))
+            {
+                out.push(Denied {
+                    dest: d,
+                    record: RecordKind::Destination,
+                });
+            }
+        }
+        let full = |v4: bool| {
+            let name = if v4 {
+                ruleset::FULL_NAMES[0]
+            } else {
+                ruleset::FULL_NAMES[1]
+            };
+            summary.full.iter().any(|f| f == name)
+        };
+        for a in summary.addresses.unwrap_or_default() {
+            // Only a full drop set is a reason for an address to have no
+            // destination there: otherwise its packet came after the drop
+            // set was listed, and the next listing has it.
+            let v4 = a
+                .address
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_ipv4());
+            if !full(v4) || !self.named.insert((a.address.clone(), a.protocol.clone())) {
+                continue;
+            }
+            out.push(Denied {
+                dest: DroppedDest {
+                    address: a.address,
+                    protocol: a.protocol,
+                    port: None,
+                    packets: a.packets,
+                },
+                record: RecordKind::Address,
+            });
+        }
+        Ok(out)
     }
 
     /// True the first time it is called: a failed reading is reported once.
@@ -174,10 +240,82 @@ mod tests {
         )
     }
 
-    fn keys(list: &[DroppedDest]) -> Vec<(String, String, Option<u16>, u64)> {
+    fn keys(list: &[Denied]) -> Vec<(String, String, Option<u16>, u64)> {
         list.iter()
-            .map(|d| (d.address.clone(), d.protocol.clone(), d.port, d.packets))
+            .map(|Denied { dest: d, record }| {
+                assert_eq!(*record, RecordKind::Destination);
+                (d.address.clone(), d.protocol.clone(), d.port, d.packets)
+            })
             .collect()
+    }
+
+    /// A table listing with the per-address sets as well: the IPv4 drop
+    /// set full with UDP to ports 1 to 1024 of 203.0.113.5, and these
+    /// IPv4 address entries (address, protocol, packets).
+    fn flooded(total: u64, extra: &[(&str, &str, u64)]) -> String {
+        let ports: Vec<String> = (1..=1024)
+            .map(|port| {
+                format!(
+                    r#"{{"elem": {{"val": {{"concat": ["203.0.113.5", "udp", {port}]}}, "counter": {{"packets": 1, "bytes": 0}}}}}}"#
+                )
+            })
+            .collect();
+        let addrs: Vec<String> = std::iter::once(("203.0.113.5", "udp", 1024))
+            .chain(extra.iter().copied())
+            .map(|(a, p, n)| {
+                format!(
+                    r#"{{"elem": {{"val": {{"concat": ["{a}", "{p}"]}}, "counter": {{"packets": {n}, "bytes": 0}}}}}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"nftables": [{{"counter": {{"name": "dropped", "packets": {total}}}}}, {{"set": {{"name": "drop4", "elem": [{}]}}}}, {{"set": {{"name": "drop6"}}}}, {{"set": {{"name": "dropaddr4", "elem": [{}]}}}}, {{"set": {{"name": "dropaddr6"}}}}]}}"#,
+            ports.join(","),
+            addrs.join(",")
+        )
+    }
+
+    #[test]
+    fn past_a_full_drop_set_a_new_address_is_sent_without_its_port() {
+        let mut live = LiveDrops::default();
+        let first = live.fresh(1024, &flooded(1024, &[])).unwrap_or_default();
+        assert_eq!(first.len(), 1024);
+        assert!(first.iter().all(|d| d.record == RecordKind::Destination));
+        // The decoys' address is named by their lines already; the real
+        // target is not in the full drop set, and gets an address line.
+        let second = live
+            .fresh(1026, &flooded(1026, &[("198.51.100.66", "tcp", 2)]))
+            .unwrap_or_default();
+        assert_eq!(
+            second,
+            [Denied {
+                dest: DroppedDest {
+                    address: "198.51.100.66".into(),
+                    protocol: "tcp".into(),
+                    port: None,
+                    packets: 2,
+                },
+                record: RecordKind::Address,
+            }]
+        );
+        assert_eq!(
+            serde_json::to_value(&second[0]).unwrap_or_default(),
+            serde_json::json!({"address": "198.51.100.66", "protocol": "tcp", "port": null, "packets": 2, "record": "address"})
+        );
+        // Once.
+        let third = live
+            .fresh(1030, &flooded(1030, &[("198.51.100.66", "tcp", 6)]))
+            .unwrap_or_default();
+        assert_eq!(third, []);
+        // An address entry without its destination while the drop set has
+        // room is a packet the listing caught between the sets: the next
+        // listing has its destination.
+        let mut live = LiveDrops::default();
+        let early = table(1, &[], &[]).replace(
+            "{\"set\": {\"name\": \"cut\"}}",
+            "{\"set\": {\"name\": \"dropaddr4\", \"elem\": [{\"elem\": {\"val\": {\"concat\": [\"192.0.2.2\", \"udp\"]}, \"counter\": {\"packets\": 1}}}]}}, {\"set\": {\"name\": \"dropaddr6\"}}",
+        );
+        assert_eq!(live.fresh(1, &early).unwrap_or_default(), []);
     }
 
     #[test]

@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 use crate::approval::{AllowRule, Approval, Proto};
 use crate::contacts;
 use crate::ruleset::{
-    CUT_COUNTER, CUT_MARK, CUT_SET, CUT_SET_SIZE, DROP_SET_SIZE, Instrumentation, LATE_COUNTER,
-    TABLE, end_second,
+    ADDRESS_SET_SIZE, ADDRESS_SETS, CUT_COUNTER, CUT_MARK, CUT_SET, CUT_SET_SIZE, DROP_SET_SIZE,
+    Instrumentation, LATE_COUNTER, TABLE, end_second,
 };
 
 /// The time zone `nft` is run in when it lists the table. `nft --json`
@@ -155,6 +155,13 @@ fn declarations(timed: bool, with: Instrumentation) -> Table {
                 "size":DROP_SET_SIZE,"flags":["dynamic"],"stmt":[{"counter":null}]}),
         );
     }
+    for (name, kind) in ADDRESS_SETS.into_iter().zip(["ipv4_addr", "ipv6_addr"]) {
+        table.objects.insert(
+            (String::from("set"), name.to_owned()),
+            json!({"family":"inet","table":TABLE,"name":name,"type":[kind,"inet_proto"],
+                "size":ADDRESS_SET_SIZE,"flags":["dynamic"],"stmt":[{"counter":null}]}),
+        );
+    }
     table
 }
 
@@ -207,6 +214,13 @@ fn expected(approval: &Approval, with: Instrumentation) -> Table {
                 {"set":{"op":"add","elem":{"concat":[payload(family,"daddr"),meta("l4proto"),port]},"set":set}}
             ]));
         }
+    }
+    // nft prints these without their `meta nfproto` matches, as the
+    // additions in the contacted chain.
+    for (family, set) in [("ip", ADDRESS_SETS[0]), ("ip6", ADDRESS_SETS[1])] {
+        output.push(json!([
+            {"set":{"op":"add","elem":{"concat":[payload(family,"daddr"),meta("l4proto")]},"set":format!("@{set}")}}
+        ]));
     }
     // With --on-drop: the tripwire, and a drop instead of the reject (see
     // `ruleset::render_instrumented`).
@@ -809,6 +823,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_address_record_is_required() {
+        let approval = approval();
+        // Without its two rules or its two sets, as a ruleset from before
+        // the record would be.
+        for set in ["dropaddr4", "dropaddr6"] {
+            let rule = RULES
+                .lines()
+                .find(|l| l.contains("\"rule\"") && l.contains(&format!("\"@{set}\"")))
+                .unwrap_or_else(|| panic!("no {set} rule"));
+            let without = RULES.replacen(&format!("{rule}\n"), "", 1);
+            assert_ne!(RULES, without);
+            assert_eq!(
+                verify_policy(&without, &approval),
+                Err("output chain has 16 rules, expected 17".into()),
+                "{set}"
+            );
+            let declaration = RULES
+                .lines()
+                .find(|l| l.contains(&format!("\"name\": \"{set}\"")))
+                .unwrap_or_else(|| panic!("no {set} set"));
+            let without = RULES.replacen(&format!("{declaration}\n"), "", 1);
+            assert_ne!(RULES, without);
+            assert!(verify_policy(&without, &approval).is_err(), "{set}");
+        }
+        for (from, to) in [
+            // Another size, a port in the key, the sets swapped, no
+            // per-element counter.
+            (
+                "\"type\": [\"ipv4_addr\", \"inet_proto\"], \"handle\": 8, \"size\": 1024",
+                "\"type\": [\"ipv4_addr\", \"inet_proto\"], \"handle\": 8, \"size\": 16",
+            ),
+            (
+                "\"type\": [\"ipv4_addr\", \"inet_proto\"]",
+                "\"type\": [\"ipv4_addr\", \"inet_proto\", \"inet_service\"]",
+            ),
+            ("\"set\": \"@dropaddr4\"", "\"set\": \"@dropaddr6\""),
+            (
+                "\"type\": [\"ipv6_addr\", \"inet_proto\"], \"handle\": 9, \"size\": 1024, \"flags\": [\"dynamic\"], \"stmt\": [{\"counter\": null}]",
+                "\"type\": [\"ipv6_addr\", \"inet_proto\"], \"handle\": 9, \"size\": 1024, \"flags\": [\"dynamic\"]",
+            ),
+        ] {
+            let altered = RULES.replacen(from, to, 1);
+            assert_ne!(RULES, altered, "{from}");
+            assert!(verify_policy(&altered, &approval).is_err(), "{to}");
+        }
+    }
+
     const CONTACTS: &str = include_str!("../tests/fixtures/nft/contacts.json");
 
     fn contacts(json: &str, grant_counters: usize) -> Result<(), String> {
@@ -873,8 +935,8 @@ mod tests {
         let elsewhere = CONTACTS.replacen("\"target\": \"contacted\"", "\"target\": \"input\"", 1);
         assert_eq!(contacts(&elsewhere, 0), Err("output rule 7 differs".into()));
         let dropped = CONTACTS.replace(
-            "\"chain\": \"contacted\", \"handle\": 42, \"expr\": [{\"accept\": null}]",
-            "\"chain\": \"contacted\", \"handle\": 42, \"expr\": [{\"drop\": null}]",
+            "\"chain\": \"contacted\", \"handle\": 46, \"expr\": [{\"accept\": null}]",
+            "\"chain\": \"contacted\", \"handle\": 46, \"expr\": [{\"drop\": null}]",
         );
         assert_ne!(CONTACTS, dropped);
         assert_eq!(

@@ -243,6 +243,7 @@ mod tests {
             packets: 1,
             destinations: vec![dest("198.51.100.9", Some(9563), 1)],
             destinations_truncated: false,
+            ..DropSummary::default()
         };
         let seen = Observed {
             drops: Some(&drops),
@@ -281,6 +282,7 @@ mod tests {
             packets: 2,
             destinations: vec![],
             destinations_truncated: true,
+            ..DropSummary::default()
         };
         let seen = Observed {
             drops: Some(&drops),

@@ -342,6 +342,46 @@ fn a_denied_destination_is_reported_once_while_the_command_runs() {
 /// Twenty destinations at once: eight lines and one "more" line on
 /// stderr, a record for each on the events stream, and every one in the
 /// report.
+/// The live lines of a burst: 8 lines, one that says there are more, then
+/// only addresses and protocols that the first 8 did not show.
+fn check_live_burst(live: &[String], expected: &BTreeSet<(String, String, u64)>, err: &str) {
+    assert!(live.len() >= 9, "{err}");
+    for line in &live[..8] {
+        let dest = line
+            .strip_prefix("playpen: dropped: ")
+            .and_then(|l| l.strip_suffix(" (not approved)"))
+            .unwrap_or_else(|| panic!("{line:?}"));
+        let mut parts = dest.split(' ');
+        let (addr, proto, word, port) = (parts.next(), parts.next(), parts.next(), parts.next());
+        assert_eq!(word, Some("port"), "{line:?}");
+        let k = (
+            addr.unwrap_or("").to_owned(),
+            proto.unwrap_or("").to_owned(),
+            port.and_then(|p| p.parse().ok()).unwrap_or(0),
+        );
+        assert!(expected.contains(&k), "{line:?}");
+    }
+    assert_eq!(
+        live[8],
+        "playpen: dropped: more than 8 destinations; see the summary at the end"
+    );
+    // Then only addresses and protocols that the first 8 lines did not show.
+    let first: BTreeSet<String> = live[..8]
+        .iter()
+        .filter_map(|l| l.strip_prefix("playpen: dropped: "))
+        .map(|l| l.split(" port ").next().unwrap_or("").to_owned())
+        .collect();
+    for line in &live[9..] {
+        let rest = line
+            .strip_prefix("playpen: dropped: ")
+            .and_then(|l| l.strip_suffix(" (not approved; a new address)"))
+            .unwrap_or_else(|| panic!("{line:?}"));
+        let key = rest.split(" port ").next().unwrap_or("");
+        assert!(!first.contains(key), "{line:?} repeats an address: {err}");
+    }
+    assert!(live.len() <= 9 + 3, "{err}");
+}
+
 #[test]
 fn a_burst_is_bounded_on_stderr_and_complete_in_the_report() {
     require_sandbox!(false);
@@ -412,26 +452,7 @@ fn a_burst_is_bounded_on_stderr_and_complete_in_the_report() {
 
     // Eight lines, then one line that says there are more.
     let live: Vec<String> = f.live_lines().into_iter().map(|(_, l)| l).collect();
-    assert_eq!(live.len(), 9, "{err}");
-    for line in &live[..8] {
-        let dest = line
-            .strip_prefix("playpen: dropped: ")
-            .and_then(|l| l.strip_suffix(" (not approved)"))
-            .unwrap_or_else(|| panic!("{line:?}"));
-        let mut parts = dest.split(' ');
-        let (addr, proto, word, port) = (parts.next(), parts.next(), parts.next(), parts.next());
-        assert_eq!(word, Some("port"), "{line:?}");
-        let k = (
-            addr.unwrap_or("").to_owned(),
-            proto.unwrap_or("").to_owned(),
-            port.and_then(|p| p.parse().ok()).unwrap_or(0),
-        );
-        assert!(expected.contains(&k), "{line:?}");
-    }
-    assert_eq!(
-        live[8],
-        "playpen: dropped: more than 8 destinations; see the summary at the end"
-    );
+    check_live_burst(&live, &expected, &err);
 
     // The report and the summary have them all.
     let dests = f.report["dropped"]["destinations"]
@@ -449,6 +470,117 @@ fn a_burst_is_bounded_on_stderr_and_complete_in_the_report() {
             "{err}"
         );
     }
+}
+
+/// The evaluation's decoy flood: UDP to ports 1 to 1024 of one address
+/// fills the IPv4 drop set, then one TCP connection goes to the real
+/// target. The per-address record still has the target, so the report, the
+/// summary and the `denied` records name it, and stderr stays short.
+#[test]
+fn a_port_sweep_does_not_hide_the_real_target() {
+    require_sandbox!(false);
+    let dir = tmpdir("decoys");
+    let mut script = String::from("\"$0\" probe reach");
+    for port in 1..=1024 {
+        script.push_str(" --try 203.0.113.5:");
+        script.push_str(&port.to_string());
+        script.push_str("/udp");
+    }
+    // Long enough for a reading after the last packet.
+    script.push_str(" --try 198.51.100.66:443/tcp >/dev/null; sleep 2.5");
+    let f = start(
+        &dir,
+        &[
+            "--no-network",
+            "--lo-addr",
+            "203.0.113.5",
+            "--lo-addr",
+            "198.51.100.66",
+            "--live-drops",
+            "--",
+            "sh",
+            "-c",
+            &script,
+            BIN,
+        ],
+    )
+    .finish(&dir);
+    let err = f.err();
+    let context = format!("stderr {err}; report {}", f.report);
+    assert_eq!(f.code, Some(0), "{context}");
+
+    // The report: the drop set is full of decoys, and the address record
+    // has the target.
+    let dropped = &f.report["dropped"];
+    assert_eq!(dropped["packets"], 1025, "{context}");
+    assert_eq!(
+        dropped["destinations"].as_array().map(Vec::len),
+        Some(1024),
+        "{context}"
+    );
+    assert_eq!(dropped["destinations_truncated"], true, "{context}");
+    assert_eq!(dropped["destinations_unlisted"], 1, "{context}");
+    assert_eq!(
+        dropped["addresses"],
+        serde_json::json!([
+            {"address": "203.0.113.5", "protocol": "udp", "packets": 1024},
+            {"address": "198.51.100.66", "protocol": "tcp", "packets": 1}
+        ]),
+        "{context}"
+    );
+    assert_eq!(dropped["addresses_truncated"], false, "{context}");
+    assert_eq!(dropped["addresses_unlisted"], 0, "{context}");
+    assert_eq!(
+        dropped["full"],
+        serde_json::json!(["destinations_ipv4"]),
+        "{context}"
+    );
+
+    // The summary names it, and says why its port is missing.
+    for line in [
+        "playpen: WARNING: 1025 packet(s) to UNAPPROVED destinations were dropped.",
+        "playpen:   203.0.113.5 udp, 1024 ports: 1024 packet(s)",
+        "playpen:   198.51.100.66 tcp, port not recorded: 1 packet(s)",
+        "playpen:   1 packet(s) have no port in the report: the per-port record is full for IPv4 (it keeps the first 1024 destinations of each family)",
+    ] {
+        assert!(err.lines().any(|l| l == line), "{line}: {context}");
+    }
+    assert!(!err.contains("inconsistent"), "{context}");
+    // Short: the start line, 9 live lines and the summary.
+    assert!(f.stderr.len() < 30, "{} lines: {err}", f.stderr.len());
+
+    // The live records: every decoy, and the target from the address
+    // record, once.
+    let denied = f.denied();
+    assert_eq!(denied.len(), 1025, "{:?}", denied.last());
+    let target: Vec<&Value> = denied
+        .iter()
+        .map(|(_, e)| &e["details"])
+        .filter(|d| d["address"] == "198.51.100.66")
+        .collect();
+    assert_eq!(
+        target,
+        [
+            &serde_json::json!({"address": "198.51.100.66", "protocol": "tcp", "port": null, "packets": 1, "record": "address"})
+        ],
+        "{context}"
+    );
+    assert!(
+        denied
+            .iter()
+            .filter(|(_, e)| e["details"]["address"] == "203.0.113.5")
+            .all(|(_, e)| e["details"]["record"] == "destination" && e["details"]["port"].is_u64()),
+        "{context}"
+    );
+    // On live stderr: 8 decoys, the line that says there are more, and
+    // the target as a new address.
+    let live: Vec<String> = f.live_lines().into_iter().map(|(_, l)| l).collect();
+    assert_eq!(live.len(), 10, "{context}");
+    assert_eq!(
+        live[9],
+        "playpen: dropped: 198.51.100.66 tcp, port not recorded (not approved; a new address)",
+        "{context}"
+    );
 }
 
 /// A run with nothing dropped prints what it printed before, and the

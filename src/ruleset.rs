@@ -8,7 +8,7 @@
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::approval::{AllowRule, Approval, Proto};
 use crate::contacts;
@@ -16,8 +16,22 @@ pub use crate::nft_readback::verify_policy;
 
 /// Name of the nftables table playpen loads.
 pub const TABLE: &str = "playpen";
-/// Most distinct dropped destinations remembered per address family.
+/// Most distinct dropped destinations (address, protocol and port)
+/// remembered per address family.
 pub const DROP_SET_SIZE: u32 = 1024;
+/// The sets of dropped destinations (address, protocol and port), IPv4 and
+/// IPv6.
+pub const DROP_SETS: [&str; 2] = ["drop4", "drop6"];
+/// The sets of dropped addresses (address and protocol, without the port),
+/// IPv4 and IPv6.
+///
+/// A command that sends to many ports of one address fills the drop sets,
+/// but uses one element here, so packets to other addresses are still
+/// recorded.
+pub const ADDRESS_SETS: [&str; 2] = ["dropaddr4", "dropaddr6"];
+/// Most distinct dropped addresses (address and protocol) remembered per
+/// address family.
+pub const ADDRESS_SET_SIZE: u32 = 1024;
 /// The set that closes all egress once it holds [`CUT_MARK`]. Empty when
 /// the ruleset is loaded.
 pub const CUT_SET: &str = "cut";
@@ -55,7 +69,8 @@ pub fn end_second(approval: &Approval) -> Option<i64> {
 /// Output, input and forward chains all have policy drop. Output accepts
 /// loopback destinations on `lo`, established and related traffic, the
 /// kernel's own IPv6 neighbour discovery, and the approved destinations.
-/// Everything else is counted (in total and per destination) and rejected,
+/// Everything else is counted (in total, per destination and per address)
+/// and rejected,
 /// so a blocked connection fails at once instead of hanging. A rule for an
 /// IPv4 network does not accept the network and broadcast addresses of any
 /// listed network (see [`Approval::covers_addr`]); they are counted and rejected
@@ -133,6 +148,14 @@ fn declarations(out: &mut String, timed: bool, with: Instrumentation) {
         let _ = writeln!(out, "\t\tcounter");
         let _ = writeln!(out, "\t}}");
     }
+    for (name, ty) in ADDRESS_SETS.into_iter().zip(["ipv4_addr", "ipv6_addr"]) {
+        let _ = writeln!(out, "\tset {name} {{");
+        let _ = writeln!(out, "\t\ttype {ty} . inet_proto");
+        let _ = writeln!(out, "\t\tsize {ADDRESS_SET_SIZE}");
+        let _ = writeln!(out, "\t\tflags dynamic");
+        let _ = writeln!(out, "\t\tcounter");
+        let _ = writeln!(out, "\t}}");
+    }
     let _ = writeln!(out, "\tset {CUT_SET} {{");
     let _ = writeln!(out, "\t\ttype mark");
     if with.tripwire {
@@ -204,22 +227,7 @@ pub fn render_instrumented(approval: &Approval, with: Instrumentation) -> String
             let _ = writeln!(out, " accept");
         }
     }
-    let _ = writeln!(
-        out,
-        "\t\tmeta nfproto ipv4 meta l4proto {{ tcp, udp }} add @drop4 {{ ip daddr . meta l4proto . th dport }}"
-    );
-    let _ = writeln!(
-        out,
-        "\t\tmeta nfproto ipv4 meta l4proto != {{ tcp, udp }} add @drop4 {{ ip daddr . meta l4proto . 0 }}"
-    );
-    let _ = writeln!(
-        out,
-        "\t\tmeta nfproto ipv6 meta l4proto {{ tcp, udp }} add @drop6 {{ ip6 daddr . meta l4proto . th dport }}"
-    );
-    let _ = writeln!(
-        out,
-        "\t\tmeta nfproto ipv6 meta l4proto != {{ tcp, udp }} add @drop6 {{ ip6 daddr . meta l4proto . 0 }}"
-    );
+    record_drops(&mut out);
     if with.tripwire {
         let _ = writeln!(
             out,
@@ -261,6 +269,38 @@ pub fn render_instrumented(approval: &Approval, with: Instrumentation) -> String
     let _ = writeln!(out, "\t}}");
     let _ = writeln!(out, "}}");
     out
+}
+
+/// The rules of the refusal path that record each refused packet before it
+/// is counted: its destination (address, protocol and port) in the drop
+/// set of its family, and its address and protocol in the per-address set.
+fn record_drops(out: &mut String) {
+    let _ = writeln!(
+        out,
+        "\t\tmeta nfproto ipv4 meta l4proto {{ tcp, udp }} add @drop4 {{ ip daddr . meta l4proto . th dport }}"
+    );
+    let _ = writeln!(
+        out,
+        "\t\tmeta nfproto ipv4 meta l4proto != {{ tcp, udp }} add @drop4 {{ ip daddr . meta l4proto . 0 }}"
+    );
+    let _ = writeln!(
+        out,
+        "\t\tmeta nfproto ipv6 meta l4proto {{ tcp, udp }} add @drop6 {{ ip6 daddr . meta l4proto . th dport }}"
+    );
+    let _ = writeln!(
+        out,
+        "\t\tmeta nfproto ipv6 meta l4proto != {{ tcp, udp }} add @drop6 {{ ip6 daddr . meta l4proto . 0 }}"
+    );
+    // Each in a rule of its own: a full set ends only the rule that adds
+    // to it.
+    let _ = writeln!(
+        out,
+        "\t\tmeta nfproto ipv4 add @dropaddr4 {{ ip daddr . meta l4proto }}"
+    );
+    let _ = writeln!(
+        out,
+        "\t\tmeta nfproto ipv6 add @dropaddr6 {{ ip6 daddr . meta l4proto }}"
+    );
 }
 
 /// With `--report-contacts`, the rules of the input chain that record the
@@ -405,7 +445,7 @@ fn match_expr(rule: &AllowRule, excluded: &[std::net::Ipv4Addr]) -> String {
 }
 
 /// One dropped destination with its packet count.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct DroppedDest {
     /// Destination address.
     pub address: String,
@@ -417,19 +457,152 @@ pub struct DroppedDest {
     pub packets: u64,
 }
 
-/// What the drop counters said after the command finished.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+/// One dropped address with its protocol and packet count: the record
+/// without the port ([`ADDRESS_SETS`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
+pub struct DroppedAddr {
+    /// Destination address.
+    pub address: String,
+    /// Protocol name, as in [`DroppedDest::protocol`].
+    pub protocol: String,
+    /// Packets dropped to this address with this protocol, to any port.
+    pub packets: u64,
+}
+
+/// A record that is full: it holds as many elements as its set's size, so
+/// it took no new destination after that. Values are stable.
+pub const FULL_NAMES: [&str; 4] = [
+    "destinations_ipv4",
+    "destinations_ipv6",
+    "addresses_ipv4",
+    "addresses_ipv6",
+];
+
+/// What the drop counters said after the command finished. C passes it
+/// to P as JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DropSummary {
     /// Packets to unapproved destinations that were dropped, in total.
     pub packets: u64,
-    /// Per-destination breakdown, largest first.
+    /// Per-destination breakdown (address, protocol and port), largest
+    /// first.
     pub destinations: Vec<DroppedDest>,
     /// True when the per-destination list does not account for every
-    /// dropped packet (more distinct destinations than the set holds).
+    /// dropped packet (more distinct destinations than the set holds), or
+    /// the listing is inconsistent.
     pub destinations_truncated: bool,
+    /// Packets in `packets` that are in no entry of `destinations`; `None`
+    /// when the listing is inconsistent.
+    pub destinations_unlisted: Option<u64>,
+    /// Per-address breakdown (address and protocol, any port), largest
+    /// first; `None` when the listing has no per-address sets.
+    pub addresses: Option<Vec<DroppedAddr>>,
+    /// True when the per-address list does not account for every dropped
+    /// packet, or there is none.
+    pub addresses_truncated: bool,
+    /// Packets in `packets` that are in no entry of `addresses`; `None`
+    /// when the listing is inconsistent or has no per-address sets.
+    pub addresses_unlisted: Option<u64>,
+    /// The records that are full, from [`FULL_NAMES`].
+    pub full: Vec<String>,
+}
+
+impl Default for DropSummary {
+    /// Nothing dropped, and both records complete.
+    fn default() -> Self {
+        Self {
+            packets: 0,
+            destinations: Vec::new(),
+            destinations_truncated: false,
+            destinations_unlisted: Some(0),
+            addresses: Some(Vec::new()),
+            addresses_truncated: false,
+            addresses_unlisted: Some(0),
+            full: Vec::new(),
+        }
+    }
+}
+
+/// The elements of one kind of set (the two families) in a listing.
+struct Record<T> {
+    entries: Vec<T>,
+    /// An element did not parse or repeated, a set repeated, or a family's
+    /// set is missing.
+    uncertain: bool,
+    /// The sets seen, by family (IPv4, IPv6).
+    seen: [bool; 2],
+    /// The families whose set holds `size` elements.
+    full: [bool; 2],
+}
+
+impl<T> Record<T> {
+    /// The elements of the sets `names` (IPv4, IPv6) in `items`, each
+    /// parsed by `parse` (given whether the set is the IPv4 one) and keyed
+    /// by `key`.
+    fn read<K: Eq + std::hash::Hash>(
+        items: &[serde_json::Value],
+        names: [&str; 2],
+        size: u32,
+        parse: impl Fn(&serde_json::Value, bool) -> Option<T>,
+        key: impl Fn(&T) -> K,
+    ) -> Self {
+        let mut record = Self {
+            entries: Vec::new(),
+            uncertain: false,
+            seen: [false; 2],
+            full: [false; 2],
+        };
+        let mut keys = std::collections::HashSet::new();
+        for s in items.iter().filter_map(|item| item.get("set")) {
+            let name = s.get("name").and_then(serde_json::Value::as_str);
+            let Some(family) = names.iter().position(|n| Some(*n) == name) else {
+                continue;
+            };
+            if std::mem::replace(&mut record.seen[family], true) {
+                record.uncertain = true;
+            }
+            match s.get("elem") {
+                None => {} // nft omits elem for an empty set
+                Some(serde_json::Value::Array(elems)) => {
+                    record.full[family] = elems.len() >= usize::try_from(size).unwrap_or(0);
+                    for elem in elems {
+                        match parse(elem, family == 0) {
+                            Some(entry) => {
+                                if !keys.insert(key(&entry)) {
+                                    record.uncertain = true;
+                                }
+                                record.entries.push(entry);
+                            }
+                            None => record.uncertain = true,
+                        }
+                    }
+                }
+                Some(_) => record.uncertain = true,
+            }
+        }
+        record.uncertain |= record.seen != [true; 2];
+        record
+    }
+
+    /// Whether the entries account for `total` packets exactly, and the
+    /// packets in no entry (`None` when the record is uncertain or its
+    /// entries count more than `total`).
+    fn unlisted(&self, total: u64, packets: impl Fn(&T) -> u64) -> (bool, Option<u64>) {
+        let listed = self
+            .entries
+            .iter()
+            .try_fold(0_u64, |sum, entry| sum.checked_add(packets(entry)));
+        let rest = listed
+            .and_then(|listed| total.checked_sub(listed))
+            .filter(|_| !self.uncertain);
+        (rest == Some(0), rest)
+    }
 }
 
 /// Parses `nft --json list table inet playpen`.
+///
+/// A listing without the per-address sets ([`ADDRESS_SETS`]) gives the
+/// per-destination breakdown as before, and `addresses` `None`.
 ///
 /// # Errors
 /// When the output is not the JSON nftables writes or the counter is
@@ -442,78 +615,78 @@ pub fn parse_counters(json: &str) -> Result<DropSummary, String> {
         .and_then(serde_json::Value::as_array)
         .ok_or("nft JSON has no \"nftables\" array")?;
     let mut total = None;
-    let mut dests = Vec::new();
-    let mut detail_uncertain = false;
-    let mut seen_sets = std::collections::HashSet::new();
-    let mut identities = std::collections::HashSet::new();
-    for item in items {
-        if let Some(c) = item.get("counter")
-            && c.get("name").and_then(serde_json::Value::as_str) == Some("dropped")
-        {
-            if total.is_some() {
-                return Err("nft JSON has duplicate dropped counters".into());
-            }
-            total = Some(
-                c.get("packets")
-                    .and_then(serde_json::Value::as_u64)
-                    .ok_or("invalid dropped counter")?,
-            );
+    for c in items.iter().filter_map(|item| item.get("counter")) {
+        if c.get("name").and_then(serde_json::Value::as_str) != Some("dropped") {
+            continue;
         }
-        if let Some(s) = item.get("set") {
-            let name = s.get("name").and_then(serde_json::Value::as_str);
-            if !matches!(name, Some("drop4" | "drop6")) {
-                continue;
-            }
-            if !seen_sets.insert(name.unwrap_or_default().to_owned()) {
-                detail_uncertain = true;
-            }
-            match s.get("elem") {
-                None => {} // nft omits elem for an empty set
-                Some(serde_json::Value::Array(elems)) => {
-                    for elem in elems {
-                        if let Some(d) = parse_elem(elem, name == Some("drop4")) {
-                            if !identities.insert((d.address.clone(), d.protocol.clone(), d.port)) {
-                                detail_uncertain = true;
-                            }
-                            dests.push(d);
-                        } else {
-                            detail_uncertain = true;
-                        }
-                    }
-                }
-                Some(_) => detail_uncertain = true,
-            }
+        if total.is_some() {
+            return Err("nft JSON has duplicate dropped counters".into());
         }
+        total = Some(
+            c.get("packets")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("invalid dropped counter")?,
+        );
     }
     let packets = total.ok_or("nft JSON has no \"dropped\" counter")?;
-    dests.sort_by(|a, b| b.packets.cmp(&a.packets).then_with(|| a.cmp(b)));
-    let listed = dests
+    let dests = Record::read(items, DROP_SETS, DROP_SET_SIZE, parse_elem, |d| {
+        (d.address.clone(), d.protocol.clone(), d.port)
+    });
+    let addrs = Record::read(
+        items,
+        ADDRESS_SETS,
+        ADDRESS_SET_SIZE,
+        parse_addr_elem,
+        |a| (a.address.clone(), a.protocol.clone()),
+    );
+    let (dests_complete, destinations_unlisted) = dests.unlisted(packets, |d| d.packets);
+    let has_addresses = addrs.seen != [false; 2];
+    let (addrs_complete, addresses_unlisted) = if has_addresses {
+        addrs.unlisted(packets, |a| a.packets)
+    } else {
+        (false, None)
+    };
+    let full = dests
+        .full
         .iter()
-        .try_fold(0_u64, |sum, d| sum.checked_add(d.packets));
-    detail_uncertain |= seen_sets.len() != 2;
+        .chain(&addrs.full)
+        .zip(FULL_NAMES)
+        .filter(|(full, _)| **full)
+        .map(|(_, name)| name.to_owned())
+        .collect();
+    let mut destinations = dests.entries;
+    destinations.sort_by(|a, b| b.packets.cmp(&a.packets).then_with(|| a.cmp(b)));
+    let addresses = has_addresses.then(|| {
+        let mut list = addrs.entries;
+        list.sort_by(|a, b| b.packets.cmp(&a.packets).then_with(|| a.cmp(b)));
+        list
+    });
     Ok(DropSummary {
         packets,
-        destinations_truncated: detail_uncertain || listed != Some(packets),
-        destinations: dests,
+        destinations,
+        destinations_truncated: !dests_complete,
+        destinations_unlisted,
+        addresses,
+        addresses_truncated: !addrs_complete,
+        addresses_unlisted,
+        full,
     })
 }
 
-/// One element of a set of destinations (address, protocol, port) with
-/// its counter: of an IPv4 set when `v4`, else of an IPv6 set. `None` for
-/// an element of any other shape or family.
-pub(crate) fn parse_elem(elem: &serde_json::Value, v4: bool) -> Option<DroppedDest> {
+/// The address, protocol name and packet count of an element of a set of
+/// `width` concatenated fields that starts with an address and a protocol:
+/// of an IPv4 set when `v4`, else of an IPv6 set. Also the fields.
+fn elem_head(
+    elem: &serde_json::Value,
+    v4: bool,
+    width: usize,
+) -> Option<(&[serde_json::Value], String, String, u64)> {
     let inner = elem.get("elem")?;
     let concat = inner.get("val")?.get("concat")?.as_array()?;
-    if concat.len() != 3 {
+    if concat.len() != width {
         return None;
     }
-    let address = concat
-        .first()?
-        .as_str()?
-        .parse::<std::net::IpAddr>()
-        .ok()?
-        .to_string();
-    let ip = address.parse::<std::net::IpAddr>().ok()?;
+    let ip = concat.first()?.as_str()?.parse::<std::net::IpAddr>().ok()?;
     if v4 != ip.is_ipv4() {
         return None;
     }
@@ -530,6 +703,15 @@ pub(crate) fn parse_elem(elem: &serde_json::Value, v4: bool) -> Option<DroppedDe
         "ipv6-icmp" | "58" => "ipv6-icmp".to_owned(),
         other => other.parse::<u8>().ok()?.to_string(),
     };
+    let packets = inner.get("counter")?.get("packets")?.as_u64()?;
+    Some((concat, ip.to_string(), protocol, packets))
+}
+
+/// One element of a set of destinations (address, protocol, port) with
+/// its counter: of an IPv4 set when `v4`, else of an IPv6 set. `None` for
+/// an element of any other shape or family.
+pub(crate) fn parse_elem(elem: &serde_json::Value, v4: bool) -> Option<DroppedDest> {
+    let (concat, address, protocol, packets) = elem_head(elem, v4, 3)?;
     let port = match (protocol.as_str(), concat.get(2)?) {
         ("tcp" | "udp", serde_json::Value::Number(n)) => {
             n.as_u64().and_then(|p| u16::try_from(p).ok())
@@ -540,11 +722,22 @@ pub(crate) fn parse_elem(elem: &serde_json::Value, v4: bool) -> Option<DroppedDe
     if matches!(protocol.as_str(), "tcp" | "udp") && port.is_none() {
         return None;
     }
-    let packets = inner.get("counter")?.get("packets")?.as_u64()?;
     Some(DroppedDest {
         address,
         protocol,
         port,
+        packets,
+    })
+}
+
+/// One element of a set of addresses (address, protocol) with its
+/// counter: of an IPv4 set when `v4`, else of an IPv6 set. `None` for an
+/// element of any other shape or family.
+fn parse_addr_elem(elem: &serde_json::Value, v4: bool) -> Option<DroppedAddr> {
+    let (_, address, protocol, packets) = elem_head(elem, v4, 2)?;
+    Some(DroppedAddr {
+        address,
+        protocol,
         packets,
     })
 }
@@ -1020,6 +1213,134 @@ mod tests {
         let max = entry.replace("\"packets\":3", &format!("\"packets\":{}", u64::MAX));
         assert!(snapshot(u64::MAX, &format!("{max},{entry}")).destinations_truncated);
         assert!(parse_counters(r#"{"nftables":[{"counter":{"name":"dropped","packets":0}},{"set":{"name":"drop4"}}]}"#).unwrap_or_default().destinations_truncated);
+    }
+
+    #[test]
+    fn the_address_record_is_its_own_rules_after_the_drop_sets() {
+        for with in [
+            Instrumentation::default(),
+            Instrumentation {
+                grant_counters: 1,
+                record_contacts: true,
+                tripwire: true,
+            },
+        ] {
+            let text = render_instrumented(&ending("2026-12-01T12:34:56Z"), with);
+            for (name, ty) in [("dropaddr4", "ipv4_addr"), ("dropaddr6", "ipv6_addr")] {
+                let set = format!(
+                    "\tset {name} {{\n\t\ttype {ty} . inet_proto\n\t\tsize 1024\n\t\tflags dynamic\n\t\tcounter\n\t}}\n"
+                );
+                assert_eq!(text.matches(&set).count(), 1, "{text}");
+            }
+            let output = chain(&text, "output");
+            let at = |needle: &str| output.find(needle).unwrap_or(usize::MAX);
+            let order = [
+                "add @drop6 { ip6 daddr . meta l4proto . 0 }\n",
+                "\t\tmeta nfproto ipv4 add @dropaddr4 { ip daddr . meta l4proto }\n",
+                "\t\tmeta nfproto ipv6 add @dropaddr6 { ip6 daddr . meta l4proto }\n",
+                "counter name \"dropped\"",
+            ];
+            for pair in order.windows(2) {
+                assert!(at(pair[0]) < at(pair[1]), "{pair:?} in\n{output}");
+            }
+            assert_eq!(text.matches("@dropaddr").count(), 2, "{text}");
+        }
+    }
+
+    /// The listing of a run that sent UDP to ports 1 to 1024 of
+    /// 203.0.113.5, then TCP to 198.51.100.66:443: the IPv4 drop set is
+    /// full, and the address record has both.
+    fn decoys(extra_ports: u16) -> String {
+        let ports: Vec<String> = (1..=1024)
+            .map(|port| format!(r#"{{"elem":{{"val":{{"concat":["203.0.113.5","udp",{port}]}},"counter":{{"packets":1}}}}}}"#))
+            .collect();
+        let total = 1025 + u64::from(extra_ports);
+        format!(
+            r#"{{"nftables":[{{"counter":{{"name":"dropped","packets":{total}}}}},{{"set":{{"name":"drop4","elem":[{}]}}}},{{"set":{{"name":"drop6"}}}},{{"set":{{"name":"dropaddr4","elem":[{{"elem":{{"val":{{"concat":["203.0.113.5","udp"]}},"counter":{{"packets":{}}}}}}},{{"elem":{{"val":{{"concat":["198.51.100.66","tcp"]}},"counter":{{"packets":1}}}}}}]}}}},{{"set":{{"name":"dropaddr6"}}}}]}}"#,
+            ports.join(","),
+            1024 + u64::from(extra_ports)
+        )
+    }
+
+    #[test]
+    fn a_port_sweep_leaves_room_for_another_address() {
+        let s = parse_counters(&decoys(0)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.packets, 1025);
+        assert_eq!(s.destinations.len(), 1024);
+        assert!(s.destinations_truncated);
+        assert_eq!(s.destinations_unlisted, Some(1));
+        assert_eq!(
+            s.addresses,
+            Some(vec![
+                DroppedAddr {
+                    address: "203.0.113.5".into(),
+                    protocol: "udp".into(),
+                    packets: 1024,
+                },
+                DroppedAddr {
+                    address: "198.51.100.66".into(),
+                    protocol: "tcp".into(),
+                    packets: 1,
+                },
+            ])
+        );
+        assert!(!s.addresses_truncated);
+        assert_eq!(s.addresses_unlisted, Some(0));
+        assert_eq!(s.full, ["destinations_ipv4"]);
+        let json = serde_json::to_value(&s).unwrap_or_default();
+        assert_eq!(json["addresses"][1]["address"], "198.51.100.66");
+        assert_eq!(json["full"], serde_json::json!(["destinations_ipv4"]));
+        // More packets to known ports of a full set keep counting there.
+        let s = parse_counters(&decoys(7)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.destinations_unlisted, Some(8));
+        assert_eq!(s.addresses_unlisted, Some(0));
+    }
+
+    #[test]
+    fn a_listing_without_the_address_record_reads_as_before() {
+        let entry = r#"{"elem":{"val":{"concat":["192.0.2.1","tcp",80]},"counter":{"packets":3}}}"#;
+        let listing = |sets: &str| {
+            format!(
+                r#"{{"nftables":[{{"counter":{{"name":"dropped","packets":3}}}},{{"set":{{"name":"drop4","elem":[{entry}]}}}},{{"set":{{"name":"drop6"}}}}{sets}]}}"#
+            )
+        };
+        let old = parse_counters(&listing("")).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(old.packets, 3);
+        assert_eq!(old.destinations.len(), 1);
+        assert!(!old.destinations_truncated);
+        assert_eq!(old.destinations_unlisted, Some(0));
+        assert_eq!(old.addresses, None);
+        assert!(old.addresses_truncated);
+        assert_eq!(old.addresses_unlisted, None);
+        assert_eq!(old.full, Vec::<String>::new());
+        // With the record, its entries must add up as well.
+        let addr = r#"{"elem":{"val":{"concat":["192.0.2.1","tcp"]},"counter":{"packets":3}}}"#;
+        let new = parse_counters(&listing(&format!(
+            r#",{{"set":{{"name":"dropaddr4","elem":[{addr}]}}}},{{"set":{{"name":"dropaddr6"}}}}"#
+        )))
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(!new.addresses_truncated);
+        assert_eq!(new.destinations, old.destinations);
+        for broken in [
+            // One family only.
+            format!(r#",{{"set":{{"name":"dropaddr4","elem":[{addr}]}}}}"#),
+            // A repeated entry.
+            format!(
+                r#",{{"set":{{"name":"dropaddr4","elem":[{addr},{addr}]}}}},{{"set":{{"name":"dropaddr6"}}}}"#
+            ),
+            // An entry with a port, or of the other family.
+            format!(
+                r#",{{"set":{{"name":"dropaddr4","elem":[{entry}]}}}},{{"set":{{"name":"dropaddr6"}}}}"#
+            ),
+            format!(
+                r#",{{"set":{{"name":"dropaddr4"}}}},{{"set":{{"name":"dropaddr6","elem":[{addr}]}}}}"#
+            ),
+        ] {
+            let s = parse_counters(&listing(&broken)).unwrap_or_else(|e| panic!("{e}"));
+            assert!(s.addresses_truncated, "{broken}");
+            assert_eq!(s.addresses_unlisted, None, "{broken}");
+            assert!(!s.destinations_truncated, "{broken}");
+        }
     }
 
     #[test]
