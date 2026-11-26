@@ -5,6 +5,7 @@ use crate::pass;
 use clap::Args;
 use serde::Deserialize;
 use std::io::Read as _;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use time::OffsetDateTime;
 
@@ -65,31 +66,28 @@ fn evaluate(args: &PolicyTestArgs, format: Format) -> Result<bool, String> {
     if cases.is_empty() {
         return Err("at least one case is required".into());
     }
-    let mut failed = false;
-    let mut results = Vec::new();
+    let mut checked = Vec::new();
+    let mut invalid = Vec::new();
     for (index, case) in cases.iter().enumerate() {
-        let ip = parse_literal_addr(&case.address).map_err(|e| e.to_string())?;
-        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || case.port == 0 {
-            return Err(format!(
-                "case {} is outside outbound application tuples",
-                index + 1
-            ));
+        match check(case) {
+            Ok(c) => checked.push(c),
+            Err(e) => invalid.push(format!("case {} {e}", index + 1)),
         }
-        let proto = match case.protocol.as_str() {
-            "tcp" => Proto::Tcp,
-            "udp" => Proto::Udp,
-            _ => return Err(format!("case {} has invalid protocol", index + 1)),
-        };
-        let expected = match case.expect.as_str() {
-            "allow" => true,
-            "deny" => false,
-            _ => return Err(format!("case {} has invalid expectation", index + 1)),
-        };
-        let matched = policy.matching_grant(ip, proto, case.port);
-        let actual = matched.is_some();
-        let verdict = if actual { "allow" } else { "deny" };
-        failed |= actual != expected;
-        if format == Format::Json || actual != expected {
+    }
+    if !invalid.is_empty() {
+        return Err(invalid.join("; "));
+    }
+    let mut results = Vec::new();
+    let mut matched_count = 0_usize;
+    for (index, (case, (ip, proto, expected))) in cases.iter().zip(&checked).enumerate() {
+        let (ip, proto, expected) = (*ip, *proto, *expected);
+        let (actual, reason) = if ip.is_loopback() {
+            (
+                true,
+                "the sandbox's own loopback, always allowed".to_string(),
+            )
+        } else {
+            let matched = policy.matching_grant(ip, proto, case.port);
             let excluded = || {
                 policy
                     .rules()
@@ -101,24 +99,64 @@ fn evaluate(args: &PolicyTestArgs, format: Format) -> Result<bool, String> {
                 (_, Some(r)) => format!("excluded network/broadcast address in {r}"),
                 _ => "no matching grant".into(),
             };
-            if format == Format::Json {
-                results.push(serde_json::json!({"index":index + 1, "name":case.name, "address":ip, "port":case.port, "protocol":case.protocol, "expect":case.expect, "actual":verdict, "ok":actual == expected, "reason":reason}));
+            (matched.is_some(), reason)
+        };
+        let verdict = if actual { "allow" } else { "deny" };
+        let ok = actual == expected;
+        matched_count += usize::from(ok);
+        if format == Format::Json {
+            results.push(serde_json::json!({"index":index + 1, "name":case.name, "address":ip, "port":case.port, "protocol":case.protocol, "expect":case.expect, "actual":verdict, "ok":ok, "reason":reason}));
+        } else {
+            let label = case
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("case {}", index + 1));
+            if ok {
+                outln!("{label}: ok, {verdict} ({reason})");
             } else {
                 outln!(
-                    "{}: expected {}, got {verdict} ({reason})",
-                    case.name.as_deref().unwrap_or("unnamed"),
+                    "{label}: expected {}, got {verdict} ({reason})",
                     case.expect
                 );
             }
         }
     }
+    let total = cases.len();
     if format == Format::Json {
         outln!(
             "{}",
-            serde_json::json!({"ok":!failed,"cases":results,"advice":[]})
+            serde_json::json!({"ok":matched_count == total,"matched":matched_count,"mismatched":total - matched_count,"total":total,"cases":results,"advice":[]})
         );
+    } else {
+        outln!("{matched_count} of {total} cases matched");
     }
-    Ok(failed)
+    Ok(matched_count != total)
+}
+
+/// Validate one case: its address, protocol, port and expectation.
+fn check(case: &Case) -> Result<(IpAddr, Proto, bool), String> {
+    // An IPv4-mapped IPv6 address is sent as IPv4, so test the IPv4 address.
+    let ip = parse_literal_addr(&case.address)
+        .map_err(|e| format!("has an invalid address: {e}"))?
+        .to_canonical();
+    if ip.is_unspecified() || ip.is_multicast() || case.port == 0 {
+        return Err("is outside outbound application tuples (unspecified, multicast and port 0 cannot be tested)".into());
+    }
+    let proto = match case.protocol.as_str() {
+        "tcp" => Proto::Tcp,
+        "udp" => Proto::Udp,
+        other => return Err(format!("has invalid protocol {other:?} (use tcp or udp)")),
+    };
+    let expected = match case.expect.as_str() {
+        "allow" => true,
+        "deny" => false,
+        other => {
+            return Err(format!(
+                "has invalid expectation {other:?} (use allow or deny)"
+            ));
+        }
+    };
+    Ok((ip, proto, expected))
 }
 pub(super) fn run(args: &PolicyTestArgs, format: Format) -> i32 {
     match evaluate(args, format) {

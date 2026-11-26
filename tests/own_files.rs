@@ -235,6 +235,7 @@ fn the_restore_loop_of_the_evaluation_is_stopped_and_never_read_the_pass() {
     let script = r#"P=$1
 cp "$P" "$P.saved" && echo "copied $(wc -c < "$P.saved") bytes"
 stat -c %F "$P"
+echo ready
 while :; do
   if ! cmp -s "$P" "$P.saved"; then
     cp "$P.saved" "$P.tmp" && chmod 600 "$P.tmp" && mv -f "$P.tmp" "$P" && echo restored
@@ -249,21 +250,22 @@ done"#;
         script,
         &[s(relative)],
     );
-    let started = Instant::now();
-    let child = spawn_in(&args, &dir);
-    std::thread::sleep(Duration::from_secs(1));
+    // Revoke once the command is running, not after a fixed sleep: on a
+    // loaded machine the sandbox can take longer than any fixed delay.
+    let (child, seen, rest) = spawn_ready(&args, &dir);
     write_pass(
         &pass,
         &contents.replace("revoked = false", "revoked = true"),
     );
-    let out = finish(child);
-    let took = started.elapsed();
-    let (stdout, err) = (text(&out.stdout), text(&out.stderr));
+    let edited = Instant::now();
+    let (out, after) = finish_ready(child, rest);
+    let took = edited.elapsed();
+    let (stdout, err) = (format!("{seen}{after}"), text(&out.stderr));
     let json = report(&rep);
     assert_eq!(out.status.code(), Some(128 + 15), "{stdout}\n{err}");
-    // 1 s to the edit, then at most the interval, the grace and slack.
+    // After the edit: at most the interval, the grace and slack.
     assert!(
-        took < Duration::from_millis(1000 + 200 + 3000 + 1500),
+        took < Duration::from_millis(200 + 3000 + 2500),
         "took {took:?}"
     );
     assert_eq!(json["stopped_by_pass"], true, "{json}");
@@ -399,6 +401,7 @@ fn with_its_directory_hidden_the_pass_cannot_be_seen_or_replaced() {
     let script = r#"P=$1
 echo "entries: $(ls -A "$(dirname "$P")" | wc -l)"
 echo x > "$P.t" 2>/dev/null || echo write-failed
+echo ready
 while :; do
   if grep -q '^revoked = true' "$P" 2>/dev/null; then
     sed 's/^revoked = true/revoked = false/' "$P" > "$P.t" && chmod 600 "$P.t" &&
@@ -407,14 +410,13 @@ while :; do
   sleep 0.02
 done"#;
     let args = pass_args(&pass, &rep, &["--hide", s(&sealed)], script, &[s(&pass)]);
-    let child = spawn(&args);
-    std::thread::sleep(Duration::from_secs(1));
+    let (child, seen, rest) = spawn_ready(&args, &dir);
     write_pass(
         &pass,
         &contents.replace("revoked = false", "revoked = true"),
     );
-    let out = finish(child);
-    let (stdout, err) = (text(&out.stdout), text(&out.stderr));
+    let (out, after) = finish_ready(child, rest);
+    let (stdout, err) = (format!("{seen}{after}"), text(&out.stderr));
     assert_eq!(out.status.code(), Some(128 + 15), "{stdout}\n{err}");
     assert!(stdout.contains("entries: 0"), "{stdout}");
     assert!(stdout.contains("write-failed"), "{stdout}");

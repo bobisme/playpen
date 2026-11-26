@@ -1685,8 +1685,21 @@ array of outbound application tuples without loading nft or sending packets.
 Each case has `address`, `protocol` (`tcp` or `udp`), `port`, `expect` (`allow`
 or `deny`), and optional `name`. Use `--pass FILE` and optional repeated
 `--only LABEL` instead of `--allow` to test a narrowed pass. The pass must be
-currently valid. Loopback, multicast, unspecified addresses, port zero, and
-special kernel traffic are outside this test's scope.
+currently valid. Multicast, unspecified addresses, port zero, and special
+kernel traffic are outside this test's scope.
+
+Every case is validated before any result is printed. An invalid case is
+refused with exit 2 and a message naming each bad case by number and reason;
+nothing is written to stdout. A loopback address (127.0.0.0/8 or `::1`) is not
+invalid: the result is `allow` with the reason "the sandbox's own loopback,
+always allowed", whatever the grants are, so `expect deny` for it is a mismatch.
+An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is tested as the IPv4 address,
+because the kernel sends that traffic as IPv4.
+
+Text output has one line per case, `NAME: ok, VERDICT (REASON)` or
+`NAME: expected X, got Y (REASON)`, with `case N` for an unnamed case, then
+`N of M cases matched`. JSON output adds `matched`, `mismatched` and `total` to
+the top-level object.
 
 ```json
 [{"name":"upload","address":"192.0.2.1","protocol":"tcp","port":443,"expect":"allow"},
@@ -1694,7 +1707,9 @@ special kernel traffic are outside this test's scope.
 ```
 
 The example exits 0. Changing the admin expectation to `allow` reports the
-failed case and exits 1. Invalid input or policy is refused with exit 2.
+failed case and exits 1. Invalid input or policy is refused with exit 2. Exit
+codes are unchanged, except that a loopback case, which used to exit 2, now
+exits 0 or 1 by whether its expectation matches.
 
 ### IPv6 pass prefixes
 

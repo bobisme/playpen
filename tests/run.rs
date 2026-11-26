@@ -2440,3 +2440,71 @@ fn host_refuses_brackets_around_ipv4() {
     assert!(err.contains("write a.test=192.0.2.1"), "{err}");
     assert!(err.contains("nothing was run"), "{err}");
 }
+
+#[test]
+fn policy_test_explains_loopback_and_prints_a_summary() {
+    let cases = tmpdir("policy-loopback").join("cases.json");
+    std::fs::write(
+        &cases,
+        r#"[{"address":"198.51.100.7","port":8080,"protocol":"tcp","expect":"allow"},{"name":"lo","address":"127.0.0.1","port":80,"protocol":"tcp","expect":"deny"},{"address":"::1","port":80,"protocol":"tcp","expect":"allow"},{"name":"mapped","address":"::ffff:198.51.100.7","port":8080,"protocol":"tcp","expect":"allow"}]"#,
+    )
+    .expect("cases");
+    let args = [
+        "policy-test",
+        cases.to_str().expect("path"),
+        "--allow",
+        "198.51.100.0/24:8080/tcp",
+    ];
+    let out = run(&args);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout
+            .contains("lo: expected deny, got allow (the sandbox's own loopback, always allowed)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("case 3: ok, allow (the sandbox's own loopback"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("case 1: ok, allow (granted by"), "{stdout}");
+    assert!(stdout.contains("mapped: ok, allow (granted by"), "{stdout}");
+    assert!(stdout.ends_with("3 of 4 cases matched\n"), "{stdout}");
+    let json = run(&[args[0], args[1], args[2], args[3], "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    assert_eq!(json.status.code(), Some(1));
+    assert_eq!(
+        (
+            v["matched"].as_u64(),
+            v["mismatched"].as_u64(),
+            v["total"].as_u64()
+        ),
+        (Some(3), Some(1), Some(4))
+    );
+    assert_eq!(v["cases"][1]["actual"], "allow");
+    assert_eq!(v["cases"][3]["address"], "198.51.100.7");
+}
+
+#[test]
+fn policy_test_validates_every_case_before_printing() {
+    let cases = tmpdir("policy-invalid").join("cases.json");
+    std::fs::write(
+        &cases,
+        r#"[{"address":"192.0.2.1","port":80,"protocol":"tcp","expect":"allow"},{"address":"0.0.0.0","port":80,"protocol":"tcp","expect":"deny"},{"address":"192.0.2.1","port":80,"protocol":"icmp","expect":"deny"}]"#,
+    )
+    .expect("cases");
+    let out = run(&[
+        "policy-test",
+        cases.to_str().expect("path"),
+        "--allow",
+        "198.51.100.1:80/tcp",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(text(&out.stdout), "");
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("case 2 is outside outbound application tuples"),
+        "{err}"
+    );
+    assert!(err.contains("case 3 has invalid protocol"), "{err}");
+}
