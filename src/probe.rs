@@ -377,6 +377,36 @@ pub fn unix_send(path: &str) -> Value {
     json!({"path": path, "sent": outcome(sent)})
 }
 
+/// `probe reparent [DIR]`: renames and links across directories.
+///
+/// Renames and hard-links a file, and renames a directory, from one
+/// directory into another, in a fresh directory below `DIR` (by default
+/// the temporary directory), which it removes again. Prints `rename`, `link` and `rename_dir`, each `ALLOWED` or `denied:
+/// ERROR`. Package managers (uv, bun) need all three.
+#[must_use]
+pub fn reparent(dir: Option<&std::path::Path>) -> Value {
+    let base = dir
+        .map_or_else(std::env::temp_dir, std::path::Path::to_path_buf)
+        .join(format!("playpen-reparent-{}", std::process::id()));
+    let (a, b) = (base.join("a"), base.join("b"));
+    let made = fs::create_dir_all(a.join("d"))
+        .and_then(|()| fs::create_dir_all(&b))
+        .and_then(|()| fs::write(a.join("f"), "playpen-probe"))
+        .and_then(|()| fs::write(a.join("g"), "playpen-probe"));
+    let value = if let Err(e) = made {
+        json!({"error": format!("cannot create {}: {e}", base.display())})
+    } else {
+        let io = |r: std::io::Result<()>| outcome(r.map_err(|e| e.to_string()));
+        json!({
+            "rename": io(fs::rename(a.join("f"), b.join("f"))),
+            "link": io(fs::hard_link(a.join("g"), b.join("g"))),
+            "rename_dir": io(fs::rename(a.join("d"), b.join("d"))),
+        })
+    };
+    let _ = fs::remove_dir_all(&base);
+    value
+}
+
 /// `probe listen`: listens on a TCP address for `ms` milliseconds.
 ///
 /// Prints `{"listening": ADDR}` once the socket is bound, `{"accepted":

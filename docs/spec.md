@@ -1287,7 +1287,7 @@ command and verifies (`offline loopback only`) that the sandbox has only
 a TCP attempt to `192.0.2.1` port 9 and a UDP attempt to `2001:db8::1`
 port 9 are refused and counted. Both modes require user
 namespaces, a working `nft`, and Landlock ABI 9 or later, and run local
-privilege, Unix-socket and VM-socket checks. Egress mode additionally requires `pasta`
+privilege, Unix-socket, rename and VM-socket checks. Egress mode additionally requires `pasta`
 and tests approved TCP, UDP, and IPv6 destinations against blocked ones.
 
 For example:
@@ -1336,7 +1336,13 @@ step 3):
 8. a third sandbox (`--no-network`) that must reach its own private Unix
    socket and must fail to connect to the host pathname and abstract sockets
    doctor creates. Doctor requires one structured result for each endpoint;
-9. `VM sockets (AF_VSOCK)`: doctor listens on a VM socket (any port, in
+9. `renames and links across directories`: a sandbox (`--no-network`)
+   runs `probe reparent`, which renames a file, hard-links a file and
+   renames a directory from one directory into another in a fresh
+   directory below its temporary directory. `ok` when all three work.
+   Under the default guard Landlock refuses them with `EXDEV` unless the
+   ruleset grants `REFER` (section 7);
+10. `VM sockets (AF_VSOCK)`: doctor listens on a VM socket (any port, in
    the caller's network namespace), and a fourth sandbox (with pasta; under
    `--mode offline`, `--no-network`) runs `probe vsock --try PORT`, which
    reads the sandbox's `/proc/sys/net/vsock/ns_mode` and connects to CID 1
@@ -1391,7 +1397,8 @@ If `PLAYPEN_PASTA` names a missing executable, `playpen qualify --source
 unsupported and exits 1; offline scenarios may still execute.
 
 The scenario IDs are `offline-command`, `offline-loopback`,
-`network-privileges`, `unix-socket-guard`, `socket-runtime-directory`,
+`network-privileges`, `unix-socket-guard`, `cross-directory-rename`,
+`socket-runtime-directory`,
 `egress-filter`, `run-loopback`, `pass-egress`, `gateway-host-loopback`,
 `routed-peer`, `terminal-pty-input`, and `private-tty-signals`.
 
@@ -1817,7 +1824,7 @@ Not part of the stable interface, hidden from `--help`:
 - `run --lo-addr ADDR` adds `ADDR` to the sandbox's `lo` before the
   ruleset is loaded. Used by tests and `doctor` to have destinations that
   exist only inside the sandbox.
-- `playpen probe reach|privs|resolve|dns|unix|unix-send|unix-recv-fd|stdout-reconnect|fds|tty|signals|listen|send|interfaces|vsock` are the checks
+- `playpen probe reach|privs|resolve|dns|unix|unix-send|unix-recv-fd|stdout-reconnect|fds|tty|signals|listen|send|interfaces|vsock|reparent` are the checks
   run inside the sandbox by `doctor` and the tests (`interfaces` prints
   the interface names and, in `default_routes`, the interfaces with an
   IPv4 and an IPv6 default route; `privs` tries the changes of 4.4, check
@@ -2252,6 +2259,11 @@ directory, reached through the descriptor playpen holds for it.
   `--pass-dir-writable` is given: an empty read-only tmpfs when it holds
   nothing but the pass and playpen's own files, else the host's directory,
   read-only (section 4.1).
+- Renames and hard links into another directory work as on the host.
+  Under Landlock, one from outside into an exposed directory fails with
+  `EXDEV`: below an exposed directory every file may be connected to, and
+  Landlock refuses a rename or link that gives a file a right it did not
+  have. A rename within one directory is not affected.
 
 Inside, the command's uid and gid are the caller's; other users and groups
 show as `nobody`.

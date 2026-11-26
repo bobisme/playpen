@@ -178,6 +178,9 @@ enum ProbeCmd {
     },
     /// Send one datagram by address to a Unix datagram socket.
     UnixSend { path: String },
+    /// Rename and hard-link a file, and rename a directory, into another
+    /// directory below DIR (default: the temporary directory).
+    Reparent { dir: Option<PathBuf> },
     /// Take a descriptor passed over the Unix socket at PATH and send a
     /// datagram to ADDR:PORT through it.
     UnixRecvFd { path: String, to: String },
@@ -581,6 +584,10 @@ fn probe(what: ProbeCmd) -> i32 {
         }
         ProbeCmd::UnixSend { path } => {
             outln!("{}", crate::probe::unix_send(&path));
+            0
+        }
+        ProbeCmd::Reparent { dir } => {
+            outln!("{}", crate::probe::reparent(dir.as_deref()));
             0
         }
         ProbeCmd::UnixRecvFd { path, to } => match to.parse() {

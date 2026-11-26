@@ -57,6 +57,12 @@ const SCENARIOS: &[Scenario] = &[
         prerequisites: COMMON,
     },
     Scenario {
+        id: "cross-directory-rename",
+        mode: "offline",
+        check: ScenarioCheck::DoctorProbe("renames and links across directories"),
+        prerequisites: COMMON,
+    },
+    Scenario {
         id: "socket-runtime-directory",
         mode: "offline",
         check: ScenarioCheck::IntegrationTest {

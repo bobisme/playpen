@@ -538,6 +538,110 @@ fn exposing_an_escape_capable_socket_prints_a_note_and_not_none_reachable() {
     assert!(text(&out.stderr).contains("host Unix sockets: none reachable"));
 }
 
+/// The evaluation's `rn.py`: a rename within one directory, a rename and
+/// a hard link into another, and a directory renamed into another, in a
+/// directory of the host. Landlock refuses all but the first with `EXDEV`
+/// unless the ruleset grants `REFER` (uv and bun then fail).
+const REPARENT_PY: &str = r"import os, sys
+os.chdir(sys.argv[1])
+for d in ['rn/a/d', 'rn/b']: os.makedirs(d)
+for p in ['rn/a/f', 'rn/a/g']: open(p, 'w').close()
+ops = [(os.rename, 'rn/a/f', 'rn/b/f'), (os.rename, 'rn/a/g', 'rn/a/g2'),
+       (os.link, 'rn/a/g2', 'rn/b/hl'), (os.rename, 'rn/a/d', 'rn/b/d')]
+for fn, a, b in ops:
+    try:
+        fn(a, b); print(fn.__name__, a, b, 'ok')
+    except OSError as e:
+        print(fn.__name__, a, b, 'FAIL', e)
+";
+
+#[test]
+fn renames_and_links_across_directories_work_under_the_default_guard() {
+    require_sandbox!();
+    let mut modes: Vec<Vec<&str>> = vec![vec!["--without-landlock"]];
+    if landlock_ok() {
+        modes.push(vec![]);
+    }
+    for (n, mode) in modes.iter().enumerate() {
+        let dir = tmpdir(&format!("reparent-{n}"));
+        let _ = std::fs::remove_dir_all(dir.join("rn"));
+        let d = dir.display().to_string();
+        let out = sandbox(mode, &["python3", "-I", "-c", REPARENT_PY, &d]);
+        let stdout = text(&out.stdout);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{mode:?}: {}",
+            text(&out.stderr)
+        );
+        assert_eq!(stdout.matches(" ok\n").count(), 4, "{mode:?}: {stdout}");
+        let rn = dir.join("rn");
+        assert!(rn.join("b/f").is_file() && !rn.join("a/f").exists());
+        assert!(rn.join("b/d").is_dir() && !rn.join("a/d").exists());
+        let links = std::os::unix::fs::MetadataExt::nlink(
+            &std::fs::metadata(rn.join("b/hl")).unwrap_or_else(|e| panic!("{e}")),
+        );
+        assert_eq!(links, 2, "{mode:?}");
+        // The doctor's probe, in the same host directory.
+        let out = sandbox(mode, &[BIN, "probe", "reparent", &d]);
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        for key in ["rename", "link", "rename_dir"] {
+            assert_eq!(v[key], "ALLOWED", "{mode:?}: {v}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Granting `REFER` does not let a host socket be brought under an
+/// `--expose` rule: Landlock refuses a rename or link that would give the
+/// file a right it lacked (`EXDEV`), so the socket is not reachable at the
+/// new path, and it stays refused at its own.
+#[test]
+fn a_host_socket_cannot_be_moved_or_linked_into_an_exposed_directory() {
+    require_sandbox!();
+    if !landlock_ok() {
+        eprintln!("SKIPPED: this kernel lacks Landlock ABI 9");
+        return;
+    }
+    let dir = tmpdir("refer-expose");
+    let (host, exp) = (dir.join("host"), dir.join("exp"));
+    for d in [&host, &exp] {
+        std::fs::create_dir_all(d).unwrap_or_else(|e| panic!("{e}"));
+    }
+    let sock = listen(&host.join("s.sock"));
+    std::fs::write(host.join("f"), "x").unwrap_or_else(|e| panic!("{e}"));
+    let py = r"import errno, os, socket, sys
+h, e = sys.argv[1], sys.argv[2]
+def t(f):
+    try:
+        f(); return 'ok'
+    except OSError as x:
+        return errno.errorcode[x.errno]
+def conn(p):
+    socket.socket(socket.AF_UNIX).connect(p)
+print(t(lambda: os.rename(h + '/s.sock', e + '/s.sock')),
+      t(lambda: os.link(h + '/s.sock', e + '/l.sock')),
+      t(lambda: os.rename(h, e + '/host')),
+      t(lambda: os.rename(h + '/f', e + '/f')),
+      t(lambda: conn(e + '/s.sock')),
+      t(lambda: conn(e + '/host/s.sock')),
+      t(lambda: conn(h + '/s.sock')))
+";
+    let (hs, es) = (host.display().to_string(), exp.display().to_string());
+    let out = sandbox(&["--expose", &es], &["python3", "-I", "-c", py, &hs, &es]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        stdout.trim(),
+        "EXDEV EXDEV EXDEV EXDEV ENOENT ENOENT EACCES",
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(sock.path.exists(), "the host socket was moved");
+    drop(sock);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn expose_refuses_missing_paths_and_root() {
     for (args, expect) in [

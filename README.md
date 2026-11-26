@@ -690,6 +690,10 @@ sent to it and has both default routes. The check requires a TCP attempt
 to an IPv4 address and a UDP attempt to an IPv6 address to be refused and
 counted. It checks the command’s network privileges and verifies that a private Unix socket
 connects while the host pathname and abstract sockets are unreachable.
+It checks that a file can be renamed and hard-linked, and a directory
+renamed, into another directory: package managers such as uv and bun need
+that. Under Landlock, only a rename or link from outside into an
+`--expose` directory fails (`EXDEV`).
 It also checks that the command reads VSOCK mode `local` and cannot
 connect to a VM-socket listener that doctor holds outside the sandbox
 (the check passes, too, where the kernel has no VM sockets). Like every

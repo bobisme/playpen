@@ -105,9 +105,46 @@ connect to, or send by address to, a pathname Unix socket whose server was
 created outside its Landlock domain, wherever the socket is. Sockets the
 command creates itself are not affected. That is exactly the rule wanted,
 and it needs no list. X applies it just before `exec`, handling only that
-right (files and directories are not restricted) and scoping abstract
-sockets. A path-beneath rule lets a socket, or every socket below a
-directory, through again: that is `--expose`.
+right and `REFER` (files and directories are not restricted otherwise; see
+"Renames and links across directories") and scoping abstract sockets. A
+path-beneath rule lets a socket, or every socket below a directory,
+through again: that is `--expose`.
+
+**Renames and links across directories.** Landlock always handles
+`LANDLOCK_ACCESS_FS_REFER` (ABI 2), even when the ruleset does not list
+it: in a domain that handles any file system right, a rename or hard link
+into another directory fails with `EXDEV` unless a rule grants `REFER` on
+both directories. Until bn-19g the ruleset handled only `RESOLVE_UNIX`, so
+under the default guard every such rename and link failed (a rename within
+one directory worked). `uv pip install` failed ("failed to rename file
+... Cross-device link") and so did `bun add` ("EXDEV accessing temporary
+directory"); pip, npm, cargo and git fell back to copying. Not handling
+`REFER` is not a way out, because the kernel handles it anyway. The fix:
+the ruleset handles `REFER` and grants it on `/`, and the `--expose` rules
+grant `RESOLVE_UNIX` as before. `REFER` needs ABI 2 and the guard already
+needs ABI 9, so no kernel that runs the guard lacks it.
+
+What that widens, measured on 7.2.8 (ABI 10) with a host listener, an
+exposed directory and an unexposed one: renames and links of files and
+directories between unexposed directories, and out of an exposed
+directory, now work; nothing else changed. Landlock still refuses, with
+`EXDEV`, a rename or link that would give the file a right it did not
+have, and below an exposed directory every file has `RESOLVE_UNIX`. So a
+host socket cannot be renamed or linked into an exposed directory, nor a
+directory that holds one, and connecting to it stays refused at its own
+path (`EACCES`). The cost: a rename or link from outside into an exposed
+directory fails with `EXDEV`, for regular files too. A rename within one
+directory needs no `REFER`, so replacing an exposed socket file by another
+socket in the same directory was possible before and still is; the rule
+belongs to the inode, so the replacement is not exposed (measured too:
+`EACCES`). Tests:
+`restrict_allows_reparenting_except_into_an_exposed_directory` (unit),
+`renames_and_links_across_directories_work_under_the_default_guard` (the
+evaluation's `rn.py` operations and `probe reparent` in a host directory,
+with and without Landlock) and
+`a_host_socket_cannot_be_moved_or_linked_into_an_exposed_directory`.
+`doctor` checks it (`renames and links across directories`), and so does
+the qualification scenario `cross-directory-rename`.
 
 The mount layer comes on top, for three reasons. Programs need a working
 runtime directory, and an empty private one behaves better than a host

@@ -7,6 +7,15 @@
 //! command creates itself stay usable. A path-beneath rule lets one socket,
 //! or every socket below one directory, through again (`--expose`).
 //!
+//! The ruleset also handles `LANDLOCK_ACCESS_FS_REFER` and grants it on `/`.
+//! Landlock denies reparenting (a rename or hard link into another
+//! directory) in every domain that handles any file system right, even when
+//! `REFER` is not handled, and the call fails with `EXDEV`. With `REFER`
+//! granted on `/`, Landlock still refuses, also with `EXDEV`, a rename or
+//! link that would give the file a right it did not have before: so nothing
+//! can be moved or linked into an exposed directory from outside it, and a
+//! host socket cannot be brought under an `--expose` rule that way.
+//!
 //! The ruleset handles nothing else, so files, directories and devices are
 //! not restricted by it; abstract Unix sockets are scoped as well (they are
 //! already private to the sandbox's network namespace).
@@ -26,6 +35,8 @@ pub const RESOLVE_UNIX_ABI: u32 = 9;
 
 const CREATE_RULESET_VERSION: u32 = 1;
 const RULE_PATH_BENEATH: libc::c_int = 1;
+/// `LANDLOCK_ACCESS_FS_REFER` (ABI 2): rename or link into another directory.
+const ACCESS_FS_REFER: u64 = 1 << 13;
 const ACCESS_FS_RESOLVE_UNIX: u64 = 1 << 16;
 const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
 
@@ -70,7 +81,7 @@ pub fn resolve_unix_supported() -> bool {
 
 fn create_ruleset() -> Result<OwnedFd, String> {
     let attr = RulesetAttr {
-        handled_access_fs: ACCESS_FS_RESOLVE_UNIX,
+        handled_access_fs: ACCESS_FS_RESOLVE_UNIX | ACCESS_FS_REFER,
         handled_access_net: 0,
         scoped: SCOPE_ABSTRACT_UNIX_SOCKET,
     };
@@ -93,11 +104,11 @@ fn create_ruleset() -> Result<OwnedFd, String> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn add_rule(ruleset: &OwnedFd, path: &Path) -> Result<(), String> {
+fn add_rule(ruleset: &OwnedFd, path: &Path, access: u64) -> Result<(), String> {
     let target = open(path, OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty())
         .map_err(|e| format!("cannot open {} for a Landlock rule: {e}", path.display()))?;
     let attr = PathBeneathAttr {
-        allowed_access: ACCESS_FS_RESOLVE_UNIX,
+        allowed_access: access,
         parent_fd: target.as_raw_fd(),
     };
     // SAFETY: `attr` is a live packed struct matching
@@ -114,7 +125,7 @@ fn add_rule(ruleset: &OwnedFd, path: &Path) -> Result<(), String> {
     };
     if rc != 0 {
         return Err(format!(
-            "cannot let {} through Landlock: {}",
+            "cannot add a Landlock rule for {}: {}",
             path.display(),
             Errno::last()
         ));
@@ -167,15 +178,19 @@ pub fn deny_all() -> Result<(), String> {
 }
 
 /// Restricts this process and everything it starts: no connection to a
-/// Unix socket created outside, except at or below `exposed`. Requires
-/// `no_new_privs`.
+/// Unix socket created outside, except at or below `exposed`.
+///
+/// Renames and hard links across directories stay allowed, except into an
+/// exposed path from outside it (`EXDEV`). Requires `no_new_privs` and ABI
+/// 9 (`REFER` needs only ABI 2).
 ///
 /// # Errors
 /// When the kernel refuses any step; the caller must not run the command.
 pub fn restrict(exposed: &[PathBuf]) -> Result<(), String> {
     let ruleset = create_ruleset()?;
+    add_rule(&ruleset, Path::new("/"), ACCESS_FS_REFER)?;
     for path in exposed {
-        add_rule(&ruleset, path)?;
+        add_rule(&ruleset, path, ACCESS_FS_RESOLVE_UNIX)?;
     }
     // SAFETY: plain syscall on a descriptor we own, flags 0.
     let rc = unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset.as_raw_fd(), 0u32) };
@@ -220,6 +235,70 @@ mod tests {
             return 7;
         }
         0
+    }
+
+    /// What a process confined by `restrict(&[dir/exp])` can do in `dir`,
+    /// as an exit code: 0 when renames and links across directories work,
+    /// the host socket is refused, and nothing can be moved or linked into
+    /// the exposed directory.
+    fn reparenting_child(dir: &Path) -> i32 {
+        let exp = dir.join("exp");
+        if nix::sys::prctl::set_no_new_privs().is_err()
+            || restrict(std::slice::from_ref(&exp)).is_err()
+        {
+            return 1;
+        }
+        let (a, b, host) = (dir.join("a"), dir.join("b"), dir.join("host"));
+        if std::fs::rename(a.join("f"), b.join("f")).is_err()
+            || std::fs::hard_link(b.join("f"), a.join("l")).is_err()
+            || std::fs::rename(a.join("d"), b.join("d")).is_err()
+        {
+            return 2;
+        }
+        let refused = |r: std::io::Result<()>| r.err().and_then(|e| e.raw_os_error());
+        let sock = host.join("s");
+        if refused(std::os::unix::net::UnixStream::connect(&sock).map(drop)) != Some(libc::EACCES) {
+            return 3;
+        }
+        if refused(std::fs::rename(&sock, exp.join("s"))) != Some(libc::EXDEV)
+            || refused(std::fs::hard_link(&sock, exp.join("s"))) != Some(libc::EXDEV)
+            || refused(std::fs::rename(&host, exp.join("host"))) != Some(libc::EXDEV)
+        {
+            return 4;
+        }
+        if refused(std::fs::rename(b.join("f"), exp.join("f"))) != Some(libc::EXDEV) {
+            return 5;
+        }
+        0
+    }
+
+    #[test]
+    fn restrict_allows_reparenting_except_into_an_exposed_directory() {
+        if !resolve_unix_supported() {
+            eprintln!("SKIPPED: Landlock ABI {RESOLVE_UNIX_ABI} is not available");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("playpen-refer-{}", std::process::id()));
+        for d in ["a/d", "b", "host", "exp"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap_or_else(|e| panic!("{e}"));
+        }
+        std::fs::write(dir.join("a/f"), "x").unwrap_or_else(|e| panic!("{e}"));
+        let listener = std::os::unix::net::UnixListener::bind(dir.join("host/s"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        // SAFETY: as in `deny_all_leaves_only_the_descriptors_held`.
+        let status = match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                let code = reparenting_child(&dir);
+                // SAFETY: ends the child at once, without unwinding into
+                // the test harness.
+                unsafe { libc::_exit(code) }
+            }
+            Ok(ForkResult::Parent { child }) => waitpid(child, None),
+            Err(e) => panic!("fork: {e}"),
+        };
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(status, Ok(WaitStatus::Exited(_, 0))), "{status:?}");
     }
 
     #[test]

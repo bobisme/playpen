@@ -590,6 +590,46 @@ fn sockets_check() -> Check {
     }
 }
 
+/// Renames and hard links across directories must work under the default
+/// guard: Landlock refuses them with `EXDEV` unless the ruleset grants
+/// `REFER`, and package managers such as uv and bun then fail.
+fn reparent_check() -> Check {
+    let name = "renames and links across directories";
+    let out = match self_run(&["--no-network"], &["reparent"]) {
+        Ok(out) => out,
+        Err(e) => {
+            return Check {
+                name,
+                ok: false,
+                detail: e,
+            };
+        }
+    };
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_default();
+    let failed: Vec<String> = ["rename", "link", "rename_dir"]
+        .iter()
+        .filter(|k| v[**k].as_str() != Some("ALLOWED"))
+        .map(|k| format!("{k}: {}", v[*k].as_str().unwrap_or("no result")))
+        .collect();
+    if v.get("error").is_none() && failed.is_empty() {
+        Check {
+            name,
+            ok: true,
+            detail:
+                "a file renamed and hard-linked, and a directory renamed, into another directory"
+                    .into(),
+        }
+    } else {
+        Check {
+            name,
+            ok: false,
+            detail: v["error"]
+                .as_str()
+                .map_or_else(|| failed.join(", "), str::to_owned),
+        }
+    }
+}
+
 /// A VM-socket listener of the caller in the caller's network namespace, on
 /// a port the kernel picks: the socket and the port. Creating it loads the
 /// `vsock` module where it is not loaded, as `playpen run` does.
@@ -717,6 +757,7 @@ pub(crate) fn run_formatted(mode: Mode, format: Format) -> i32 {
                 offline_interfaces_check(),
                 privs_check(nft, true),
                 sockets_check(),
+                reparent_check(),
                 vsock_check(&["--no-network"]),
             ],
             Mode::Egress => vec![
@@ -724,6 +765,7 @@ pub(crate) fn run_formatted(mode: Mode, format: Format) -> i32 {
                 routes_check(),
                 privs_check(nft, false),
                 sockets_check(),
+                reparent_check(),
                 vsock_check(SANDBOX),
             ],
         };
@@ -745,6 +787,7 @@ pub(crate) fn run_formatted(mode: Mode, format: Format) -> i32 {
                 "offline loopback only",
                 "command cannot change the network",
                 "host Unix sockets unreachable",
+                "renames and links across directories",
                 "VM sockets (AF_VSOCK)",
             ],
             Mode::Egress => &[
@@ -752,6 +795,7 @@ pub(crate) fn run_formatted(mode: Mode, format: Format) -> i32 {
                 "default routes",
                 "command cannot change the network",
                 "host Unix sockets unreachable",
+                "renames and links across directories",
                 "VM sockets (AF_VSOCK)",
             ],
         };
