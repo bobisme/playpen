@@ -31,7 +31,9 @@ use nix::unistd::{UnlinkatFlags, unlinkat};
 pub struct ReportFile {
     /// The path as given.
     shown: PathBuf,
-    /// The path made absolute (symbolic links not resolved).
+    /// The path made absolute, with the links in its directory resolved at
+    /// start (the file name itself is kept, so a link there is followed as
+    /// before).
     path: PathBuf,
     /// The file, created (or truncated) at start.
     file: File,
@@ -49,6 +51,14 @@ impl ReportFile {
     pub fn create(path: &Path) -> std::io::Result<Self> {
         let file = File::create(path)?;
         let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        // Resolve the directory's links now, before the command runs, so a
+        // later rewrite opens the directory that was there at start and
+        // never follows a link the command put in its place.
+        let absolute = match (absolute.parent(), absolute.file_name()) {
+            (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+                .map_or_else(|_| absolute.clone(), |dir| dir.join(name)),
+            _ => absolute,
+        };
         let dir = if fstat(&file).is_ok_and(|st| is_regular(&st)) {
             let parent = absolute.parent().unwrap_or_else(|| Path::new("/"));
             Some(open(
@@ -114,7 +124,10 @@ impl ReportFile {
     /// now, renamed over whatever is at the path (a forged report, a
     /// symbolic link), with the mode of the file created at start. When
     /// that fails, whatever is at the path is removed, so that no forged
-    /// report is left there.
+    /// report is left there. The directory's links were resolved at start,
+    /// so the directory is opened without following a symbolic link: one the
+    /// command put there makes the rewrite fail, and nothing is written
+    /// through it.
     ///
     /// # Errors
     /// When the new file cannot be written at the path.
@@ -127,9 +140,11 @@ impl ReportFile {
             .ok_or_else(|| std::io::Error::other("the report path names no file"))?;
         let parent = self.path.parent().unwrap_or_else(|| Path::new("/"));
         let mode = fstat(&self.file).map_or(0o600, |st| st.st_mode & 0o777);
+        // A directory that the command swapped for a symbolic link is not
+        // followed: the open fails and nothing is written through the link.
         let dir = open(
             parent,
-            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::empty(),
         )?;
         let mut tmp = OsString::from(".");
@@ -253,6 +268,45 @@ mod tests {
         assert_eq!(read(&path), "real");
         // The file created at start got the report too.
         assert_eq!(read(&root.join("out.moved").join("r.json")), "real");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_that_was_a_link_at_start_is_rewritten_through_it() {
+        let root = tmpdir("dirlink-start");
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap_or_else(|e| panic!("{e}"));
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap_or_else(|e| panic!("{e}"));
+        let path = link.join("r.json");
+        let mut r = ReportFile::create(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert!(r.replaced().is_none());
+        // The command replaces the report with a forged one.
+        std::fs::remove_file(&path).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(&path, b"forged").unwrap_or_else(|e| panic!("{e}"));
+        assert!(r.replaced().is_some());
+        r.write_again(b"real").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(std::fs::read(&path).unwrap_or_default(), b"real");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_swapped_for_a_symbolic_link_is_not_followed_when_writing_again() {
+        let root = tmpdir("dirlink");
+        let sub = root.join("out");
+        std::fs::create_dir(&sub).unwrap_or_else(|e| panic!("{e}"));
+        let path = sub.join("r.json");
+        let mut r = ReportFile::create(&path).unwrap_or_else(|e| panic!("{e}"));
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::rename(&sub, root.join("out.moved")).unwrap_or_else(|e| panic!("{e}"));
+        std::os::unix::fs::symlink(&elsewhere, &sub).unwrap_or_else(|e| panic!("{e}"));
+        assert!(r.replaced().is_some());
+        assert!(r.write_again(b"real").is_err());
+        let left: Vec<_> = std::fs::read_dir(&elsewhere)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

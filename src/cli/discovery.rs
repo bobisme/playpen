@@ -169,6 +169,44 @@ fn presentation(argv: &[OsString]) -> (Option<Format>, bool, bool) {
     (format, json, plain)
 }
 
+/// Removes the hidden subcommands from the suggestions of an unknown
+/// subcommand: clap offers them, and the operator is not told they exist.
+fn drop_hidden_suggestions(e: &mut clap::Error) {
+    use clap::error::{ContextKind, ContextValue};
+    if e.kind() != ErrorKind::InvalidSubcommand {
+        return;
+    }
+    let root = Cli::command();
+    let Some(ContextValue::Strings(list)) = e.get(ContextKind::SuggestedSubcommand) else {
+        return;
+    };
+    let kept: Vec<String> = list
+        .iter()
+        .filter(|name| {
+            root.find_subcommand(name.as_str())
+                .is_none_or(|c| !c.is_hide_set())
+        })
+        .cloned()
+        .collect();
+    if kept.len() == list.len() {
+        return;
+    }
+    if kept.is_empty() {
+        e.remove(ContextKind::SuggestedSubcommand);
+        // Clap starts a tips paragraph even for an empty list of tips, which
+        // leaves a second blank line once the suggestion is gone.
+        if matches!(e.get(ContextKind::Suggested), Some(ContextValue::StyledStrs(t)) if t.is_empty())
+        {
+            e.remove(ContextKind::Suggested);
+        }
+    } else {
+        e.insert(
+            ContextKind::SuggestedSubcommand,
+            ContextValue::Strings(kept),
+        );
+    }
+}
+
 pub(super) fn parse(argv: &[OsString]) -> Result<Cli, i32> {
     let (explicit, json, plain) = presentation(argv);
     let mut app = Cli::command();
@@ -181,8 +219,9 @@ pub(super) fn parse(argv: &[OsString]) -> Result<Cli, i32> {
     let result = app
         .try_get_matches_from(argv)
         .and_then(|mut matches| Cli::from_arg_matches_mut(&mut matches));
-    result.map_err(|e| {
+    result.map_err(|mut e| {
         let format = Format::resolve(explicit, json).unwrap_or(Format::Text);
+        drop_hidden_suggestions(&mut e);
         match e.kind() {
             ErrorKind::DisplayVersion => version(format),
             ErrorKind::DisplayHelp if format == Format::Json => {

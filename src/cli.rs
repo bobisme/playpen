@@ -1240,8 +1240,10 @@ fn sockets_clauses(c: &Checked, args: &RunArgs) -> Vec<String> {
         String::from(
             "host Unix sockets: hidden under /run, /tmp, /var/tmp and the runtime directory only (--without-landlock); sockets elsewhere stay reachable",
         )
-    } else {
+    } else if c.exposed.is_empty() {
         String::from("host Unix sockets: none reachable")
+    } else {
+        String::from("host Unix sockets: only the exposed ones")
     }];
     let other: Vec<PathBuf> = c
         .exposed
@@ -1257,6 +1259,79 @@ fn sockets_clauses(c: &Checked, args: &RunArgs) -> Vec<String> {
     }
     if !c.display.is_empty() {
         out.push(format!("display exposed: {}", paths(&c.display)));
+    }
+    out
+}
+
+/// What a listening program at `path` lets a client do, when that is to run
+/// programs on the host or take it over; `None` for any other path.
+///
+/// The name and the directory decide: these daemons keep their sockets at
+/// fixed places, and a copy under another name is not known.
+fn escape_kind(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_str()?;
+    let parent = path.parent()?;
+    let parent_name = parent.file_name().and_then(|n| n.to_str());
+    let in_user_runtime = |dir: &Path| dir.parent().is_some_and(|p| p.ends_with("run/user"));
+    match name {
+        "bus" if in_user_runtime(parent) => Some("the D-Bus session bus"),
+        "system_bus_socket" if parent_name == Some("dbus") => Some("the D-Bus system bus"),
+        "private" if parent_name == Some("systemd") => Some("systemd's private socket"),
+        "docker.sock" => Some("the Docker daemon's socket"),
+        "podman.sock" => Some("the Podman socket"),
+        "containerd.sock" => Some("the containerd socket"),
+        _ => None,
+    }
+}
+
+/// The places where the sockets of `escape_kind` live, for the user whose
+/// runtime directory is `runtime`.
+fn escape_candidates(runtime: Option<&Path>) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = [
+        "/run/dbus/system_bus_socket",
+        "/run/systemd/private",
+        "/run/docker.sock",
+        "/run/podman/podman.sock",
+        "/run/containerd/containerd.sock",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    if let Some(r) = runtime {
+        for rel in [
+            "bus",
+            "systemd/private",
+            "docker.sock",
+            "podman/podman.sock",
+        ] {
+            v.push(r.join(rel));
+        }
+    }
+    v
+}
+
+/// The NOTE lines for `--expose` paths that let the command run programs on
+/// the host: a known socket (`escape_kind`), or a directory that is, or
+/// holds, the runtime directory or one of those sockets. `runtime` is the
+/// caller's runtime directory.
+fn expose_notes(exposed: &[PathBuf], runtime: Option<&Path>) -> Vec<String> {
+    let candidates = escape_candidates(runtime);
+    let mut out = Vec::new();
+    for e in exposed {
+        if let Some(kind) = escape_kind(e) {
+            out.push(format!(
+                "NOTE: --expose {} gives the command {kind}. A program that talks to it can start programs on the host, outside the network filter, the hidden paths and Landlock; expose it only to a command you would also trust with a host shell",
+                e.display()
+            ));
+        } else if e.is_dir()
+            && (runtime.is_some_and(|r| r.starts_with(e))
+                || candidates.iter().any(|c| c.starts_with(e) && c.exists()))
+        {
+            out.push(format!(
+                "NOTE: --expose {} gives the command every socket in that directory, and it holds or leads to sockets that can start programs on the host (the D-Bus buses, systemd's private socket, docker.sock, podman.sock, containerd). Expose the one socket you need instead",
+                e.display()
+            ));
+        }
     }
     out
 }
@@ -1371,6 +1446,18 @@ fn metadata_notes(approval: &Approval) -> Vec<String> {
 fn start_notes(c: &Checked) -> String {
     let mut out = String::new();
     for note in metadata_notes(&c.approval) {
+        let _ = write!(out, "\nplaypen: {note}");
+    }
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            Some(PathBuf::from(format!(
+                "/run/user/{}",
+                nix::unistd::getuid()
+            )))
+        })
+        .and_then(|p| std::fs::canonicalize(p).ok());
+    for note in expose_notes(&c.exposed, runtime.as_deref()) {
         let _ = write!(out, "\nplaypen: {note}");
     }
     for note in c.from_pass.iter().flat_map(pass::unenforced_notes) {
@@ -2005,6 +2092,56 @@ fn explicitly_missing(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_escape_sockets_are_named_by_place_and_others_are_not() {
+        let kind = |p: &str| escape_kind(Path::new(p));
+        assert_eq!(kind("/run/user/1000/bus"), Some("the D-Bus session bus"));
+        assert_eq!(
+            kind("/run/dbus/system_bus_socket"),
+            Some("the D-Bus system bus")
+        );
+        assert_eq!(
+            kind("/run/systemd/private"),
+            Some("systemd's private socket")
+        );
+        assert_eq!(
+            kind("/run/user/1000/systemd/private"),
+            Some("systemd's private socket")
+        );
+        assert_eq!(kind("/run/docker.sock"), Some("the Docker daemon's socket"));
+        assert_eq!(
+            kind("/run/user/1000/podman/podman.sock"),
+            Some("the Podman socket")
+        );
+        assert_eq!(
+            kind("/run/containerd/containerd.sock"),
+            Some("the containerd socket")
+        );
+        assert_eq!(kind("/run/user/1000/wayland-0"), None);
+        assert_eq!(kind("/tmp/bus"), None);
+        assert_eq!(kind("/run/user/1000/other/private"), None);
+    }
+
+    #[test]
+    fn expose_notes_cover_the_socket_and_a_directory_that_holds_it() {
+        let root = std::env::temp_dir().join(format!("playpen-notes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = root.join("run/user/1000");
+        std::fs::create_dir_all(runtime.join("sub")).unwrap_or_else(|e| panic!("{e}"));
+        let notes = |e: &[PathBuf]| expose_notes(e, Some(&runtime));
+        let bus = runtime.join("bus");
+        assert!(notes(&[bus])[0].contains("the D-Bus session bus"));
+        // The runtime directory, and a directory above it.
+        assert!(
+            notes(std::slice::from_ref(&runtime))[0].contains("every socket in that directory")
+        );
+        assert!(notes(&[root.join("run")])[0].contains("every socket in that directory"));
+        // A directory that holds neither, and a plain socket.
+        assert_eq!(notes(&[runtime.join("sub")]).len(), 0);
+        assert_eq!(notes(&[runtime.join("wayland-0")]).len(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A directory tree for [`dir_hidden`]: `root/sealed/pass`,
     /// `root/work` and a link `root/link` to `sealed`.

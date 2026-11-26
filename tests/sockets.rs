@@ -501,6 +501,43 @@ fn a_datagram_sent_by_address_to_a_host_socket_is_refused() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Exposing a socket that can run host programs prints a NOTE; any
+/// exposure replaces "none reachable" in the start line.
+#[test]
+fn exposing_an_escape_capable_socket_prints_a_note_and_not_none_reachable() {
+    require_sandbox!();
+    let Some(fixture) = private_home_dir("expose-note") else {
+        return;
+    };
+    let dir = &fixture.0;
+    let docker = listen(&dir.join("docker.sock"));
+    let plain = listen(&dir.join("plain.sock"));
+    let run = |p: &Path| {
+        let out = sandbox(&["--expose", &p.display().to_string()], &["true"]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        text(&out.stderr)
+    };
+    let err = run(&docker.path);
+    assert!(
+        err.contains("host Unix sockets: only the exposed ones"),
+        "{err}"
+    );
+    assert!(!err.contains("none reachable"), "{err}");
+    assert!(
+        err.contains("NOTE: --expose") && err.contains("the Docker daemon's socket"),
+        "{err}"
+    );
+    let err = run(&plain.path);
+    assert!(
+        err.contains("host Unix sockets: only the exposed ones"),
+        "{err}"
+    );
+    assert!(!err.contains("NOTE: --expose"), "{err}");
+    // Nothing exposed: the old line.
+    let out = sandbox(&[], &["true"]);
+    assert!(text(&out.stderr).contains("host Unix sockets: none reachable"));
+}
+
 #[test]
 fn expose_refuses_missing_paths_and_root() {
     for (args, expect) in [

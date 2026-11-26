@@ -672,7 +672,14 @@ a regular file:
 - When the new file cannot be written, playpen removes what is at the
   path, so that no forged report is left there, prints the error
   `report-write-failed`, and exits 1 where it would have exited 0.
-- A playpen that is killed writes no report: the file stays empty, or,
+- The links in the path's directory are resolved at start, before the
+  command runs, and the new file is written in that directory, opened
+  without following a symbolic link: a directory the command swapped for a
+  link makes the new file fail (`report-write-failed`), and nothing is
+  written through the link. A directory that was a link at start works as
+  usual.
+- A playpen that is killed writes no report: the file stays empty (an empty
+  file means playpen did not finish), or,
   after the move above, the path keeps what the command put there. Trust
   the report only when playpen's own exit status agrees with it.
 
@@ -883,11 +890,18 @@ The supervisor’s human-readable diagnostics on stderr include the following me
   - `the command runs in its own session, without a controlling terminal`
     in detached mode, or `private controlling terminal` with
     `--private-tty`;
-  - always, `host Unix sockets: none reachable` (with `--without-landlock`:
+  - `host Unix sockets: only the exposed ones` when `--expose` or `--display`
+    gave a path, else `host Unix sockets: none reachable` (with
+    `--without-landlock`:
     `host Unix sockets: hidden under /run, /tmp, /var/tmp and the runtime
     directory only (--without-landlock); sockets elsewhere stay
     reachable`);
   - `exposed: PATH, ...` when `--expose` was given;
+  - a NOTE line for each `--expose` path that is a socket that runs programs
+    on the host (the D-Bus session or system bus, systemd's private socket,
+    `docker.sock`, `podman.sock`, `containerd.sock`), and for each exposed
+    directory that is, or is above, the runtime directory or holds one of
+    those sockets;
   - `hidden: PATH, ...` when `--hide` was given, the paths as typed. The
     file of `--capture` is hidden too, but it is not listed here: the
     `packet capture:` clause names it, and the operator did not ask to hide

@@ -516,3 +516,15 @@ fn run_help_says_what_fail_on_drop_counts() {
     let text = String::from_utf8(invoke(&["run", "--help"], None).stdout).expect("help");
     assert!(text.contains("--fail-on-drop"), "{text}");
 }
+
+#[test]
+fn an_unknown_command_is_not_matched_to_a_hidden_one() {
+    for typo in ["frob", "proble", "prob"] {
+        let out = invoke(&[typo], None);
+        assert_eq!(out.status.code(), Some(2));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("unrecognized subcommand"), "{err}");
+        assert!(!err.contains("'probe'"), "{err}");
+        assert!(!err.contains("\n\n\n"), "{err:?}");
+    }
+}

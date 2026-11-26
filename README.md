@@ -192,7 +192,11 @@ engine, an SSH or browser automation agent). The command's runtime
 directory (`$XDG_RUNTIME_DIR`) is a fresh, empty, private one; `/tmp` is
 the host's. Bring a socket back deliberately with `--expose`; graphical
 programs need `--display`. Both are listed on the start line (`--hide` paths too) and in the
-report:
+report. An exposed socket is as strong as the daemon behind it: the session
+bus, systemd's private socket, `docker.sock`, `podman.sock` and containerd
+let the command start programs on the host, outside the network filter. The
+start line prints a NOTE for these, and for an exposed directory such as
+`$XDG_RUNTIME_DIR` that holds them:
 
 ```console
 $ playpen run --allow 192.0.2.10:22/tcp --expose "$SSH_AUTH_SOCK" \
@@ -306,8 +310,17 @@ command works in, as above: a build that writes, renames or removes a file
 at that path would get `/dev/null` or an error (`EBUSY`) there. If the
 command moves a directory above the report and puts another file at its
 path, playpen finds that at the end, writes the real report there again,
-says so on stderr and exits 1 instead of 0. A playpen that is killed writes
-no report, so check playpen's exit status too.
+says so on stderr and exits 1 instead of 0. A playpen that is killed
+(SIGKILL) writes no report and leaves the file empty, so check playpen's
+exit status too: an empty report means playpen did not finish.
+
+### Keep API tokens out of the command
+The command inherits playpen's whole environment, including API tokens. A
+token in the environment can reach every destination you allow, so clear
+what the command does not need. playpen has no option for this. Put `env`
+in front of the command: `playpen run ... -- env -i PATH="$PATH" HOME="$HOME"
+cmd` starts it with only those two variables, and `-- env -u NAME cmd`
+removes one.
 
 ### Learn of a refused destination while the command runs
 
