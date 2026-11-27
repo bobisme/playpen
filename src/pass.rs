@@ -304,11 +304,35 @@ impl PassDir {
     /// # Errors
     /// Every error of [`hallpass::load`].
     pub fn load(&self, shown: &Path) -> Result<hallpass::LoadedPass, hallpass::Error> {
-        // The kernel resolves /proc/self/fd/N to the held directory, and the
-        // loader inspects and opens NAME in it without following a link.
-        let mut through = PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()));
+        hallpass::load(&self.through()).map_err(|e| naming(e, shown))
+    }
+
+    /// As [`PassDir::load`], with the exact bytes the digest is of.
+    ///
+    /// # Errors
+    /// Every error of [`hallpass::load`].
+    pub fn load_bytes(
+        &self,
+        shown: &Path,
+    ) -> Result<(hallpass::LoadedPass, Vec<u8>), hallpass::Error> {
+        hallpass::load_with_bytes(&self.through()).map_err(|e| naming(e, shown))
+    }
+
+    /// The held directory as a path of this process: `/proc/self/fd/N`.
+    #[must_use]
+    pub fn held_path(&self) -> String {
+        format!("/proc/self/fd/{}", self.fd.as_raw_fd())
+    }
+
+    /// The pass read through the held directory: `/proc/self/fd/N/NAME`.
+    /// The kernel resolves `/proc/self/fd/N` to the held directory, and
+    /// hallpass inspects and opens NAME in it without following a link; its
+    /// ledger, NAME.ledger, is found in the same directory.
+    #[must_use]
+    pub fn through(&self) -> PathBuf {
+        let mut through = PathBuf::from(self.held_path());
         through.push(&self.name);
-        hallpass::load(&through).map_err(|e| naming(e, shown))
+        through
     }
 
     /// Why the pass's path no longer leads into the held directory, or
@@ -327,10 +351,70 @@ impl PassDir {
         match nix::sys::stat::stat(&self.path) {
             Ok(now) if now.st_dev == held.st_dev && now.st_ino == held.st_ino => None,
             Ok(_) => Some(format!(
-                "the directory of the pass, {shown}, was moved or replaced: the path now leads to another directory, so the owner's edits would no longer reach the file playpen reads"
+                "the directory of the pass, {shown}, was moved or replaced: the path now leads to another directory, so the owner's edits would no longer reach the file playpen reads{}",
+                now_at(&self.fd)
             )),
             Err(e) => Some(format!(
-                "the directory of the pass, {shown}, was moved or removed ({e})"
+                "the directory of the pass, {shown}, was moved or removed ({e}){}",
+                now_at(&self.fd)
+            )),
+        }
+    }
+}
+
+/// Where the directory held open as `fd` is now, as a clause for a
+/// message: `; the directory playpen holds is now at DIR`, so the operator
+/// can put it back. Empty when the kernel cannot say.
+#[must_use]
+pub fn now_at(fd: &OwnedFd) -> String {
+    std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_or_else(
+        |_| String::new(),
+        |now| {
+            let now = now.display().to_string();
+            now.strip_suffix(" (deleted)").map_or_else(
+                || format!("; the directory playpen holds is now at {now}"),
+                |gone| format!("; the directory playpen holds was removed (it was at {gone})"),
+            )
+        },
+    )
+}
+
+/// Another directory held open since start, whose path must lead to it.
+///
+/// With `--pass-broker` it is the hallpass state directory. A re-read
+/// stops the run when the path no longer leads to it, as for the pass's
+/// directory.
+#[derive(Debug, Clone)]
+pub struct HeldDir {
+    /// The directory, opened `O_PATH`.
+    pub fd: Arc<OwnedFd>,
+    /// Its path as the operator knows it.
+    pub path: PathBuf,
+    /// What it is, for the message: `the hallpass state directory`.
+    pub what: &'static str,
+    /// What a move breaks, for the message.
+    pub breaks: &'static str,
+}
+
+impl HeldDir {
+    /// Why the path no longer leads to the held directory, or `None` when
+    /// it still does (same device and inode).
+    #[must_use]
+    pub fn moved(&self) -> Option<String> {
+        let (what, shown, breaks) = (self.what, self.path.display(), self.breaks);
+        let held = match fstat(&*self.fd) {
+            Ok(st) => st,
+            Err(e) => return Some(format!("{what}, {shown}, cannot be inspected ({e})")),
+        };
+        match nix::sys::stat::stat(&self.path) {
+            Ok(now) if now.st_dev == held.st_dev && now.st_ino == held.st_ino => None,
+            Ok(_) => Some(format!(
+                "{what}, {shown}, was moved or replaced: the path now leads to another directory, so {breaks}{}",
+                now_at(&self.fd)
+            )),
+            Err(e) => Some(format!(
+                "{what}, {shown}, was moved or removed ({e}), so {breaks}{}",
+                now_at(&self.fd)
             )),
         }
     }
@@ -345,11 +429,18 @@ fn naming(e: hallpass::Error, shown: &Path) -> hallpass::Error {
         E::Symlink { .. } => E::Symlink { path },
         E::NotRegular { .. } => E::NotRegular { path },
         E::TooLarge { limit, .. } => E::TooLarge { path, limit },
-        E::Insecure { mode, who, fix, .. } => E::Insecure {
+        E::Insecure {
+            mode,
+            who,
+            fix,
+            advice,
+            ..
+        } => E::Insecure {
             path,
             mode,
             who,
             fix,
+            advice,
         },
         E::Invalid { problems, .. } => E::Invalid { path, problems },
         other => other,
@@ -431,6 +522,7 @@ fn from_pass(
         require_enforced: false,
         pass_hosts: false,
         interval: RECHECK_INTERVAL,
+        held: Vec::new(),
     };
     Ok(FromPass {
         approval: Approval::with_edge_scope(
@@ -623,6 +715,8 @@ pub struct PassWatch {
     pub pass_hosts: bool,
     /// How often to re-read.
     pub interval: Duration,
+    /// Other directories whose paths must keep leading to them.
+    pub held: Vec<HeldDir>,
 }
 
 impl PassWatch {
@@ -632,12 +726,21 @@ impl PassWatch {
         &self.dir
     }
 
+    /// Why the pass's directory, or another held directory, is no longer
+    /// where its path leads; `None` when every one still is.
+    #[must_use]
+    pub fn moved(&self) -> Option<String> {
+        self.dir
+            .moved()
+            .or_else(|| self.held.iter().find_map(HeldDir::moved))
+    }
+
     /// Re-reads the file through its directory and judges it at `now`. A
     /// path that no longer leads to that directory stops the run, whatever
     /// the file says.
     pub fn recheck(&mut self, now: OffsetDateTime) -> Recheck {
         let read = self.dir.load(&self.path);
-        if let Some(why) = self.dir.moved() {
+        if let Some(why) = self.moved() {
             return Recheck::Stop(why);
         }
         match read {
@@ -840,6 +943,7 @@ calls = 6
             require_enforced: false,
             pass_hosts: false,
             interval: RECHECK_INTERVAL,
+            held: Vec::new(),
         }
     }
 
@@ -912,6 +1016,15 @@ calls = 6
             )),
             "{m}"
         );
+        // It says where the held directory is now, so it can be put back.
+        let now_at = std::fs::canonicalize(root.join("eng.moved")).unwrap_or_default();
+        assert!(
+            m.contains(&format!(
+                "the directory playpen holds is now at {}",
+                now_at.display()
+            )),
+            "{m}"
+        );
         // Still read through the held directory, now at its new path.
         assert!(w.dir().load(&path).is_ok());
         std::fs::remove_dir_all(&sub).unwrap_or_else(|e| panic!("{e}"));
@@ -930,7 +1043,7 @@ calls = 6
         assert_eq!(
             e,
             format!(
-                "--pass {}: io: {}: no such file; check the path",
+                "--pass {}: io: {}: no such file; check the path.",
                 missing.display(),
                 missing.display()
             )

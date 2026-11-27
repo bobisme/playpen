@@ -188,6 +188,90 @@ pub struct Plan {
     /// With `--on-drop`: the ruleset closes all egress at the first packet
     /// it drops, and needs [`Plan::watch_drops`] for P to learn of it.
     pub on_drop: Option<OnDrop>,
+    /// With `--pass-broker`: the socket P serves the pass on (see
+    /// [`crate::broker`]). Its path must be in [`Plan::exposed`].
+    pub broker: Option<std::sync::Arc<crate::broker::Broker>>,
+    /// With `--pass-broker`: the hallpass state directory, hidden from the
+    /// command unless it is hidden already.
+    pub state_dir: Option<DirGuard>,
+    /// Directories bound onto themselves inside, shallowest first, so the
+    /// command can neither rename nor remove them (see [`pinned_dirs`]).
+    pub pinned: Vec<PathBuf>,
+}
+
+/// Every directory from the one below `/` down to each of `dirs`, with
+/// symbolic links resolved, shallowest first.
+///
+/// Each is bound onto itself inside the sandbox. A directory that is a
+/// mount point in the command's mount namespace cannot be renamed or
+/// removed (`EBUSY`), and the command holds no capability over those
+/// mounts, so it cannot unmount them. So no path to the pass's directory
+/// or the hallpass state directory can be made to lead elsewhere from
+/// inside, while what is in them stays as writable as before.
+pub fn pinned_dirs<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = dirs
+        .into_iter()
+        .map(|d| fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf()))
+        .flat_map(|d| {
+            d.ancestors()
+                .filter(|a| a.parent().is_some())
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.components()
+            .count()
+            .cmp(&b.components().count())
+            .then_with(|| a.cmp(b))
+    });
+    out.dedup();
+    out
+}
+
+/// Binds `dir` onto itself, recursively so every mount below it stays as
+/// it is, and writable as it was: it becomes a mount point the command
+/// cannot rename, remove or unmount.
+fn pin_dir(dir: &Path) -> Result<(), String> {
+    mount(
+        Some(dir),
+        dir,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .map_err(|e| format!("cannot keep the command from moving {}: {e}", dir.display()))
+}
+
+/// The working directory again, through the mounts just made: a bind of
+/// one of its ancestors leaves the old working directory in the tree
+/// below, where the masks above do not apply. Refuses when the path now
+/// leads to another directory.
+fn reenter_cwd(plan: &Plan) -> Result<(), String> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Ok(());
+    };
+    if !plan.pinned.iter().any(|p| cwd.starts_with(p)) {
+        return Ok(());
+    }
+    let before = nix::sys::stat::stat(".")
+        .map_err(|e| format!("cannot inspect the working directory: {e}"))?;
+    nix::unistd::chdir(&cwd).map_err(|e| {
+        format!(
+            "cannot enter the working directory {} again: {e}",
+            cwd.display()
+        )
+    })?;
+    let after = nix::sys::stat::stat(".")
+        .map_err(|e| format!("cannot inspect the working directory: {e}"))?;
+    if (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the working directory {} is hidden inside the sandbox (by --hide or the pass's guard); run from another directory",
+            cwd.display()
+        ))
+    }
 }
 
 /// A directory that the command must not change, and what it sees of it.
@@ -250,6 +334,8 @@ pub struct RunResult {
     /// Packets the time rule or the cut refused on their way out; `None`
     /// when the counters could not be read.
     pub refused_after_end: Option<u64>,
+    /// With `--pass-broker`: what the broker did, when it said.
+    pub broker: Option<crate::broker::Stats>,
     /// With `--report-contacts`: the destinations the command contacted
     /// through a grant, or why they could not be read. `None` without it.
     pub contacts: Option<Result<crate::contacts::Contacted, String>>,
@@ -424,9 +510,10 @@ fn exit_now(code: i32) -> ! {
 
 /// Forks. The caller must be single-threaded.
 pub(crate) fn fork_checked() -> Result<ForkResult, String> {
-    // SAFETY: playpen never starts threads, and P checks that the process
-    // is single-threaded before the first fork (`run` refuses otherwise),
-    // so every process in the tree is single-threaded when it forks. In a
+    // SAFETY: only the pass broker starts threads, and it never forks; P
+    // checks that the process is single-threaded before the first fork
+    // (`run` refuses otherwise), so every process that forks is
+    // single-threaded when it does. In a
     // single-threaded process there is no lock another thread could hold
     // across the fork, so the child may allocate and run ordinary Rust code.
     unsafe { nix::unistd::fork() }.map_err(|e| format!("fork failed: {e}"))
@@ -832,6 +919,9 @@ fn run_sandbox(
         return Err(not_started(landlock_missing()));
     }
     cloexec_inherited_fds().map_err(not_started)?;
+    // B is forked first, while P is single-threaded and holds no pipe to
+    // the sandbox; B's threads never fork.
+    let broker = crate::broker::start_for(plan).map_err(not_started)?;
     let mask = blocked_set();
     sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
         .map_err(|e| not_started(format!("cannot block signals: {e}")))?;
@@ -867,6 +957,7 @@ fn run_sandbox(
     match fork_checked().map_err(not_started)? {
         ForkResult::Child => {
             events.in_setup_child();
+            close_broker_fds(plan, broker.as_ref());
             drop(up_r);
             drop(down_w);
             drop(control_w);
@@ -907,9 +998,25 @@ fn run_sandbox(
                 up_r,
                 down_w,
                 control_w,
+                broker,
             };
             parent(plan, child, &sigfd, channels, events, job, private_tty)
         }
+    }
+}
+
+/// In C: nothing in the sandbox holds the broker's listening socket or
+/// P's pipes to it. Closed by number: the objects that own them are never
+/// dropped in C, which ends with exit.
+fn close_broker_fds(plan: &Plan, link: Option<&crate::broker::Link>) {
+    let fds = plan
+        .broker
+        .iter()
+        .map(|b| b.listener_fd())
+        .chain(link.map(crate::broker::Link::raw_fds).into_iter().flatten());
+    for fd in fds {
+        // SAFETY: plain close of descriptors this process never uses again.
+        unsafe { libc::close(fd) };
     }
 }
 
@@ -921,6 +1028,8 @@ struct Channels {
     down_w: OwnedFd,
     /// Bytes to C alone ([`CUT`]).
     control_w: OwnedFd,
+    /// To the pass broker, with `--pass-broker`.
+    broker: Option<crate::broker::Link>,
 }
 
 /// Why the run cannot start when Landlock cannot refuse Unix socket
@@ -1245,7 +1354,9 @@ fn parent(
         up_r,
         down_w,
         control_w,
+        broker: link,
     } = channels;
+    let broker = link.as_ref();
     let up_r = &up_r;
     let deadline = plan.approval.ends_at.map(|end| {
         let left = end.at() - time::OffsetDateTime::now_utc();
@@ -1355,6 +1466,7 @@ fn parent(
             && let Err(e) = tty.relay.check()
         {
             terminal_failure = Some(format!("private terminal relay failed: {e}"));
+            tell_broker(broker, "the private terminal failed");
             shutdown.request(now);
             stop_command(st.init, child, &down_w);
         }
@@ -1374,6 +1486,7 @@ fn parent(
                 // the cut also covers a monotonic deadline that comes first.
                 let cut = cut_egress(&mut st, up_r, &control_w);
                 events.until_reached(&cut);
+                tell_broker(broker, "the approval ended");
                 stop_after_cut(&cut, st.init, child, &down_w, &mut shutdown);
             } else {
                 wake = wake.min(d.monotonic);
@@ -1390,6 +1503,7 @@ fn parent(
                         // Egress is closed before anything is said or sent.
                         let cut = cut_egress(&mut st, up_r, &control_w);
                         events.pass_withdrawn(&why, &cut);
+                        tell_broker(broker, &why);
                         stopped_by_pass = Some(why);
                         stop_after_cut(&cut, st.init, child, &down_w, &mut shutdown);
                     }
@@ -1447,6 +1561,7 @@ fn parent(
             if plan.on_drop == Some(OnDrop::Stop) {
                 let cut = cut_egress(&mut st, up_r, &control_w);
                 events.tripped(&tripped_by, Some(&cut));
+                tell_broker(broker, "the firewall dropped a packet (--on-drop stop)");
                 stopped_by_drop = true;
                 stop_after_cut(&cut, st.init, child, &down_w, &mut shutdown);
             } else {
@@ -1545,6 +1660,7 @@ fn parent(
             witness = None;
         }
         if terminal_failure.is_some() && shutdown.started.is_none() {
+            tell_broker(broker, "the private terminal failed");
             shutdown.request(Instant::now());
             stop_command(st.init, child, &down_w);
         }
@@ -1592,6 +1708,7 @@ fn parent(
             .lookups
             .unwrap_or_else(|| Err("the names the command looked up were not reported".into())),
         refused_after_end: st.refused_after_end,
+        broker: link.and_then(crate::broker::Link::finish),
         contacts: plan.report_contacts.then(|| {
             st.contacts
                 .unwrap_or_else(|| Err("the contacted destinations were not reported".into()))
@@ -1601,6 +1718,13 @@ fn parent(
         cut_packets: st.cut_packets,
         uncounted: st.uncounted,
     })
+}
+
+/// Tells the broker, if there is one, that P is stopping the command.
+fn tell_broker(broker: Option<&crate::broker::Link>, why: &str) {
+    if let Some(b) = broker {
+        b.stopping(why);
+    }
 }
 
 /// The first withdrawal starts grace. Repeated withdrawals leave it fixed.
@@ -3124,8 +3248,12 @@ fn setup_files(plan: &Plan, files: &SandboxFiles) -> Result<(), String> {
     };
     let mqueue = Path::new("/dev/mqueue").is_dir();
 
+    // First, so every mask and guard below is mounted on top.
+    for dir in &plan.pinned {
+        pin_dir(dir)?;
+    }
     stage_resolver_files(plan, files)?;
-    if let Some(guard) = &plan.pass_dir {
+    for guard in [&plan.pass_dir, &plan.state_dir].into_iter().flatten() {
         guard_dir(guard)?;
     }
     for cover in &files.covers {
@@ -3162,7 +3290,7 @@ fn setup_files(plan: &Plan, files: &SandboxFiles) -> Result<(), String> {
     for path in &files.hide {
         hide_path(path)?;
     }
-    Ok(())
+    reenter_cwd(plan)
 }
 
 fn stage_resolver_files(plan: &Plan, files: &SandboxFiles) -> Result<(), String> {
@@ -3385,6 +3513,9 @@ fn stage_x(
     if let Some(fixture) = &plan.fixture {
         cmd.env("PLAYPEN_FIXTURE_URL", fixture.start()?);
     }
+    if let Some(b) = &plan.broker {
+        cmd.env(crate::broker::ENV, b.socket());
+    }
     let err = cmd.args(args).exec();
     Err(format!(
         "cannot run {}: {err}",
@@ -3428,6 +3559,25 @@ pub fn private_dir() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_directory_on_the_way_is_pinned_shallowest_first_and_once() {
+        let pinned = pinned_dirs([
+            Path::new("/nonexistent-a/b/c"),
+            Path::new("/nonexistent-a/d"),
+        ]);
+        let want: Vec<PathBuf> = [
+            "/nonexistent-a",
+            "/nonexistent-a/b",
+            "/nonexistent-a/d",
+            "/nonexistent-a/b/c",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(pinned, want);
+        assert_eq!(pinned_dirs([Path::new("/")]), Vec::<PathBuf>::new());
+    }
 
     #[test]
     fn startup_evidence_survives_fragmentation_and_truncation() {

@@ -81,6 +81,15 @@ pub(super) fn scope(args: &RunArgs, checked: &Checked) -> Result<Value, String> 
     if args.pass_dir_writable {
         scope["pass_dir_writable"] = json!(true);
     }
+    // And for runs without the pass broker. The state directory is the one
+    // the environment names, where the broker will write the witness.
+    if let Some(b) = &checked.broker {
+        scope["pass_broker"] = json!({
+            "protocol": crate::broker::PROTOCOL,
+            "hallpass_revision": crate::broker::HALLPASS_REVISION,
+            "state_directory": unix_string(b.state.as_os_str()),
+        });
+    }
     Ok(scope)
 }
 

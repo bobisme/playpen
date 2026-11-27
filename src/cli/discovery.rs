@@ -21,6 +21,7 @@ pub(super) const RUN: &str = "Examples
   playpen run --no-network --private-tty -- bash -i
   playpen run --allow 192.0.2.10:443/tcp --report run.json -- true
   playpen run --pass ~/passes/engagement.pass.toml --pass-hosts -- curl -sS https://app.example.test/
+  playpen run --pass ~/passes/engagement.pass.toml --pass-broker --new-session -- ./engine
   playpen run --allow 192.0.2.10:443/tcp --capture run.pcap --report run.json -- true
   playpen run --allow 192.0.2.10:443/tcp --live-drops --events-fd 3 -- ./scan 3> >(jq -c .)
   playpen run --allow 192.0.2.0/24:8000-8099/tcp --report-contacts --report wide.json -- true
@@ -30,6 +31,7 @@ Agent workflow
   Choose --no-network, explicit --allow grants, or --pass FILE. Use plan with the same command and policy first, then pass its digest to --expect-plan.
   Nothing is resolved: there is no DNS inside. With --pass, --pass-hosts maps the hostname of each selected single-address destination to its address. --host NAME=ADDR maps any other name to an approved address.
   Keep a pass in a directory of its own, outside the working directory: playpen hides that directory from the command, or makes it read-only when it holds other files, so the command cannot put back a pass the owner revoked. A pass in or above the working directory, or inside an --expose path, is refused (exit 2). --pass-dir-writable runs anyway, with a NOTE.
+  --pass-broker gives a command that must spend from the pass's ceilings one Unix socket, path in PLAYPEN_PASS_BROKER: newline-delimited JSON (pass-broker-v1) with hello, pass, watch, block-spend, referenced-spend, spend-batch, receipt and verified-ledger. playpen reads the pass and writes the ledger and the hallpass witness for it; the command gets no write access to the pass, the ledger, the witness or the state directory, which is hidden. Spend replies mirror hallpass --format json. Check that playpen version --format json lists pass-broker-v1 and the hallpass_revision you expect, and fail closed when either is absent.
   In JSON mode the final report goes to stdout and workload output streams to stderr. With --report FILE, the file gets the report and stdout belongs to the workload.
   To learn of a refused destination while the command runs, read --events-fd: one denied record per new dropped destination, within about 2 s. --live-drops also prints the first 8 on stderr. The report's dropped field remains the complete record.
   --on-drop cut makes the first dropped packet close all egress but loopback in the firewall itself; --on-drop stop also stops the command within about 2 s plus the 3 s grace and never exits 0. The report's egress_cut names the destination. mDNS, LLMNR, a client's own DNS server, a cloud metadata probe and IPv6 attempts trip it too, so try a run without it first.
@@ -99,7 +101,7 @@ pub(super) const VERSION: &str = "Examples
   playpen version --format json
 
 Agent workflow
-  Include version in bug reports and host qualification records. Exit 0 means the version was printed.";
+  Include version in bug reports and host qualification records. capabilities lists pass-broker-v1 when run --pass-broker is available, and hallpass_revision is the exact hallpass commit whose ledger format the broker writes. A caller that needs the broker must refuse to start when either is absent or different. Exit 0 means the version was printed.";
 pub(super) const HELP: &str = "Examples
   playpen help
   playpen help plan --format json
@@ -347,7 +349,13 @@ pub(super) fn version(format: Format) -> i32 {
     if format == Format::Json {
         outln!(
             "{}",
-            json!({"name":"playpen","version":version,"advice":[]})
+            json!({
+                "name": "playpen",
+                "version": version,
+                "capabilities": [crate::broker::PROTOCOL],
+                "hallpass_revision": crate::broker::HALLPASS_REVISION,
+                "advice": [],
+            })
         );
     } else {
         outln!("playpen {version}");

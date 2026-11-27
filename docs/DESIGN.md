@@ -924,8 +924,9 @@ reachable at all. Refusing (with a hint to leave the label out with
 
 **Ceilings are not spent.** playpen sees packets, not calls or requests,
 and cannot tell what one unit of a ceiling is. Spending would need a
-meaning it does not have, so it neither spends nor mentions ceilings. The
-tool that knows its units spends.
+meaning it does not have, so it does not spend by itself. The tool that
+knows its units spends: with `--pass-broker`, through playpen (see "The
+pass broker").
 
 **Re-reading while the command runs.** The pass can be revoked or edited
 during a run. P re-reads it every 2 seconds, once more just before the
@@ -1132,11 +1133,12 @@ on. Three measures follow.
   directory, as the owner's edit does, is read as before. Not seen: a
   directory moved away and back between two re-reads. The pass's
   directory, hidden or read-only, is a mount point inside and cannot be
-  renamed (`EBUSY`), but a directory above it can (a mount point below
-  does not stop that), and `tests/own_files.rs` moves one and puts a
-  forged pass at the path: the re-read stops the run. The command cannot
-  see when playpen re-reads, so moving it away and back is a guess, and a
-  re-read in between stops the run.
+  renamed (`EBUSY`). A mount point below does not stop the rename of a
+  directory above it, so every directory above it is bound onto itself
+  too (see "Pinned directories" under "The pass broker"); the command can
+  move none of them. A move made on the host stops the run at the next
+  re-read, and `tests/own_files.rs` makes one with a forged pass at the
+  path.
 - *The ledger.* Neither playpen nor `hallpass::load` reads the hallpass
   ledger (`PASS.ledger`); hallpass's `spend` and `permits` do. playpen
   hides it too when it is a regular file at start, so that the command
@@ -1146,6 +1148,139 @@ on. Three measures follow.
   a tool inside the sandbox can no longer read the pass or spend from the
   ledger. Such a tool is in the command's hands anyway, so a ceiling it
   enforces from inside is not one the owner can rely on.
+
+## The pass broker (`--pass-broker`)
+
+A tool that knows its units (calls, requests, scans) must spend them from
+the pass's ceilings, and the tool runs inside the sandbox. To spend,
+hallpass reads the pass, appends to the ledger beside it and updates the
+witness in the state directory. A tool that can do those writes itself can
+also undo them: it can truncate the ledger, put back an older witness, or
+replace the pass with one it wrote. So playpen keeps all three out of the
+command's reach (the pass and the ledger are `/dev/null`, their directory
+is hidden or read-only, the state directory is hidden), and does the
+spends for the command on the host. That is the broker.
+
+**The invariant.** Every change to the ledger and the witness of this pass
+during the run is made by hallpass, on the host, under the hallpass locks,
+against the pass playpen verified at start, through the directories playpen
+opened at start. The command can ask for a spend. It cannot choose the
+pass, the ledger, the witness or the state directory, and it cannot write
+any of them. If hallpass refuses, nothing is recorded. If the outcome is
+uncertain, the reply says so, and the ledger and the witness still verify
+on the host.
+
+**Why a process of its own.** The broker (B) is forked from playpen's
+supervisor (P) before the sandbox, while P has one thread. B is outside
+every namespace of the sandbox, so it sees the host's files. B never forks,
+so it can use threads. P's event loop stays as it was: P sends B one line,
+`stop REASON`, over a pipe when it decides to stop the command, and reads
+B's counts when B ends. A slow client, a lock wait or a long ledger read
+in B cannot delay P's re-reads, its firewall cut or its kill. B dies with
+P (`PR_SET_PDEATHSIG`), and it is in its own process group, so a signal to
+playpen's group reaches P, which forwards it, and not B.
+
+**One thread for each connection.** hallpass's spend calls block: they wait
+for the witness and ledger locks (bounded by `lock_timeout_ms`), and they
+read and verify the whole ledger. An event loop would need each call on a
+worker anyway. A thread for each connection keeps one connection's state
+in one place, and a client that sends half a line, or waits for a lock,
+holds only its own thread. The cost is bounded: at most 64 connections,
+lines of at most 1 MiB, and a watcher thread that re-reads the pass. More
+connections get a JSON refusal, not a hang.
+
+**Through the held directories.** P opens the pass's directory and the
+state directory with `O_PATH` at start. B calls hallpass with
+`/proc/self/fd/N/NAME` and `StateDir::new("/proc/self/fd/M/.")`, so every
+read and write lands in the directories that were checked, even if a path
+above them was renamed. Before each spend, B checks that each given path
+still leads to its held directory (same device and inode). When one does
+not, B refuses with `pass-moved` or `state-moved`, and P stops the run: a
+ledger or witness in a directory that no longer has the operator's path is
+one the operator cannot find again. Replies show the host paths, never the `/proc` ones.
+
+**The guest names no file.** Each request type has a fixed set of fields,
+and an unknown field is a usage error. So there is no field for a pass,
+a ledger or a state directory to send. The witness is always the one in
+the state directory of playpen's own environment, which hallpass on the
+host also uses: spends from the command, from host tools and from other
+runs share one lock and one ceiling.
+
+**The socket.** One socket, in a new directory with mode 0700 that P
+creates for this run and removes at the end. The socket is bound into the
+sandbox at the same path, as with `--expose`, and is the only host socket
+that Landlock lets the command connect to. B checks `SO_PEERCRED` on each
+connection and refuses another uid, as a second check beside the
+directory's mode.
+
+**Watch.** B re-reads the pass on the same interval as P and judges it with
+the same `PassWatch`, so B and P agree on what stops the run. The first
+finding that stops the run is latched: from then on every spend is refused
+by B, even before P has stopped the command. A `watch` connection gets each
+finding with the new text, digest and state, so a client can act on it
+without another request. P's own `stop` reaches B first as a re-read, and
+then as a `stopping` event.
+
+**Replies mirror hallpass.** A client that already reads `hallpass
+--format json` reads the broker's replies with the same code. The batch has
+no hallpass CLI form, so its reply follows hallpass's
+`SpendChargesBatchOutcome`. Each reply keeps `recorded`, `refused` and
+`uncertain` apart: a client must never retry a spend it cannot prove was
+not recorded.
+
+**Pinned directories.** The broker and host tools find the witness by its
+path, `$XDG_STATE_HOME/hallpass/ID.witness`. If the command could rename a
+directory on that path, it could put a new directory with a forged witness
+in its place. The broker would refuse to spend (its held directory is no
+longer at the path), but after the run hallpass on the host would read the
+forged witness, and the real one would be under another name. The same
+holds for the pass's directory and the ledger. So I (playpen's init) binds
+every directory from the one below `/` down to the state directory and the
+pass's directory onto itself, recursively and writable, before any other
+mount. A directory that is a mount point in the caller's mount namespace
+cannot be renamed or removed (`EBUSY`, `rename(2)`), and a rename onto it
+fails in the same way. What is in the directory stays as writable as
+before. The command cannot undo the binds: they belong to the sandbox's
+first user namespace, and the command runs in a nested one with no
+capabilities, so `umount` fails with `EPERM`, as it does for the `/dev/null`
+masks. The guards and masks are mounted after the binds, so they stay on
+top. A bind of an ancestor of the working directory would leave the
+command's working directory in the tree below it, where the masks do not
+apply, so I enters the working directory again by its path, and refuses to
+run when that leads to another directory (the working directory is under
+a `--hide` path).
+
+As a second line, P and B check on every re-read that the paths still lead
+to the held directories. A move made from outside the sandbox stops the
+run, and the message gives where the held directory is now
+(`/proc/self/fd/N`), so the operator can put it back.
+
+**The version check.** The ledger format is hallpass's. A client that
+writes receipts or reads the ledger must know which hallpass it talks to,
+so the build takes the exact hallpass commit from `Cargo.lock` (`build.rs`,
+no new crate), and `version` and `hello` name it. A client fails closed if
+the capability or the revision is not the one it expects.
+
+**What the command can still do.**
+
+- Spend the whole of every ceiling. The broker records spends; it does not
+  judge whether a spend is honest. A command that spends less than it uses
+  is not seen: playpen still cannot count units (see "Ceilings are not
+  spent").
+- Read the pass through `pass`. The pass holds the approval and its
+  ceilings, which a client needs to plan its spends; it holds no secret.
+- Read the ledger through `verified-ledger` and `receipt`, including other
+  runs' notes and caller references for the same pass.
+- Make the broker busy: 64 connections and lock waits of up to 60 s. That
+  delays only its own spends and those of other hallpass users of this
+  pass, never P.
+- Fill the run's private runtime directory or the host's `/tmp`, as
+  before. The command can still write in the operator's home outside the
+  hidden directories, as without `--pass-broker`: playpen never limited
+  that, and the broker adds no write access.
+- Write in the directories above the pass and the state directory, where
+  the caller can: create, change and remove other files there. It cannot
+  rename, remove or replace those directories (see "Pinned directories").
 
 ## Ending egress in the firewall
 

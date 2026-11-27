@@ -252,6 +252,18 @@ struct RunArgs {
     /// that saves a new pass lets the command put back an unrevoked one.
     #[arg(help_heading = "Network policy", long, requires = "pass")]
     pass_dir_writable: bool,
+    /// With --pass: serve the pass to the command over one Unix socket, path in
+    /// `PLAYPEN_PASS_BROKER` (protocol pass-broker-v1). playpen reads the pass and
+    /// records the command's spends in its ledger and the hallpass witness; the
+    /// command gets no write access to the pass, ledger, witness or state directory,
+    /// which is hidden.
+    #[arg(
+        help_heading = "Network policy",
+        long,
+        requires = "pass",
+        conflicts_with = "pass_dir_writable"
+    )]
+    pass_broker: bool,
     /// When the approval ends (RFC 3339 with offset); the command is stopped
     /// then. With --pass it can only be earlier than the pass's window end.
     #[arg(help_heading = "Network policy", long, value_name = "RFC3339")]
@@ -522,6 +534,7 @@ fn pass_report(id: &pass::PassIdentity) -> PassReport {
         valid_until: Some(hallpass::stamp(id.valid_until)),
         labels: id.labels.clone(),
         directory: None,
+        broker: None,
     }
 }
 
@@ -669,10 +682,59 @@ struct Checked {
     from_pass: Option<FromPass>,
     /// With `--pass`: what the command can do in the pass's directory.
     pass_dir: Option<PassDirView>,
+    /// With `--pass-broker`: the hallpass state directory.
+    broker: Option<BrokerView>,
     /// Every exposed path, canonical (`--expose` and `--display`).
     exposed: Vec<PathBuf>,
     /// The display sockets among them.
     display: Vec<PathBuf>,
+}
+
+/// With `--pass-broker`: the hallpass state directory the broker writes
+/// the witness in, which the command must not reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrokerView {
+    /// As the environment names it (`.../hallpass`).
+    state: PathBuf,
+    /// Hidden already, by `--hide` or the mount layer: nothing is added.
+    hidden_already: bool,
+}
+
+/// The hallpass state directory for `--pass-broker`, or why the run is
+/// refused: the directory is, or holds, the working directory, or lies in
+/// an `--expose` path, so playpen cannot hide it.
+fn broker_view(args: &RunArgs, exposed: &[PathBuf]) -> Result<BrokerView, String> {
+    let state = crate::broker::StateGuard::path_from_env()?;
+    let resolved = std::fs::canonicalize(&state).unwrap_or_else(|_| state.clone());
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|c| std::fs::canonicalize(c).ok());
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let covers: Vec<PathBuf> = sockets::covers(nix::unistd::getuid(), runtime_dir.as_deref())
+        .into_iter()
+        .map(|c| c.path)
+        .collect();
+    let hidden_already = dir_hidden(&resolved, &args.hide, &covers, exposed, cwd.as_deref());
+    let shown = state.display();
+    let risk = "the command could change or remove the witness the broker writes there";
+    if !hidden_already {
+        if let Some(c) = cwd.as_ref().filter(|c| c.starts_with(&resolved)) {
+            return Err(format!(
+                "--pass-broker: the hallpass state directory, {shown}, is or holds the working directory {}: {risk}, and playpen cannot hide the directory a command works in. Run from another directory, or set XDG_STATE_HOME to a directory outside it",
+                c.display()
+            ));
+        }
+        if let Some(e) = exposed.iter().find(|e| resolved.starts_with(e)) {
+            return Err(format!(
+                "--pass-broker: the hallpass state directory, {shown}, is inside --expose {}: {risk}. Expose less",
+                e.display()
+            ));
+        }
+    }
+    Ok(BrokerView {
+        state,
+        hidden_already,
+    })
 }
 
 /// What the command can do in the pass's directory (docs/DESIGN.md, "The
@@ -959,6 +1021,11 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
         .as_ref()
         .map(|p| pass_dir_view(args, p, &exposed))
         .transpose()?;
+    let broker = if args.pass_broker {
+        Some(broker_view(args, &exposed)?)
+    } else {
+        None
+    };
     sandbox::check_stdio(!args.without_landlock)?;
     Ok(Checked {
         fixture: args
@@ -973,6 +1040,7 @@ fn check(args: &RunArgs) -> Result<Checked, String> {
         lo_addrs,
         from_pass,
         pass_dir,
+        broker,
         exposed,
         display,
     })
@@ -1280,8 +1348,12 @@ fn sockets_clauses(c: &Checked, args: &RunArgs) -> Vec<String> {
         String::from(
             "host Unix sockets: hidden under /run, /tmp, /var/tmp and the runtime directory only (--without-landlock); sockets elsewhere stay reachable",
         )
+    } else if c.exposed.is_empty() && c.broker.is_some() {
+        String::from("host Unix sockets: none reachable but the pass broker's")
     } else if c.exposed.is_empty() {
         String::from("host Unix sockets: none reachable")
+    } else if c.broker.is_some() {
+        String::from("host Unix sockets: only the exposed ones and the pass broker's")
     } else {
         String::from("host Unix sockets: only the exposed ones")
     }];
@@ -1410,7 +1482,12 @@ impl StartLine {
 
 /// The start line without the clause about VM sockets (see
 /// [`StartLine::render`]).
-fn start_line(c: &Checked, args: &RunArgs, capture: Option<&Path>) -> StartLine {
+fn start_line(
+    c: &Checked,
+    args: &RunArgs,
+    capture: Option<&Path>,
+    broker: Option<&crate::broker::Broker>,
+) -> StartLine {
     let mut lines = start_line_net(c, !args.no_network);
     if let Some(p) = capture {
         lines.push(format!("packet capture: {}", p.display()));
@@ -1442,10 +1519,36 @@ fn start_line(c: &Checked, args: &RunArgs, capture: Option<&Path>) -> StartLine 
     }
     lines.extend(sockets_clauses(c, args));
     lines.extend(c.pass_dir.as_ref().and_then(PassDirView::clause));
+    if let (Some(b), Some(view)) = (broker, &c.broker) {
+        lines.extend(broker_clauses(b, view));
+    }
     StartLine {
         lines,
         notes: start_notes(c),
     }
+}
+
+/// The start-line clauses of `--pass-broker`: the socket, the only path it
+/// adds, and the state directory the command cannot reach.
+fn broker_clauses(b: &crate::broker::Broker, view: &BrokerView) -> Vec<String> {
+    let hidden = if view.hidden_already {
+        "hidden from the command already"
+    } else {
+        "hidden from the command"
+    };
+    vec![
+        format!(
+            "pass broker: {} ({}, in {}; hallpass {}); the only path it exposes. The command reads the pass and spends from its ledger through it, with no write access to the pass, the ledger or the witness",
+            b.socket().display(),
+            crate::broker::PROTOCOL,
+            crate::broker::ENV,
+            &crate::broker::HALLPASS_REVISION[..12]
+        ),
+        format!(
+            "hallpass state directory: {} ({hidden}; the broker writes the witness there)",
+            view.state.display()
+        ),
+    ]
 }
 
 /// The prefix of each start-line clause after the first line.
@@ -1502,6 +1605,13 @@ fn start_notes(c: &Checked) -> String {
     }
     for note in c.from_pass.iter().flat_map(pass::unenforced_notes) {
         let _ = write!(out, "\nplaypen: NOTE: {note}");
+    }
+    if c.broker.is_some()
+        && c.from_pass
+            .iter()
+            .any(|p| !p.coverage.external_ceilings.is_empty())
+    {
+        out.push_str("\nplaypen: NOTE: with --pass-broker the broker refuses a spend over a ceiling and records the ones it allows, but it counts only what the command asks it to spend: the firewall does not count requests");
     }
     for note in c.pass_hosts.iter().flat_map(|p| &p.notes) {
         let _ = write!(out, "\nplaypen: NOTE: {note}");
@@ -1648,6 +1758,7 @@ fn base_report(args: &RunArgs) -> Report {
             valid_until: None,
             labels: Vec::new(),
             directory: None,
+            broker: None,
         }),
         capture: None,
         playpen_exit_status: EXIT_REFUSED,
@@ -1877,6 +1988,22 @@ fn run(args: &RunArgs, format: Format) -> i32 {
             c.discard();
         }
     };
+    // The socket and the state directory, before anything is built: an
+    // unusable state directory is a refusal.
+    let broker = match checked
+        .broker
+        .as_ref()
+        .map(|_| crate::broker::StateGuard::open().and_then(crate::broker::Broker::create))
+    {
+        Some(Ok(b)) => Some(Arc::new(b)),
+        Some(Err(e)) => {
+            discard();
+            sayln!("playpen: refused: {e}; nothing was run");
+            report.message = Some(e);
+            return finish(report_file.as_mut(), &mut report);
+        }
+        None => None,
+    };
     pipe.send("validated", &serde_json::Value::Null);
     report.allowed = checked
         .approval
@@ -1899,6 +2026,19 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     if let Some(p) = &checked.from_pass {
         report.pass = Some(PassReport {
             directory: checked.pass_dir.as_ref().map(PassDirView::report),
+            broker: checked
+                .broker
+                .as_ref()
+                .map(|_| crate::report::BrokerReport {
+                    protocol: crate::broker::PROTOCOL,
+                    hallpass_revision: crate::broker::HALLPASS_REVISION,
+                    socket: broker.as_ref().map(|b| b.socket().display().to_string()),
+                    state_directory: broker
+                        .as_ref()
+                        .map(|b| b.state().path().display().to_string()),
+                    state_directory_view: Some("hidden"),
+                    activity: None,
+                }),
             ..pass_report(&p.identity)
         });
     }
@@ -1943,7 +2083,12 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     let mut events = StderrEvents {
         pipe: &pipe,
         args,
-        start_line: start_line(&checked, args, capture.as_deref().map(Capture::path)),
+        start_line: start_line(
+            &checked,
+            args,
+            capture.as_deref().map(Capture::path),
+            broker.as_deref(),
+        ),
         until: report.until.clone(),
         started_at: None,
         ended_at: None,
@@ -1967,6 +2112,32 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     hide.extend(capture.as_deref().map(|c| c.path().to_path_buf()));
     // Nor the pass, its ledger or the report.
     hide.extend(own_files(checked.from_pass.as_ref(), report_file.as_ref()));
+    let mut exposed = checked.exposed;
+    let mut state_dir = None;
+    let mut watch = checked.from_pass.map(|p| p.watch);
+    if let (Some(b), Some(w)) = (&broker, watch.as_mut()) {
+        // P stops the run when the state directory is moved, as for the
+        // pass's directory.
+        w.held.push(b.state().held());
+    }
+    let pinned = sandbox::pinned_dirs(
+        watch
+            .as_ref()
+            .map(|w| w.dir().path())
+            .into_iter()
+            .chain(broker.as_ref().map(|b| b.state().canonical())),
+    );
+    if let (Some(b), Some(view)) = (&broker, &checked.broker) {
+        // Canonical, as every exposed path is.
+        exposed
+            .push(std::fs::canonicalize(b.socket()).unwrap_or_else(|_| b.socket().to_path_buf()));
+        exposed.sort();
+        if !view.hidden_already {
+            state_dir = Some(sandbox::DirGuard::Hidden(
+                b.state().canonical().to_path_buf(),
+            ));
+        }
+    }
     let plan = Plan {
         fixture: checked.fixture,
         approval: checked.approval,
@@ -1976,17 +2147,20 @@ fn run(args: &RunArgs, format: Format) -> i32 {
         report_contacts: args.report_contacts,
         lo_addrs: checked.lo_addrs,
         hide,
-        exposed: checked.exposed,
+        exposed,
         landlock: !args.without_landlock,
         new_session: checked.new_session,
         command: args.command.clone(),
         nft,
         pasta,
         capture: capture.clone(),
-        watch: checked.from_pass.map(|p| p.watch),
+        watch,
         pass_dir: checked.pass_dir.as_ref().and_then(PassDirView::guard),
+        pinned,
         watch_drops: args.events_fd.is_some() || args.live_drops || args.on_drop.is_some(),
         on_drop: args.on_drop,
+        broker,
+        state_dir,
     };
     let outcome = sandbox::run_with_output(&plan, &mut events, stdout_report, args.private_tty);
     report.started_at = events.started_at.map(crate::report::stamp);
@@ -2072,6 +2246,9 @@ fn run(args: &RunArgs, format: Format) -> i32 {
     }
     report.refused_after_end = result.refused_after_end;
     report.uncounted = result.uncounted;
+    if let Some(b) = report.pass.as_mut().and_then(|p| p.broker.as_mut()) {
+        b.activity = result.broker;
+    }
     if let Some(on_drop) = args.on_drop {
         let seen = tripwire::Observed {
             drops: report.dropped.as_ref(),

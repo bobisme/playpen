@@ -15,6 +15,7 @@
 mod say;
 
 pub mod approval;
+pub mod broker;
 pub mod capture;
 pub mod cli;
 mod compare;

@@ -345,11 +345,12 @@ touch "$D/writable" && echo dir-writable"#;
     assert!(!dir.join("moved").exists());
 }
 
-/// The command moves the directory above the pass's away and puts a new
-/// one with a forged, valid pass at the pass's path (the pass's directory
-/// itself is a mount point inside, so it cannot be moved). playpen reads
-/// the pass through the directory it opened at start, sees that the path
-/// now leads elsewhere, and stops the run.
+/// The command cannot move the pass's directory or any directory above
+/// it: each is a mount point inside (`EBUSY`). When one is moved anyway,
+/// on the host, and a new one with a forged, valid pass is put at the
+/// pass's path, playpen still reads the pass through the directory it
+/// opened at start, sees that the path now leads elsewhere, stops the run
+/// and says where the directory it holds is now.
 #[test]
 fn a_moved_pass_directory_with_a_forged_pass_in_its_place_stops_the_run() {
     require_sandbox!();
@@ -362,23 +363,40 @@ fn a_moved_pass_directory_with_a_forged_pass_in_its_place_stops_the_run() {
     write_pass(&forged, &pass_text("Forged", false));
     let rep = dir.join("report.json");
     let script = r#"mv "$1/eng/p" "$1/eng/p.moved" 2>/dev/null || echo cannot-move-it
-mv "$1/eng" "$1/eng.moved" && mkdir -p "$1/eng/p" &&
-cp "$1/forged.pass.toml" "$1/eng/p/test.pass.toml" && chmod 600 "$1/eng/p/test.pass.toml" && echo swapped
+mv "$1/eng" "$1/eng.moved" 2>/dev/null || echo cannot-move-above
+rmdir "$1/eng" 2>/dev/null || echo cannot-remove-above
+mv "$1" "$1.moved" 2>/dev/null || echo cannot-move-top
+echo ready
 exec sleep 30"#;
     let args = pass_args(&pass, &rep, &[], script, &[s(&dir)]);
+    let (child, seen, rest) = spawn_ready(&args, &dir);
+    for word in [
+        "cannot-move-it",
+        "cannot-move-above",
+        "cannot-remove-above",
+        "cannot-move-top",
+    ] {
+        assert!(seen.contains(word), "{word}: {seen}");
+    }
     let started = Instant::now();
-    let out = run(&args);
+    std::fs::rename(dir.join("eng"), dir.join("eng.moved")).unwrap_or_else(|e| panic!("{e}"));
+    std::fs::create_dir_all(&sub).unwrap_or_else(|e| panic!("{e}"));
+    write_pass(&pass, &pass_text("Forged", false));
+    let (out, _) = finish_ready(child, rest);
     let took = started.elapsed();
-    let (stdout, err) = (text(&out.stdout), text(&out.stderr));
-    assert!(stdout.contains("cannot-move-it"), "{stdout}\n{err}");
-    assert!(stdout.contains("swapped"), "{stdout}\n{err}");
-    assert_eq!(out.status.code(), Some(128 + 15), "{stdout}\n{err}");
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 15), "{err}");
     assert!(took < Duration::from_millis(5500), "took {took:?}");
     let json = report(&rep);
     assert_eq!(json["stopped_by_pass"], true, "{json}");
     let reason = json["stop_reason"].as_str().unwrap_or("");
     assert!(reason.contains("was moved or replaced"), "{reason}");
-    assert!(err.contains("was moved or replaced"), "{err}");
+    let now_at = format!(
+        "the directory playpen holds is now at {}",
+        s(&dir.join("eng.moved/p"))
+    );
+    assert!(reason.contains(&now_at), "{reason}");
+    assert!(err.contains(&now_at), "{err}");
 }
 
 /// With the pass in a directory of its own, hidden with `--hide`, the

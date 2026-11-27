@@ -235,6 +235,29 @@ pub struct PassReport {
     /// when the run was refused before playpen looked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub directory: Option<&'static str>,
+    /// With `--pass-broker`: the broker's socket, the state directory and
+    /// what the broker did. Absent without it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broker: Option<BrokerReport>,
+}
+
+/// The report's `pass.broker`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrokerReport {
+    /// `pass-broker-v1`.
+    pub protocol: &'static str,
+    /// The hallpass revision whose ledger format the broker writes.
+    pub hallpass_revision: &'static str,
+    /// The socket, the only path the broker exposes; null when the run was
+    /// refused before it was made.
+    pub socket: Option<String>,
+    /// The hallpass state directory that holds the witness.
+    pub state_directory: Option<String>,
+    /// What the command could do there: `"hidden"`.
+    pub state_directory_view: Option<&'static str>,
+    /// What the broker did, as it said when it ended; null when it did not
+    /// run or did not say.
+    pub activity: Option<crate::broker::Stats>,
 }
 
 /// A moment as the report writes it: RFC 3339 in UTC, like `until`.
@@ -723,6 +746,7 @@ mod tests {
             valid_until: None,
             labels: vec!["private-label".into()],
             directory: Some("writable"),
+            broker: None,
         });
         r.contacts = Some(crate::contacts::ContactFields {
             contacted: Some(crate::contacts::Contacted {

@@ -147,11 +147,13 @@ check. So playpen keeps the command from changing that directory:
 
 The start line says which it is (`pass directory: ...`), and the report
 has it as `pass.directory`. A tool that reads the pass, such as `hallpass
-permits` or `hallpass spend`, must run outside the sandbox.
+permits` or `hallpass spend`, must run outside the sandbox, or use
+`--pass-broker` (below).
 
-playpen reads the pass through the directory it opened at start. If that
-directory is moved or replaced while the command runs, playpen stops the
-run as for a revocation.
+playpen reads the pass through the directory it opened at start. The
+command cannot rename or remove that directory or any directory above it.
+If the directory is moved on the host while the command runs, playpen
+stops the run as for a revocation, and says where the directory is now.
 
 playpen refuses to start (exit 2, "nothing was run") when the pass is
 invalid, unreadable, a symbolic link, writable by others, not yet valid,
@@ -170,6 +172,36 @@ application-level enforcer. playpen prints a NOTE at the start (and on
 `playpen rules --pass`) for each such term in the pass. Use `--require-enforced` to refuse a pass with
 such applicable terms when playpen must enforce every restriction itself.
 The refusal names the destination labels and the ceilings.
+
+### Spend from the pass's ceilings inside the sandbox
+
+A tool that counts its own units (calls, requests) can spend them from the
+pass through playpen:
+
+```sh
+playpen version --format json   # check "pass-broker-v1" and "hallpass_revision"
+playpen run --pass ~/passes/engagement.pass.toml --pass-broker -- ./engine
+```
+
+The command gets one Unix socket, with the path in `PLAYPEN_PASS_BROKER`.
+It sends one JSON request per line and gets one JSON reply per line:
+
+```text
+> {"op":"referenced-spend","charges":[{"counter":"calls","n":1}],"caller_ref":"job-1","require_new_ref":true}
+< {"op":"referenced-spend","command":"spend","result":"allowed","seq":2,"spent":3,"remaining":3,...}
+```
+
+playpen does the spend on the host, with hallpass, in the pass's ledger and
+the hallpass witness (`$XDG_STATE_HOME/hallpass`). The command cannot
+write the pass, the ledger, the witness or the state directory, and it
+cannot name another pass. Nor can it move the state directory, or any
+directory above it, to put a forged witness in its place. The operations are `hello`, `pass`, `watch`,
+`block-spend`, `referenced-spend`, `spend-batch`, `receipt` and
+`verified-ledger`; spend replies are those of `hallpass spend --format
+json`. `watch` reports a revocation or an edit as it is found, and after
+one, every spend is refused. A client must fail closed: when `version`
+does not list `pass-broker-v1`, or names another `hallpass_revision`, it
+must not run. docs/spec.md, "The pass broker", has the protocol.
 
 ### How a pass-backed run ends
 

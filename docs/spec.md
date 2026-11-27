@@ -8,6 +8,15 @@ analysis are in [DESIGN.md](DESIGN.md).
 
 If you used v0.1, these will be different:
 
+- **Version 0.2.0 adds `--pass-broker`.** With `--pass`, the command can
+  read the pass and spend from its ceilings over one Unix socket, while
+  playpen writes the ledger and the witness ("The pass broker",
+  section 4). With `--pass`, the command can no longer rename or remove
+  the pass's directory or any directory above it (section 4.1). `playpen version --format json` has the new fields
+  `capabilities` (`["pass-broker-v1"]`) and `hallpass_revision`. playpen
+  now links hallpass 7c06ea837ab6aa98858dc18e4be1fbaf6f3e85ff. Runs without
+  the option, and their plan digests, do not change.
+
 - **Host Unix sockets are unreachable by default, wherever they are.**
   v0.1 hid a fixed list (D-Bus, systemd, resolvers, container engines,
   dirmngr, PulseAudio). Now every pathname socket created outside the
@@ -216,7 +225,9 @@ The global format may appear on either side of the command name and overrides
 `FORMAT`. With neither set, a terminal selects pretty output and a pipe selects
 text. Workload argv starts after `--`. `playpen help [COMMAND] --format json`
 describes the public command tree, argument requirements, examples and workflow.
-`playpen version --format json` returns the binary version. JSON objects include
+`playpen version --format json` returns the binary version, `capabilities`
+(`["pass-broker-v1"]`) and `hallpass_revision` (the full hallpass commit that
+this build links). JSON objects include
 an `advice` array. In JSON mode a usage error produces an error object on stderr
 and exits 2.
 
@@ -224,7 +235,7 @@ and exits 2.
 
 ```text
 playpen run --pass FILE [--only LABEL]... [--pass-hosts]
-            [--pass-dir-writable]
+            [--pass-dir-writable | --pass-broker]
             [--host NAME=ADDR]... [--until RFC3339] [SOCKETS]
             [--format text|pretty|json] [--report FILE] [--capture FILE]
             [--live-drops] [--on-drop cut|stop] -- COMMAND [ARGS...]
@@ -387,6 +398,23 @@ DIR (hidden from the command)`, `(read-only for the command)` or
 `(writable by the command, --pass-dir-writable)` to the start line, and
 the report has `pass.directory` (section 4.5).
 
+In every case, each directory from the one below `/` down to the pass's
+directory (symbolic links resolved) is bound onto itself inside, writable
+as before. The command cannot rename or remove any of them (`EBUSY`), or
+rename another directory onto one, and `umount` of one fails (`EPERM`).
+What is in them stays as writable as on the host. With `--pass-broker` the
+same holds for the directories down to the hallpass state directory. When
+one of these binds is above the working directory, playpen enters the
+working directory again through the binds. When that leads to another
+directory (the working directory is under a `--hide` path), the command
+does not start, and playpen says `the working directory DIR is hidden
+inside the sandbox`.
+
+A re-read also checks that the pass's path still leads to the directory
+playpen opened. When the directory was moved on the host, the run stops
+(`stopped_by_pass`), and the message ends with `the directory playpen
+holds is now at DIR` (or `was removed`), so the operator can put it back.
+
 **`--pass-dir-writable`** (needs `--pass`). Leave the pass's directory as
 it is: no refusal, no read-only bind, no tmpfs. A NOTE follows the start
 line: `the pass's directory, DIR, is writable by the command
@@ -398,6 +426,12 @@ outside the working directory, and leave out --pass-dir-writable: playpen
 then makes that directory read-only for the command, or hides it`. A pass
 whose directory is hidden already gets neither the NOTE nor the clause.
 The plan has `pass_dir_writable: true` only when the option is given.
+
+**`--pass-broker`** (needs `--pass`; not with `--pass-dir-writable`).
+Serve the pass to the command over one Unix socket, with the path in
+`PLAYPEN_PASS_BROKER`, and record the command's spends in the pass's ledger
+and the hallpass witness. The hallpass state directory is hidden from the
+command. "The pass broker" (after section 4.2) has the protocol.
 
 **The pass's directory.** playpen opens the pass's directory at start
 (`O_PATH`) and reads the pass through it, by name, at start and on every
@@ -944,6 +978,13 @@ The supervisor’s human-readable diagnostics on stderr include the following me
     directory: DIR (hidden from the command)`, `(read-only for the
     command)` or `(writable by the command, --pass-dir-writable)` (see
     "The pass inside the sandbox");
+  - with `--pass-broker`, `pass broker: SOCKET (pass-broker-v1, in
+    PLAYPEN_PASS_BROKER; hallpass REV12); the only path it exposes. The
+    command reads the pass and spends from its ledger through it, with no
+    write access to the pass, the ledger or the witness`, then `hallpass
+    state directory: DIR (hidden from the command; the broker writes the
+    witness there)` (`hidden from the command already` when `--hide` or
+    the mount layer hides it);
   - always, last, the VM sockets as C found them in the sandbox's network
     namespace (section 5, step 4; the report's `vsock`): `VM sockets
     (AF_VSOCK): only the sandbox's own (VSOCK mode local)`; on a kernel
@@ -1190,6 +1231,249 @@ reader does not keep up, and the stream then ends there. A missing terminal reco
 gap or a partial final line means the stream is incomplete. An event reader
 can disappear without delaying supervision.
 
+### The pass broker (`--pass-broker`)
+
+`run --pass FILE --pass-broker` gives the command one Unix socket. Through
+it, the command reads the pass and spends from the pass's ceilings. playpen
+does the reads and the writes. The command gets no write access to the
+pass, its ledger, the hallpass witness or the state directory. DESIGN.md,
+"The pass broker", says why.
+
+**What changes in the run.**
+
+- The broker is a process on the host: a child of playpen, outside every
+  namespace of the sandbox, with the caller's uid. It starts before the
+  sandbox and ends after it.
+- The socket is `pass-broker.sock` in a new directory in
+  `$XDG_RUNTIME_DIR` (else the temporary directory). The directory has mode
+  0700 and the caller owns it. The socket has mode 0600. playpen removes
+  both when the run ends. The command's environment has the path as
+  `PLAYPEN_PASS_BROKER`.
+- The socket is the only path the broker exposes. It is bound into place
+  inside, as with `--expose`. Landlock lets the command connect to it and
+  to no other host socket.
+- The hallpass state directory is the one hallpass would use in playpen's
+  environment: `$XDG_STATE_HOME/hallpass`, else
+  `$HOME/.local/state/hallpass`. playpen creates it (mode 0700) when it is
+  not there. It refuses a directory that is a symbolic link or that others
+  can read or change. Inside, an empty read-only tmpfs is mounted over it,
+  unless `--hide` or the mount layer hides it already. A state directory
+  that is or holds the working directory, or that is inside an `--expose`
+  path, is refused (exit 2, nothing was run).
+- The pass and its ledger stay `/dev/null` (or hidden with their
+  directory). The pass's directory stays hidden or read-only (4.1).
+  `--pass-broker` with `--pass-dir-writable` is a usage error (exit 2).
+- The broker opens the state directory at start and keeps it open, as it
+  keeps the pass's directory open. Every hallpass call goes through those
+  two open directories. The command cannot move either, or any directory
+  above them (4.1, "The pass inside the sandbox"). When one is moved on
+  the host anyway, the broker refuses every spend (`pass-moved`,
+  `state-moved`), and playpen stops the run as for a moved pass
+  directory. The stop message, in the summary and the report's
+  `stop_reason`, says where the held directory is now.
+- The broker re-reads the pass every `--pass-recheck-ms` (2 s by default),
+  as the supervisor does, and judges it in the same way.
+- The start line has two more clauses: `pass broker: SOCKET
+  (pass-broker-v1, in PLAYPEN_PASS_BROKER; hallpass REV12); the only path it
+  exposes. ...` and `hallpass state directory: DIR (hidden from the
+  command; the broker writes the witness there)`. The `host Unix sockets:`
+  clause says `none reachable but the pass broker's` (or `only the exposed
+  ones and the pass broker's`). When the pass has ceilings, one more NOTE
+  says that the broker counts only what the command asks it to spend.
+- The report has `pass.broker` (section 4.5).
+- The plan has `pass_broker`: `{"protocol": "pass-broker-v1",
+  "hallpass_revision": REV, "state_directory": DIR}`, only when the option
+  is given. `plan` creates nothing.
+
+**Capability check.** `playpen version --format json` has `"capabilities":
+["pass-broker-v1"]` and `"hallpass_revision"`. The revision is the full
+hallpass commit (from `Cargo.lock`) whose ledger format the broker writes.
+Inside the sandbox, `hello` gives both again. A client must fail closed. When
+`pass-broker-v1` is not listed, when `PLAYPEN_PASS_BROKER` is not set, or
+when `hallpass_revision` is not the one it expects, the client must not run
+and must not spend in another way.
+
+**Wire format.** A `SOCK_STREAM` Unix socket. Each request is one JSON
+object on one line, ending in `\n`. Each request gets exactly one reply,
+one JSON object on one line, in order. A client can open several
+connections at once. Each connection is served on its own thread. A `watch`
+request turns its connection into an event stream (below).
+
+Every request has `op` and can have `id` (any JSON value), which the reply
+repeats. Every reply has `op`, `command`, `result` and `warnings`. A field
+that the operation does not take is refused (`usage`). So no request can
+name a pass, a ledger, a state directory or any other file. The broker
+spends only from the pass playpen was started with, and the witness is
+always the one in the state directory above.
+
+`result` is one of:
+
+| `result` | meaning |
+| --- | --- |
+| `ok` | a read was answered |
+| `allowed` | a spend was recorded in the ledger and the witness; `seq` (or `units[].seq`) is set |
+| `would-allow` | a `dry_run` spend would be allowed; nothing was recorded |
+| `refused` | hallpass or the broker refused a spend; nothing was recorded |
+| `error` | the request failed; `error.recording` says what it left in the ledger |
+| `found`, `not-found`, ... | `receipt` only: the `result` of hallpass |
+
+An `error` reply mirrors `hallpass --format json`. `error` is `{"code",
+"recording", "seq", "ledger", "message", "line", "last_line"}`, and
+`problems` lists the problems of an invalid pass. `error.recording` is one
+of:
+
+- `recorded`: the debit is in the ledger, but the witness was not updated
+  (`witness-not-updated`);
+- `uncertain`: the append possibly happened (`ledger-append-uncertain`);
+- `not-recorded`;
+- null, when hallpass cannot say (for example an `io` error during a
+  spend).
+
+After `recorded`, `uncertain` or null, do not retry. Reconcile first with
+`receipt` or `verified-ledger`. The broker's own error codes are `usage`
+(invalid JSON, a missing or extra field, a bad value), `unknown-op`,
+`line-too-long`, `too-many-connections` and `peer-refused`. All are
+`not-recorded`.
+
+A refusal that the broker makes itself (not hallpass) has `"source":
+"broker"`, `refusal: {"code", "message"}`, `seq: null`, `charges: []`,
+`units: []` and `committed: 0`. Its codes:
+
+| code | when |
+| --- | --- |
+| `revoked`, `expired`, `not-yet-valid` | a re-read found the pass so; for the rest of the run |
+| `narrowed` | a re-read found a destination in use removed or changed, or another edit that stops the run (4.1); for the rest of the run |
+| `pass-unreadable` | a re-read could not read or validate the pass; for the rest of the run |
+| `pass-moved` | the pass's path no longer leads to the directory playpen opened |
+| `state-moved` | the state directory's path no longer leads to the directory playpen opened |
+| `stopping` | playpen is stopping the command (end time, pass withdrawn, `--on-drop stop`, a failed private terminal) |
+
+Between two re-reads, hallpass still reads the pass again under its lock on
+every spend. So a revoked or expired pass is refused at once, with the code
+of hallpass.
+
+**Operations.**
+
+- `hello` (no fields). Reply: `protocol` (`pass-broker-v1`),
+  `playpen_version`, `hallpass_revision`, `capabilities` (the eight
+  operations), `file` (the pass as playpen verified it), `state_directory`,
+  `recheck_ms`, and `limits`: `max_line_bytes`, `max_connections`,
+  `default_lock_timeout_ms`, `max_lock_timeout_ms`, `max_batch_units`
+  (1024) and `max_targets`.
+- `pass` (no fields). The broker reads the pass now, through the directory
+  playpen opened. Reply: `file`, `text` (the exact bytes, as a string; parse
+  it with `hallpass::Pass::parse`), `digest` (`sha256:` of those bytes),
+  `pass_id`, `state` (`valid`, `revoked`, `expired` or `not-yet-valid`),
+  `window` (as `hallpass status`: `state`, `valid_from`, `valid_until`,
+  `seconds_remaining`, `seconds_until_open`, `seconds_since_end`,
+  `revoked_reason`), `withdrawn` (null, or the broker's refusal `{"code",
+  "message"}` that every spend now gets), `stopping` (bool) and `error`
+  (null). When the pass cannot be read, `result` is `error`, `error` is the
+  hallpass error, and `text`, `digest`, `state` and `window` are null.
+- `watch` (no fields). The first reply is a `pass` reply with `"command":
+  "watch"` and `"event": "current"`. After it, the connection carries only
+  events, one JSON line each. The broker ignores what the client sends.
+  Every event has `op: "watch"`, `event`, `digest`, `pass_id`, `state`,
+  `window`, `text` (the new bytes), `error`, `message` and `at` (RFC 3339
+  UTC), so the client needs no other request. `event` is one of:
+  - `pass`: the pass has a new digest and the run continues (the edit
+    changed nothing this run uses);
+  - `revoked`, `expired`, `not-yet-valid`: the pass is no longer valid;
+  - `narrowed`: an edit removed or changed a destination in use, or stops
+    the run for another reason;
+  - `unreadable`: the pass cannot be read (`error` says why);
+  - `moved`: the pass's path no longer leads to the directory playpen
+    opened;
+  - `state-moved`: the state directory's path no longer leads to the
+    directory playpen opened;
+  - `stopping`: playpen is stopping the command; `message` says why. When
+    a re-read of the pass is the cause, its event comes first.
+
+  The broker sends an event once for each finding and digest. A watcher
+  that does not read is dropped after 64 queued events. The stream ends
+  when the run ends.
+- `block-spend`: as `hallpass spend FILE COUNTER --n N`, the scalar spend
+  (`hallpass::spend`). Fields: `counter` (required), `n` (default 1), `to`
+  (one `ADDR:PORT/PROTO[@NAME]` or a list), `name`, `digest` (refuse unless
+  the pass still has it), `duration` (seconds the window must stay open),
+  `note`, `dry_run` and `lock_timeout_ms`. Reply: the reply of `hallpass
+  spend --format json`, key for key: `command: "spend"`, `result`, `file`,
+  `digest`, `pass_id`, `now`, `test_clock` (false), `charges` (each
+  `{"counter", "n", "total", "spent", "remaining", "projected_spent"}`),
+  `counter`, `n`, `total`, `spent`, `remaining`, `projected_spent`, `seq`,
+  `note`, `targets` (each `{"target", "name", "label"}`), `refused_target`,
+  `target`, `name`, `label`, `receipt` (null), `refusal` (`{"code",
+  "message"}`), `reference_evidence` (null) and `warnings`.
+- `referenced-spend`: as `hallpass spend FILE --charge COUNTER=N ...
+  [--caller-ref REF]`, one versioned debit (`hallpass::spend_charges`).
+  Fields: `charges` (required, a list of `{"counter", "n"}`; `amount` is
+  accepted for `n`, but not both; default 1), `to`, `name`, `digest`,
+  `duration`, `note`, `caller_ref`, `require_new_ref`, `record_target`,
+  `dry_run` and `lock_timeout_ms`. Reply: as `block-spend`, with `receipt`
+  (`{"caller_ref", "targets"}`) after a commit, and `reference_evidence`
+  for a duplicate or inconclusive reference.
+- `spend-batch`: `hallpass::spend_charges_batch`, all or none. Fields:
+  `counter` (required), `units` (required, 1 to 1024, each `{"caller_ref",
+  "to"}`; `to` is optional and is one target), `digest`, `duration` and
+  `lock_timeout_ms`. Every unit charges 1 from `counter`, requires a new
+  caller reference, and records its target when it has one. Reply:
+  `command: "spend-batch"`, `result` (`allowed` or `refused`), `file`,
+  `digest`, `pass_id`, `now`, `test_clock`, `counter`, `total`,
+  `spent_before` (the durable total before the batch), `spent` (after it;
+  the same on a refusal), `remaining`, `requested` (N), `committed` (N on
+  success, 0 on a refusal), `projected_spent` (`spent_before` + N),
+  `refused_unit` (1-based, on a refusal), `refusal`, `reference_evidence`,
+  `units` and `warnings`. On success `units` is in request order, each
+  `{"caller_ref", "seq", "labels", "receipt"}`; on a refusal it is empty.
+  hallpass has no CLI command for a batch, so the fields follow
+  `SpendChargesBatchOutcome`.
+- `receipt`: as `hallpass receipt FILE --caller-ref REF`
+  (`hallpass::evidence::lookup_receipt`). Fields: `caller_ref` (required)
+  and `lock_timeout_ms`. Reply: the receipt report of hallpass (`pass_id`,
+  `caller_ref`, `result`, `match_count`, `matches`, `truncated`,
+  `adoption_count`, `reconciled_at`, `witness`, `warnings`), with
+  `command` and `file`.
+- `verified-ledger`: as `hallpass ledger FILE --format json`
+  (`hallpass::read_ledger`): the whole chain verified and compared with the
+  witness. Fields: `counter`, `tail`, `since` (as `--counter`, `--tail`,
+  `--since`; the whole chain is verified in every case) and
+  `lock_timeout_ms`. Reply: `command: "ledger"`, `file`, `ledger`,
+  `exists`, `pass_id`, `digest`, `counter`, `shown`, `verified` (true),
+  `witness` (`matches`, `fresh`, `extended`, `missing`, ...), `moved_from`,
+  `entries`, `adoptions`, `reference_reconciliations`,
+  `unreconciled_adoption`, `totals` and `warnings`. A chain that does not
+  verify is an `error` (`ledger-corrupt`, `ledger-changed`,
+  `ledger-missing`, ...). Use it to reconcile after an `uncertain` outcome,
+  and to refuse accounting that has adoptions or does not match its
+  witness.
+
+Every path in a reply is the host path that playpen verified, never the
+`/proc/self/fd` path the broker reads through.
+
+**Locks and limits.** Spends wait for the witness and ledger locks of
+hallpass, which every hallpass process on the host shares. So spends from
+the command, from other runs and from host tools all count against one
+ceiling, in one order. `lock_timeout_ms` limits the wait (default 10000, at
+most 60000). A timeout is the `lock-timeout` error, `not-recorded`. A
+request line is at most 1 MiB, newline included. A longer one gets
+`line-too-long`, and the broker closes the connection. The broker serves at
+most 64 connections at once. One more gets `too-many-connections` and is
+closed. A client that connects and sends nothing, or waits for a lock, holds
+only its own connection. A peer with another uid (`SO_PEERCRED`) gets
+`peer-refused`.
+
+**Example session** (`socat - UNIX-CONNECT:"$PLAYPEN_PASS_BROKER"`, replies
+shortened):
+
+```text
+> {"op":"hello","id":1}
+< {"op":"hello","id":1,"command":"hello","result":"ok","protocol":"pass-broker-v1","hallpass_revision":"7c06ea837ab6aa98858dc18e4be1fbaf6f3e85ff","capabilities":["hello","pass","watch","block-spend","referenced-spend","spend-batch","receipt","verified-ledger"],...}
+> {"op":"referenced-spend","charges":[{"counter":"calls","n":1}],"to":"192.0.2.1:9101/tcp","caller_ref":"job-1","require_new_ref":true,"record_target":true}
+< {"op":"referenced-spend","command":"spend","result":"allowed","seq":2,"spent":3,"remaining":3,"receipt":{"caller_ref":"job-1","targets":[{"target":"192.0.2.1:9101/tcp","name":null,"label":"web"}]},...}
+> {"op":"block-spend","counter":"calls","n":5}
+< {"op":"block-spend","command":"spend","result":"refused","seq":null,"refusal":{"code":"ceiling-reached","message":"..."},...}
+```
+
 ### Previewing a run
 
 `playpen plan --no-network -- printf hello` describes the command and its
@@ -1210,8 +1494,10 @@ mapping and argument order are preserved. With `--pass-hosts` the plan has
 `--host` ones. Without it the field is absent, so plans without the option
 keep their digest. The same holds for `--live-drops` and `"live_drops":
 true`, for `--report-contacts` and `"report_contacts": true`, for
-`--on-drop` and `"on_drop": "cut"` or `"stop"`, and for
-`--pass-dir-writable` and `"pass_dir_writable": true`. `plan` checks the
+`--on-drop` and `"on_drop": "cut"` or `"stop"`, for
+`--pass-dir-writable` and `"pass_dir_writable": true`, and for
+`--pass-broker` and `"pass_broker": {"protocol", "hallpass_revision",
+"state_directory"}`. `plan` checks the
 pass's directory as `run` does (4.1, "The pass inside the sandbox") and
 refuses the same layouts.
 
@@ -1493,7 +1779,7 @@ Written by `run --format json` or `run --report FILE`. Field names are stable.
 | `stopped_by_pass` | bool | playpen stopped the command after re-reading the pass |
 | `stop_reason` | string or null | why playpen stopped the command, when `stopped_by_until`, `stopped_by_pass` or `stopped_by_drop` |
 | `enforcement_coverage` | object, if available | selected pass enforcement coverage; omitted when unavailable |
-| `pass` | object or null | null without `--pass`; else `{"file", "id", "name", "owner", "digest", "valid_until", "labels"}`: the file as given, the pass id, name, `approval.owner`, `sha256:` digest of the file at start, `valid_until` (RFC 3339 UTC), and the labels in use. When the pass could not be loaded, everything but `file` is null and `labels` is empty. A run that got past its checks also has `directory`: `"hidden"` (by `--hide`, the mount layer or playpen), `"read_only"`, or `"writable"` with `--pass-dir-writable` (4.1, "The pass inside the sandbox"); it is absent from a refusal and from `rules` |
+| `pass` | object or null | null without `--pass`; else `{"file", "id", "name", "owner", "digest", "valid_until", "labels"}`: the file as given, the pass id, name, `approval.owner`, `sha256:` digest of the file at start, `valid_until` (RFC 3339 UTC), and the labels in use. When the pass could not be loaded, everything but `file` is null and `labels` is empty. A run that got past its checks also has `directory`: `"hidden"` (by `--hide`, the mount layer or playpen), `"read_only"`, or `"writable"` with `--pass-dir-writable` (4.1, "The pass inside the sandbox"); it is absent from a refusal and from `rules`. With `--pass-broker` it also has `broker`: `{"protocol", "hallpass_revision", "socket", "state_directory", "state_directory_view", "activity"}` ("The pass broker", section 4). `state_directory_view` is `"hidden"` (by playpen, `--hide` or the mount layer). `socket` and `state_directory` are null when the run was refused before they were made. `activity` is what the broker did, `{"connections", "refused_connections", "requests", "recorded", "refused", "errors"}` (spend requests; a batch counts once), or null when the broker did not run or did not say |
 | `capture` | object or null | null without `--capture` and when nothing was run; else `{"file", "bytes", "sha256"}`: the capture file (absolute), its size, and the SHA-256 of its bytes in lower-case hex as `sha256sum` prints it, read through the descriptor playpen created it with, after pasta has exited. Also null when the file could not be read back; `message` then says why |
 | `playpen_exit_status` | integer | the status playpen exits with |
 | `dropped` | object or null | `{"packets": N, "destinations": [{"address", "protocol", "port", "packets"}], "destinations_truncated": bool, "destinations_unlisted": N or null, "addresses": [{"address", "protocol", "packets"}] or null, "addresses_truncated": bool, "addresses_unlisted": N or null, "full": [...]}`. `destinations` is the per-port record (the drop sets); `port` is null for protocols other than TCP and UDP. `addresses` is the per-address record (the sets `dropaddr4` and `dropaddr6`): the packets to each address and protocol, any port; null when the table has no such sets. Both lists are sorted by packet count, largest first. `destinations_truncated` and `addresses_truncated` are true when the list does not account for every packet in `packets`, or its consistency cannot be established (always true when `addresses` is null). `destinations_unlisted` and `addresses_unlisted` are the packets in `packets` that are in no entry of the list; null when the listing is inconsistent (and `addresses_unlisted` when `addresses` is null). `full` names each record that holds as many entries as its set's size (1024), so it took no new entry after that: `"destinations_ipv4"`, `"destinations_ipv6"`, `"addresses_ipv4"`, `"addresses_ipv6"`. Packets to a known entry of a full set are still counted there |
@@ -1689,8 +1975,8 @@ stops can themselves disclose information, including timing-related behavior.
 
 ### Offline report comparison
 
-`playpen compare BEFORE AFTER [--format json]` reads full 0.1.0 reports as
-inert data (at most 1 MiB each). It compares effective grants, network, host
+`playpen compare BEFORE AFTER [--format json]` reads full 0.1.0 and 0.2.0
+reports as inert data (0.2.0 adds only `pass.broker`) (at most 1 MiB each). It compares effective grants, network, host
 mappings (an entry from `--pass-hosts` counts as its `NAME=ADDR`), exposed
 sockets, display and socket guard independently of observed
 blocked endpoint tuples. Packet counts do not themselves trigger changes.
@@ -1736,7 +2022,7 @@ input is invalid. When new observations and a policy change coexist, exit
 playpen suggest REPORT [--format text|pretty|json]
 ```
 
-Reads one full 0.1.0 report as inert data (at most 1 MiB), as `compare`
+Reads one full 0.1.0 or 0.2.0 report as inert data (at most 1 MiB), as `compare`
 does, and prints the narrowest options that admit what the report's
 `contacted` lists:
 
@@ -1801,7 +2087,7 @@ report has no `contacted` field (the run was without `--report-contacts`),
 when `contacted` is null (the record is unavailable; the message gives
 `contacted_error`), or when `truncated` is not `false`. It is
 `invalid-report` when the file cannot be read, is larger than 1 MiB, is
-not JSON or not a full 0.1.0 report (a shareable report is not), when a
+not JSON or not a full 0.1.0 or 0.2.0 report (a shareable report is not), when a
 destination is not exactly an address, `tcp` or `udp`, a port, a packet
 count and (when the entry has them) the flags `answered` and `reset`, when a destination is listed twice, when a destination is not
 admitted by `allowed`, or when `allowed` or `hosts` does not parse.
@@ -2320,6 +2606,12 @@ directory, reached through the descriptor playpen holds for it.
   `--pass-dir-writable` is given: an empty read-only tmpfs when it holds
   nothing but the pass and playpen's own files, else the host's directory,
   read-only (section 4.1).
+- With `--pass`, every directory from the one below `/` down to the pass's
+  directory, and with `--pass-broker` down to the hallpass state
+  directory: the host's, bound onto itself, so it cannot be renamed or
+  removed (section 4.1).
+- With `--pass-broker`, the hallpass state directory: an empty read-only
+  tmpfs, unless it is hidden already.
 - Renames and hard links into another directory work as on the host.
   Under Landlock, one from outside into an exposed directory fails with
   `EXDEV`: below an exposed directory every file may be connected to, and

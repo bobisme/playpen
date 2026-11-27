@@ -420,6 +420,68 @@ fn pass_dir_writable_is_listed_and_without_pass_is_a_usage_error() {
     }
 }
 
+/// `--pass-broker` is listed for run and plan and says what it gives and
+/// what it keeps from the command; the run workflow names the protocol and
+/// its operations; version names the capability and the hallpass revision.
+#[test]
+fn pass_broker_is_listed_and_version_names_the_capability() {
+    for name in ["run", "plan"] {
+        let help = json(&invoke(&["help", name, "--format", "json"], None).stdout);
+        let arg = help["arguments"]
+            .as_array()
+            .expect("arguments")
+            .iter()
+            .find(|a| a["long"] == "pass-broker")
+            .cloned()
+            .unwrap_or_else(|| panic!("{name}: no --pass-broker in {help}"));
+        assert_eq!(arg["takes_value"], false, "{name}");
+        let said = arg["help"].as_str().unwrap_or("");
+        for part in [
+            "With --pass",
+            "PLAYPEN_PASS_BROKER",
+            "pass-broker-v1",
+            "no write access",
+            "hidden",
+        ] {
+            assert!(said.contains(part), "{name}: {part}: {said}");
+        }
+        let text = String::from_utf8(invoke(&[name, "--help"], None).stdout).expect("help");
+        assert!(text.contains("--pass-broker"), "{text}");
+    }
+    let run = json(&invoke(&["help", "run", "--format", "json"], None).stdout);
+    let workflow = run["workflow"].as_str().unwrap_or("");
+    for op in [
+        "hello",
+        "pass,",
+        "watch",
+        "block-spend",
+        "referenced-spend",
+        "spend-batch",
+        "receipt",
+        "verified-ledger",
+        "fail closed",
+    ] {
+        assert!(workflow.contains(op), "{op}: {workflow}");
+    }
+    let version = json(&invoke(&["version", "--format", "json"], None).stdout);
+    assert_eq!(version["version"], "0.2.0", "{version}");
+    assert_eq!(
+        version["capabilities"],
+        serde_json::json!(["pass-broker-v1"])
+    );
+    assert_eq!(
+        version["hallpass_revision"],
+        "7c06ea837ab6aa98858dc18e4be1fbaf6f3e85ff"
+    );
+    let help = json(&invoke(&["help", "version", "--format", "json"], None).stdout);
+    assert!(
+        help["workflow"]
+            .as_str()
+            .is_some_and(|w| w.contains("pass-broker-v1") && w.contains("hallpass_revision")),
+        "{help}"
+    );
+}
+
 #[test]
 fn the_contacted_record_and_suggest_are_listed() {
     let root = json(&invoke(&["--help", "--json"], None).stdout);

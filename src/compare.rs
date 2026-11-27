@@ -153,11 +153,12 @@ fn cut_hid_drops(v: &Value) -> bool {
     }
 }
 
-/// A full report as inert JSON: at most 1 MiB, of the 0.1.0 schema.
+/// A full report as inert JSON: at most 1 MiB, of the 0.1.0 or 0.2.0
+/// schema (0.2.0 adds only the optional `pass.broker`).
 ///
 /// # Errors
 /// When the file cannot be read, is too large, is not JSON, or is not a
-/// full 0.1.0 report.
+/// full 0.1.0 or 0.2.0 report.
 pub fn read_report(path: &Path) -> Result<Value, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
@@ -168,7 +169,7 @@ pub fn read_report(path: &Path) -> Result<Value, String> {
         return Err("report exceeds 1 MiB".into());
     }
     let v: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if v["playpen_version"] != "0.1.0" {
+    if !matches!(v["playpen_version"].as_str(), Some("0.1.0" | "0.2.0")) {
         return Err("unsupported or reduced report schema".into());
     }
     Ok(v)
